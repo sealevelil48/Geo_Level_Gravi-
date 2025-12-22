@@ -1,0 +1,194 @@
+{
+  "type": "FeatureCollection",
+  "name": "Leveling Network",
+  "crs": {
+    "type": "name",
+    "properties": {
+      "name": "urn:ogc:def:crs:EPSG::4326"
+    }
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            34.8,
+            31.49,
+            0.0
+          ],
+          [
+            34.8,
+            31.51,
+            0.0
+          ]
+        ]
+      },
+      "properties": {
+        "filename": "KMA58_DAT",
+        "start_point": "5793MPI",
+        "end_point": "5792MPI",
+        "distance_m": 420.435,
+        "height_diff_m": -0.43455,
+        "num_setups": 13,
+        "status": "valid",
+        "method": "BF"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            34.8,
+            31.51,
+            0.0
+          ],
+          [
+            34.8,
+            31.49,
+            0.0
+          ]
+        ]
+      },
+      "properties": {
+        "filename": "KMA59_DAT",
+        "start_point": "5792MPI",
+        "end_point": "5793MPI",
+        "distance_m": 415.26,
+        "height_diff_m": 0.42338000000000076,
+        "num_setups": 12,
+        "status": "valid",
+        "method": "BF"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            34.79,
+            31.5,
+            0.0
+          ],
+          [
+            34.8,
+            31.49,
+            0.0
+          ]
+        ]
+      },
+      "properties": {
+        "filename": "KMA57_DAT",
+        "start_point": "640B",
+        "end_point": "5793MPI",
+        "distance_m": 387.655,
+        "height_diff_m": 10.42411,
+        "num_setups": 12,
+        "status": "valid",
+        "method": "BF"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            34.8,
+            31.49,
+            0.0
+          ],
+          [
+            34.809999999999995,
+            31.5,
+            0.0
+          ]
+        ]
+      },
+      "properties": {
+        "filename": "KMA60_DAT",
+        "start_point": "5793MPI",
+        "end_point": "740B",
+        "distance_m": 393.25,
+        "height_diff_m": -10.42722,
+        "num_setups": 12,
+        "status": "valid",
+        "method": "BF"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          34.809999999999995,
+          31.5,
+          0.0
+        ]
+      },
+      "properties": {
+        "point_id": "740B",
+        "height": 0.0,
+        "is_benchmark": true
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          34.8,
+          31.51,
+          0.0
+        ]
+      },
+      "properties": {
+        "point_id": "5792MPI",
+        "height": 0.0,
+        "is_benchmark": true
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          34.79,
+          31.5,
+          0.0
+        ]
+      },
+      "properties": {
+        "point_id": "640B",
+        "height": 0.0,
+        "is_benchmark": true
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          34.8,
+          31.49,
+          0.0
+        ]
+      },
+      "properties": {
+        "point_id": "5793MPI",
+        "height": 0.0,
+        "is_benchmark": true
+      }
+    }
+  ],
+  "metadata": {
+    "created": "2025-12-21T11:03:15.729764",
+    "num_lines": 4,
+    "num_points": 4,
+    "generator": "Geodetic Leveling Tool"
+  }
+}
