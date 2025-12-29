@@ -24,34 +24,40 @@ logger = logging.getLogger(__name__)
 class FA0Exporter:
     """
     Export FA0 format files.
-    
+
     FA0 Format (adjustment input):
         Line 1: Header (num_points, type, filename)
         Lines 2-N: Benchmark heights (point_id, height)
         Following: Observation data (from, to, dh, dist, setups, bf_diff, date, source)
         Last line: Terminator (9)
     """
-    
+
     def __init__(self):
         self.settings = get_settings()
         self.encoding = self.settings.encoding.output_encoding
-    
+
     def export(
         self,
         filepath: str,
         benchmarks: List[Benchmark],
         observations: List[MeasurementSummary],
-        project_name: str = "project.rez"
+        project_name: str = "project.rez",
+        only_used: bool = True
     ):
         """
         Export to FA0 format.
-        
+
         Args:
             filepath: Output file path
             benchmarks: List of known benchmarks
             observations: List of measurement summaries
             project_name: Project/output filename reference
+            only_used: If True, only export observations with is_used=True (if available)
         """
+        # Filter observations if they have is_used attribute
+        if only_used:
+            observations = [obs for obs in observations if not hasattr(obs, 'is_used') or obs.is_used]
+
         with open(filepath, 'w', encoding=self.encoding) as f:
             # Header line
             num_points = len(benchmarks) + self._count_unknown_points(observations, benchmarks)
@@ -319,33 +325,39 @@ class REZExporter:
     """
     Export REZ format files (summary/results).
     """
-    
+
     def __init__(self):
         self.settings = get_settings()
         self.encoding = self.settings.encoding.output_encoding
-    
+
     def export(
         self,
         filepath: str,
         lines: List[LevelingLine],
-        project_name: str = "project"
+        project_name: str = "project",
+        only_used: bool = True
     ):
         """
         Export summary REZ file.
-        
+
         Args:
             filepath: Output file path
             lines: List of LevelingLine objects
             project_name: Project identifier
+            only_used: If True, only export lines marked as is_used=True
         """
+        # Filter lines if requested
+        if only_used:
+            lines = [line for line in lines if line.is_used]
+
         with open(filepath, 'w', encoding=self.encoding) as f:
             f.write(f"# REZ Summary File - {project_name}\n")
             f.write(f"# Generated: {datetime.now().isoformat()}\n")
             f.write("#" + "=" * 78 + "\n\n")
-            
+
             f.write(f"{'From':<12}{'To':<12}{'Height Diff':>14}{'Distance':>12}{'Setups':>8}{'Status':>12}\n")
             f.write("-" * 70 + "\n")
-            
+
             for line in lines:
                 status_str = "OK" if line.status.value == "valid" else line.status.value
                 f.write(

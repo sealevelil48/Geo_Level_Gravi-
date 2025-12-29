@@ -3,7 +3,7 @@ GIS Package
 
 GIS export and visualization tools.
 """
-from gis.geojson_export import (
+from .geojson_export import (
     GeoJSONExporter,
     CoordinateManager,
     QGISStyleGenerator,

@@ -584,12 +584,18 @@ class GeodeticToolGUI:
         # Data storage
         self.lines: List[LevelingLine] = []
         self.file_paths: List[str] = []
-        
+
+        # NEW: Project management
+        from ..config.models import ProjectData
+        from ..config.project_manager import ProjectManager
+        self.current_project: Optional[ProjectData] = ProjectData(name="Unnamed Project")
+        self.project_manager = ProjectManager()
+
         # Create the GUI
         self._create_menu()
         self._create_main_layout()
         self._create_status_bar()
-        
+
         # Configure styles
         self._configure_styles()
     
@@ -612,8 +618,19 @@ class GeodeticToolGUI:
         file_menu.add_command(label="Open Folder... / פתח תיקייה", command=self._open_folder)
         file_menu.add_separator()
         file_menu.add_command(label="Export Results... / ייצוא תוצאות", command=self._export_results)
+        file_menu.add_command(label="Export to QGIS... / ייצוא ל-QGIS", command=self._export_qgis)
         file_menu.add_separator()
         file_menu.add_command(label="Exit / יציאה", command=self.root.quit, accelerator="Alt+F4")
+
+        # NEW: Project menu
+        project_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Project / פרויקט", menu=project_menu)
+        project_menu.add_command(label="Save Project... / שמור פרויקט", command=self._save_project)
+        project_menu.add_command(label="Load Project... / טען פרויקט", command=self._load_project)
+        project_menu.add_separator()
+        project_menu.add_command(label="Create Joint Project... / צור פרויקט משולב", command=self._create_joint_project)
+        project_menu.add_separator()
+        project_menu.add_command(label="Project Properties... / מאפייני פרויקט", command=self._show_project_properties)
         
         # Analysis menu
         analysis_menu = tk.Menu(menubar, tearoff=0)
@@ -679,10 +696,15 @@ class GeodeticToolGUI:
         # Toolbar
         toolbar = ttk.Frame(parent)
         toolbar.pack(fill=tk.X, pady=(0, 5))
-        
+
         ttk.Button(toolbar, text="➕ Add", command=self._open_files).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="🗑️ Clear", command=self._clear_files).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="↻ Reload", command=self._reload_files).pack(side=tk.LEFT, padx=2)
+
+        # NEW: Additional toolbar buttons
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=5, fill=tk.Y)
+        ttk.Button(toolbar, text="⇄ Toggle Dir", command=self._toggle_line_direction).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="✓/✗ Toggle Use", command=self._toggle_line_used).pack(side=tk.LEFT, padx=2)
         
         # File list with scrollbar
         list_frame = ttk.Frame(parent)
@@ -702,7 +724,15 @@ class GeodeticToolGUI:
         
         self.file_listbox.bind('<<ListboxSelect>>', self._on_file_select)
         self.file_listbox.bind('<Double-1>', self._on_file_double_click)
-        
+
+        # NEW: Right-click context menu
+        self.file_context_menu = tk.Menu(self.file_listbox, tearoff=0)
+        self.file_context_menu.add_command(label="Toggle Direction (BF ⇄ FB)", command=self._toggle_line_direction)
+        self.file_context_menu.add_command(label="Toggle Include/Exclude", command=self._toggle_line_used)
+        self.file_context_menu.add_separator()
+        self.file_context_menu.add_command(label="View Details", command=lambda: self.notebook.select(0))
+        self.file_listbox.bind('<Button-3>', self._show_context_menu)
+
         # Summary label
         self.summary_label = ttk.Label(parent, text="No files loaded")
         self.summary_label.pack(pady=5)
@@ -850,10 +880,11 @@ class GeodeticToolGUI:
                 self.lines.append(line)
                 self.file_paths.append(file_path)
                 
-                # Add to listbox
+                # Add to listbox with used marker
                 display_name = Path(file_path).name
-                self.file_listbox.insert(tk.END, f"{display_name}: {line.start_point} → {line.end_point}")
-                
+                used_marker = "✓" if line.is_used else "✗"
+                self.file_listbox.insert(tk.END, f"{used_marker} {display_name}: {line.start_point} → {line.end_point}")
+
                 self._log(f"Loaded: {display_name}")
                 
             except Exception as e:
@@ -891,6 +922,20 @@ class GeodeticToolGUI:
         """Handle double-click on file."""
         self._on_file_select(event)
         self.notebook.select(0)  # Switch to details tab
+
+    def _show_context_menu(self, event):
+        """Show context menu on right-click."""
+        # Select the item under the cursor
+        index = self.file_listbox.nearest(event.y)
+        self.file_listbox.selection_clear(0, tk.END)
+        self.file_listbox.selection_set(index)
+        self.file_listbox.activate(index)
+
+        # Show context menu
+        try:
+            self.file_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.file_context_menu.grab_release()
     
     def _show_line_details(self, line: LevelingLine):
         """Display details for selected line."""
@@ -1087,21 +1132,44 @@ class GeodeticToolGUI:
         folder = filedialog.askdirectory(title="Select Output Folder / בחר תיקיית יעד")
         if folder:
             try:
-                from exporters import FA0Exporter, FTEGExporter
-                from gis.geojson_export import GeoJSONExporter
+                from ..exporters import FA0Exporter, FTEGExporter
+                from ..gis.geojson_export import GeoJSONExporter
                 
-                # Export FTEG
+                # Export FTEG (only used lines)
                 fteg_path = Path(folder) / "lines.FTEG"
                 fteg = FTEGExporter()
-                fteg.export(self.lines, str(fteg_path))
-                
-                # Export GeoJSON
+                # Convert LevelingLine objects to MeasurementSummary format
+                from ..config.models import MeasurementSummary
+                observations = []
+                for line in self.lines:
+                    if not line.is_used:  # Skip unused lines
+                        continue
+                    obs = MeasurementSummary(
+                        from_point=line.start_point,
+                        to_point=line.end_point,
+                        height_diff=line.total_height_diff,
+                        distance=line.total_distance,
+                        num_setups=len(line.setups),
+                        bf_diff=0.0,  # Calculate if needed
+                        year_month=line.date[:4] if line.date else "",
+                        source_file=line.filename or "",
+                        is_used=True
+                    )
+                    observations.append(obs)
+                fteg.export(str(fteg_path), observations)
+
+                # Export GeoJSON (only used lines)
                 geojson_path = Path(folder) / "lines.geojson"
                 gj = GeoJSONExporter()
-                gj.export(self.lines, str(geojson_path))
-                
-                messagebox.showinfo("Export", f"Files exported to:\n{folder}")
-                self._log(f"Exported to {folder}")
+                used_lines = [line for line in self.lines if line.is_used]
+                gj.export_lines(used_lines, str(geojson_path))
+
+                used_count = len([line for line in self.lines if line.is_used])
+                total_count = len(self.lines)
+                messagebox.showinfo("Export",
+                    f"Files exported to:\n{folder}\n\n"
+                    f"Exported {used_count} of {total_count} lines (only 'Used' lines)")
+                self._log(f"Exported to {folder}: {used_count}/{total_count} lines")
             except Exception as e:
                 messagebox.showerror("Error", f"Export failed: {str(e)}")
     
@@ -1166,6 +1234,214 @@ Features:
 © 2024
         """
         messagebox.showinfo("About / אודות", about_text)
+
+    # NEW: Project Management Methods
+
+    def _save_project(self):
+        """Save current project to file."""
+        if not self.lines:
+            messagebox.showinfo("No Data", "No data to save")
+            return
+
+        # Sync lines to project
+        self.current_project.lines = self.lines
+
+        # Ask for project name if unnamed
+        if self.current_project.name == "Unnamed Project":
+            name = simpledialog.askstring("Project Name", "Enter project name:")
+            if name:
+                self.current_project.name = name
+
+        # Ask for save location
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON Project", "*.json"), ("Pickle Project", "*.pickle"), ("All files", "*.*")],
+            initialfile=f"{self.current_project.name}.json"
+        )
+
+        if filepath:
+            try:
+                format = "json" if filepath.endswith(".json") else "pickle"
+                self.current_project.project_path = filepath
+                saved_path = self.project_manager.save_project(self.current_project, format=format)
+                messagebox.showinfo("Success", f"Project saved to:\n{saved_path}")
+                self._log(f"Project saved: {saved_path}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save project: {str(e)}")
+
+    def _load_project(self):
+        """Load project from file."""
+        filepath = filedialog.askopenfilename(
+            title="Open Project",
+            filetypes=[("Project files", "*.json *.pickle"), ("JSON Project", "*.json"), ("Pickle Project", "*.pickle"), ("All files", "*.*")]
+        )
+
+        if filepath:
+            try:
+                project = self.project_manager.load_project(filepath)
+                self.current_project = project
+                self.lines = project.lines
+                self.file_paths = [line.filename for line in self.lines]
+
+                # Update UI
+                self.file_listbox.delete(0, tk.END)
+                for line in self.lines:
+                    display_name = line.filename or f"{line.start_point}-{line.end_point}"
+                    used_marker = "✓" if line.is_used else "✗"
+                    self.file_listbox.insert(tk.END, f"{used_marker} {display_name}: {line.start_point} → {line.end_point}")
+
+                total_dist = sum(line.total_distance for line in self.lines)
+                self.summary_label.config(text=f"{len(self.lines)} files, {total_dist:.0f} m total")
+                self.root.title(f"Geodetic Leveling Tool - {project.name}")
+
+                messagebox.showinfo("Success", f"Project loaded: {project.name}")
+                self._log(f"Project loaded: {filepath}")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load project: {str(e)}")
+
+    def _create_joint_project(self):
+        """Create a joint project from multiple source projects."""
+        # Select multiple project files
+        filepaths = filedialog.askopenfilenames(
+            title="Select Source Projects",
+            filetypes=[("Project files", "*.json *.pickle"), ("All files", "*.*")]
+        )
+
+        if not filepaths:
+            return
+
+        # Ask for joint project name
+        name = simpledialog.askstring("Joint Project Name", "Enter name for the joint project:")
+        if not name:
+            return
+
+        try:
+            joint_project = self.project_manager.create_joint_project(name, list(filepaths))
+            self.current_project = joint_project
+            self.lines = joint_project.lines
+            self.file_paths = [line.filename for line in self.lines]
+
+            # Update UI
+            self.file_listbox.delete(0, tk.END)
+            for line in self.lines:
+                display_name = line.filename or f"{line.start_point}-{line.end_point}"
+                used_marker = "✓" if line.is_used else "✗"
+                self.file_listbox.insert(tk.END, f"{used_marker} {display_name}: {line.start_point} → {line.end_point}")
+
+            total_dist = sum(line.total_distance for line in self.lines)
+            self.summary_label.config(text=f"{len(self.lines)} files, {total_dist:.0f} m total (JOINT PROJECT)")
+            self.root.title(f"Geodetic Leveling Tool - {name} (Joint)")
+
+            messagebox.showinfo("Success",
+                f"Joint project created!\n\n"
+                f"Lines: {len(self.lines)}\n"
+                f"Source projects: {len(joint_project.source_projects)}\n\n"
+                f"You can now edit without affecting source projects."
+            )
+            self._log(f"Joint project created: {name}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create joint project: {str(e)}")
+
+    def _show_project_properties(self):
+        """Show project properties dialog."""
+        if not self.current_project:
+            return
+
+        props_text = f"""Project: {self.current_project.name}
+Type: {"Joint Project" if self.current_project.is_joint_project else "Single Project"}
+Lines: {len(self.current_project.lines)}
+Used Lines: {len(self.current_project.get_used_lines())}
+Benchmarks: {len(self.current_project.benchmarks)}
+Total Points: {len(self.current_project.get_all_points())}
+"""
+
+        if self.current_project.is_joint_project:
+            props_text += f"\nSource Projects:\n"
+            for src in self.current_project.source_projects:
+                props_text += f"  - {src}\n"
+
+        if self.current_project.project_path:
+            props_text += f"\nSaved at: {self.current_project.project_path}"
+
+        messagebox.showinfo("Project Properties", props_text)
+
+    def _export_qgis(self):
+        """Export project for QGIS."""
+        if not self.lines:
+            messagebox.showinfo("No Data", "Please load files first")
+            return
+
+        folder = filedialog.askdirectory(title="Select Output Folder for QGIS Export")
+        if folder:
+            try:
+                from ..gis.qgis_integration import QGISVirtualLayerBuilder
+
+                # Sync lines to project
+                self.current_project.lines = self.lines
+
+                builder = QGISVirtualLayerBuilder()
+                output_files = builder.export_for_qgis(self.current_project, folder, include_geojson=True)
+
+                messagebox.showinfo("Export Complete",
+                    f"QGIS files exported to:\n{folder}\n\n"
+                    f"PyQGIS script: {Path(output_files['pyqgis_script']).name}\n"
+                    f"README: {Path(output_files['readme']).name}\n\n"
+                    f"See README_QGIS.txt for instructions."
+                )
+                self._log(f"QGIS export: {folder}")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"QGIS export failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+
+    def _toggle_line_direction(self):
+        """Toggle direction of selected line (BF <-> FB)."""
+        selection = self.file_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Please select a line first")
+            return
+
+        index = selection[0]
+        if index < len(self.lines):
+            line = self.lines[index]
+            old_method = line.method
+            line.toggle_direction()
+
+            # Update display
+            self._show_line_details(line)
+            messagebox.showinfo("Direction Toggled",
+                f"Line direction changed:\n"
+                f"{old_method} → {line.method}\n\n"
+                f"Start: {line.start_point}\n"
+                f"End: {line.end_point}\n"
+                f"Height difference inverted: {line.total_height_diff:.5f} m"
+            )
+            self._log(f"Toggled direction for {line.filename}: {old_method} → {line.method}")
+
+    def _toggle_line_used(self):
+        """Toggle is_used flag for selected line."""
+        selection = self.file_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Please select a line first")
+            return
+
+        index = selection[0]
+        if index < len(self.lines):
+            line = self.lines[index]
+            line.is_used = not line.is_used
+
+            # Update display
+            display_name = line.filename or f"{line.start_point}-{line.end_point}"
+            used_marker = "✓" if line.is_used else "✗"
+            self.file_listbox.delete(index)
+            self.file_listbox.insert(index, f"{used_marker} {display_name}: {line.start_point} → {line.end_point}")
+            self.file_listbox.selection_set(index)
+
+            status = "Included" if line.is_used else "Excluded"
+            self._log(f"{status}: {line.filename}")
 
 
 def main():

@@ -12,17 +12,17 @@ from typing import List, Optional
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from parsers import create_parser, detect_file_format
-from parsers.base_parser import FileFormat
-from validators import validate_line, LevelingValidator, BatchValidator
-from engine import (
+from ..parsers import create_parser, detect_file_format
+from ..parsers.base_parser import FileFormat
+from ..validators import validate_line, LevelingValidator, BatchValidator
+from ..engine import (
     calculate_line_totals,
     create_measurement_summary,
     LeastSquaresAdjuster
 )
-from exporters import export_fa0, export_fa1, export_fteg, export_rez
-from config.models import LevelingLine, Benchmark, MeasurementSummary
-from config.settings import get_settings, is_benchmark
+from ..exporters import export_fa0, export_fa1, export_fteg, export_rez
+from ..config.models import LevelingLine, Benchmark, MeasurementSummary
+from ..config.settings import get_settings, is_benchmark
 
 
 # Configure logging
@@ -273,7 +273,7 @@ Examples:
         return 0
     
     elif args.command == 'geojson':
-        from gis.geojson_export import export_network_to_geojson
+        from ..gis.geojson_export import export_network_to_geojson
         
         lines = parse_files(args.files)
         

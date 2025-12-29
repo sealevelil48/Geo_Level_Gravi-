@@ -38,14 +38,15 @@ class StationSetup:
     temperature: Optional[float] = None  # Celsius
     height_diff: Optional[float] = None  # Computed dH = Rb - Rf
     cumulative_height: Optional[float] = None  # Z from start
-    
+    is_used: bool = True  # NEW: Flag to include/exclude in exports
+
     def __post_init__(self):
         """Calculate height difference if not provided."""
         if self.height_diff is None and self.backsight_reading and self.foresight_reading:
             self.height_diff = self.backsight_reading - self.foresight_reading
 
 
-@dataclass  
+@dataclass
 class LevelingLine:
     """Complete leveling line from one benchmark to another."""
     filename: str
@@ -55,13 +56,17 @@ class LevelingLine:
     method: str = "BF"  # BF, BFFB, FB
     date: Optional[datetime] = None
     instrument_id: Optional[str] = None
-    
+
     # Computed values
     total_distance: float = 0.0      # Total line distance in meters
     total_height_diff: float = 0.0   # Total height difference in meters
     misclosure: Optional[float] = None  # Misclosure if endpoints are known
     status: LineStatus = LineStatus.VALID
     validation_errors: List[str] = field(default_factory=list)
+
+    # NEW: Export control and direction management
+    is_used: bool = True  # Flag to include/exclude entire line in exports
+    original_direction: str = "BF"  # Track original direction for reversal
     
     @property
     def num_setups(self) -> int:
@@ -81,6 +86,39 @@ class LevelingLine:
         self.total_height_diff = sum(
             s.height_diff for s in self.setups if s.height_diff is not None
         )
+
+    def toggle_direction(self):
+        """
+        Toggle line direction between BF and FB.
+        Automatically inverts height differences and swaps start/end points.
+        """
+        # Swap start and end points
+        self.start_point, self.end_point = self.end_point, self.start_point
+
+        # Toggle method
+        if self.method == "BF":
+            self.method = "FB"
+        elif self.method == "FB":
+            self.method = "BF"
+
+        # Invert height differences
+        for setup in self.setups:
+            if setup.height_diff is not None:
+                setup.height_diff *= -1
+            # Swap from/to points in setups
+            setup.from_point, setup.to_point = setup.to_point, setup.from_point
+
+        # Recalculate totals
+        self.total_height_diff *= -1
+
+    def get_used_setups(self) -> List['StationSetup']:
+        """Return only setups marked as used."""
+        return [s for s in self.setups if s.is_used]
+
+    def copy(self) -> 'LevelingLine':
+        """Create a deep copy of this line for joint projects."""
+        import copy
+        return copy.deepcopy(self)
     
     def to_dataframe(self) -> pd.DataFrame:
         """Convert setups to a pandas DataFrame."""
@@ -123,10 +161,13 @@ class MeasurementSummary:
     bf_diff: float            # BF difference in mm
     year_month: str           # MMYY format
     source_file: str
-    
+
     # Adjustment values
     residual: Optional[float] = None     # v in mm
     adjusted_dh: Optional[float] = None  # Adjusted height diff
+
+    # NEW: Export control
+    is_used: bool = True  # Flag to include/exclude in exports
 
 
 @dataclass
@@ -183,15 +224,20 @@ class ProjectData:
     lines: List[LevelingLine] = field(default_factory=list)
     benchmarks: Dict[str, Benchmark] = field(default_factory=dict)
     adjustment_results: Optional[AdjustmentResult] = None
-    
+
+    # NEW: Joint project support
+    is_joint_project: bool = False
+    source_projects: List[str] = field(default_factory=list)  # Track source project names
+    project_path: Optional[str] = None  # File path for persistence
+
     def add_line(self, line: LevelingLine):
         """Add a leveling line to the project."""
         self.lines.append(line)
-        
+
     def add_benchmark(self, benchmark: Benchmark):
         """Add a known benchmark to the project."""
         self.benchmarks[benchmark.point_id] = benchmark
-    
+
     def get_all_points(self) -> set:
         """Get all unique point IDs from all lines."""
         points = set()
@@ -202,7 +248,35 @@ class ProjectData:
                 points.add(setup.from_point)
                 points.add(setup.to_point)
         return points
-    
+
+    def get_used_lines(self) -> List[LevelingLine]:
+        """Return only lines marked as used for export."""
+        return [line for line in self.lines if line.is_used]
+
+    def copy(self) -> 'ProjectData':
+        """Create a deep copy of this project (for joint projects)."""
+        import copy
+        return copy.deepcopy(self)
+
+    def merge_from(self, other_project: 'ProjectData'):
+        """
+        Merge another project into this one (for joint projects).
+        Creates deep copies to avoid modifying source projects.
+        """
+        # Copy lines
+        for line in other_project.lines:
+            self.lines.append(line.copy())
+
+        # Copy benchmarks
+        for point_id, bm in other_project.benchmarks.items():
+            if point_id not in self.benchmarks:
+                import copy
+                self.benchmarks[point_id] = copy.deepcopy(bm)
+
+        # Track source
+        if other_project.name not in self.source_projects:
+            self.source_projects.append(other_project.name)
+
     def lines_to_dataframe(self) -> pd.DataFrame:
         """Convert all lines to summary DataFrame."""
         data = []
@@ -215,6 +289,7 @@ class ProjectData:
                 'TotalDistance': line.total_distance,
                 'HeightDiff': line.total_height_diff,
                 'Method': line.method,
-                'Status': line.status.value
+                'Status': line.status.value,
+                'IsUsed': line.is_used  # NEW
             })
         return pd.DataFrame(data)
