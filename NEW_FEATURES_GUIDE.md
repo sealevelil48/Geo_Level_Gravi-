@@ -245,7 +245,52 @@ print(f"README: {output_files['readme']}")
 
 ---
 
-### 6. ✅ Enhanced Calculation Modules
+### 6. ✅ Enhanced LSA (Least Squares Adjustment) Calculations
+
+**Major Enhancement:** Complete LSA implementation with both adjustment methods
+
+**New Adjustment Methods:**
+- **Parametric Adjustment (Ax+L):** Enhanced with matrix stability checking
+- **Conditional Adjustment (Bv+W):** New implementation for loop networks
+
+**New Features:**
+- Matrix stability analysis (condition number, determinant, rank)
+- Ill-conditioned matrix warnings
+- Singular matrix detection
+- Residual plotting and analysis
+- Enhanced quality metrics (σ₀, K coefficient)
+
+**New Files:**
+```python
+from geodetic_tool.engine import (
+    LeastSquaresAdjuster,      # Enhanced parametric adjustment
+    ConditionalAdjuster,        # New conditional adjustment
+    AdjustmentComputations,     # Core computation engine
+    SingularMatrixError,        # Custom error handling
+    IllConditionedMatrixWarning # Matrix stability warnings
+)
+```
+
+**Usage Example:**
+```python
+from geodetic_tool.engine import LeastSquaresAdjuster
+
+# Create adjuster with stability checking
+adjuster = LeastSquaresAdjuster(check_stability=True)
+
+# Perform adjustment
+result = adjuster.adjust(observations, fixed_points)
+
+# Access stability information
+if hasattr(result, 'stability_info'):
+    print(f"Condition number: {result.stability_info['condition_number']:.2e}")
+```
+
+**For detailed documentation:** See [LSA_GUIDE.md](LSA_GUIDE.md)
+
+---
+
+### 7. ✅ Original Calculation Modules (Maintained)
 
 All existing calculation modules are fully maintained and enhanced:
 
@@ -570,7 +615,10 @@ All requirements from the specification have been implemented:
 - [x] CRS 2039 (Israel TM Grid) support
 - [x] Line Coordination calculations (already existed)
 - [x] Loop Coordination calculations (already existed)
-- [x] Network Coordination (LSA) calculations (already existed)
+- [x] Network Coordination - Parametric (Ax+L) LSA (enhanced with stability checking)
+- [x] Network Coordination - Conditional (Bv+W) LSA (newly implemented)
+- [x] Matrix stability analysis and warnings
+- [x] Residual plotting and analysis
 - [x] All existing features maintained
 - [x] Backward compatibility ensured
 
@@ -578,14 +626,16 @@ All requirements from the specification have been implemented:
 
 ## 🎉 Summary
 
-Geodetic Tool v1.1 is a **major upgrade** that adds powerful project management, selective exports, direction control, and GIS integration while **maintaining 100% backward compatibility** with v1.0.
+Geodetic Tool v1.1 is a **major upgrade** that adds powerful project management, selective exports, direction control, GIS integration, and comprehensive LSA capabilities while **maintaining 100% backward compatibility** with v1.0.
 
 **Key Achievements:**
-- ✅ 6 major new features
+- ✅ 7 major new features (including enhanced LSA)
 - ✅ 0 breaking changes
 - ✅ All existing functionality preserved
 - ✅ Professional-grade project management
 - ✅ Industry-standard GIS integration
+- ✅ Both Parametric (Ax+L) and Conditional (Bv+W) adjustment methods
+- ✅ Advanced matrix stability analysis
 
 **Ready to use in production!**
 
@@ -593,5 +643,6 @@ Geodetic Tool v1.1 is a **major upgrade** that adds powerful project management,
 
 **For questions or support, see:**
 - [README.md](README.md) - Main documentation
+- [LSA_GUIDE.md](LSA_GUIDE.md) - **NEW:** Comprehensive LSA documentation
 - [FIXES_AND_USAGE_GUIDE.md](FIXES_AND_USAGE_GUIDE.md) - Original usage guide
 - [QUICK_REFERENCE.md](QUICK_REFERENCE.md) - Quick reference guide

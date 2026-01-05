@@ -22,7 +22,19 @@ from .line_adjustment import (
 
 from .least_squares import (
     LeastSquaresAdjuster,
+    ConditionalAdjuster,
     simple_adjustment
+)
+
+from .adjustment_computations import AdjustmentComputations
+
+from .ADJwarnings import (
+    IllConditionedMatrixWarning,
+    SingularMatrixError,
+    InsufficientObservationsError,
+    ConvergenceError,
+    WeightMatrixError,
+    InvalidNetworkError
 )
 
 from .loop_detector import (
@@ -48,10 +60,20 @@ __all__ = [
     'LineAdjuster',
     'adjust_single_line',
     
-    # Least squares
+    # Least squares - Parametric (Ax+L) and Conditional (Bv+W)
     'LeastSquaresAdjuster',
+    'ConditionalAdjuster',
     'simple_adjustment',
-    
+    'AdjustmentComputations',
+
+    # Adjustment warnings and errors
+    'IllConditionedMatrixWarning',
+    'SingularMatrixError',
+    'InsufficientObservationsError',
+    'ConvergenceError',
+    'WeightMatrixError',
+    'InvalidNetworkError',
+
     # Loop detection
     'Loop',
     'NetworkGraph',
