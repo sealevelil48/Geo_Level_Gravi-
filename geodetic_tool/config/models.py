@@ -23,6 +23,7 @@ class LineStatus(Enum):
     NAMING_ERROR = "naming_error"          # File name doesn't match points
     INCOMPLETE = "incomplete"              # Missing data
     EXCEEDED_TOLERANCE = "exceeded_tolerance"
+    EXCLUDED_FROM_MERGE = "excluded_from_merge"  # Original line merged into another (Phase 3, Item 14)
 
 
 @dataclass

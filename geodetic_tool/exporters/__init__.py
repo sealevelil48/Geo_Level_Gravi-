@@ -335,7 +335,8 @@ class REZExporter:
         filepath: str,
         lines: List[LevelingLine],
         project_name: str = "project",
-        only_used: bool = True
+        only_used: bool = True,
+        include_source_files: bool = True
     ):
         """
         Export summary REZ file.
@@ -345,6 +346,7 @@ class REZExporter:
             lines: List of LevelingLine objects
             project_name: Project identifier
             only_used: If True, only export lines marked as is_used=True
+            include_source_files: If True, add Source Files column (NEW in v1.1)
         """
         # Filter lines if requested
         if only_used:
@@ -355,16 +357,31 @@ class REZExporter:
             f.write(f"# Generated: {datetime.now().isoformat()}\n")
             f.write("#" + "=" * 78 + "\n\n")
 
-            f.write(f"{'From':<12}{'To':<12}{'Height Diff':>14}{'Distance':>12}{'Setups':>8}{'Status':>12}\n")
-            f.write("-" * 70 + "\n")
+            # Build header with optional Source Files column
+            if include_source_files:
+                f.write(f"{'From':<12}{'To':<12}{'Height Diff':>14}{'Distance':>12}{'Setups':>8}{'Status':>12}  {'Source File':<30}\n")
+                f.write("-" * 110 + "\n")
+            else:
+                f.write(f"{'From':<12}{'To':<12}{'Height Diff':>14}{'Distance':>12}{'Setups':>8}{'Status':>12}\n")
+                f.write("-" * 70 + "\n")
 
             for line in lines:
                 status_str = "OK" if line.status.value == "valid" else line.status.value
-                f.write(
+
+                # Base columns
+                output = (
                     f"{line.start_point:<12}{line.end_point:<12}"
                     f"{line.total_height_diff:>14.5f}{line.total_distance:>12.2f}"
-                    f"{line.num_setups:>8}{status_str:>12}\n"
+                    f"{line.num_setups:>8}{status_str:>12}"
                 )
+
+                # Add source file if requested
+                if include_source_files:
+                    from pathlib import Path
+                    source_file = Path(line.filename).name if line.filename else "Unknown"
+                    output += f"  {source_file:<30}"
+
+                f.write(output + "\n")
 
 
 # Convenience functions

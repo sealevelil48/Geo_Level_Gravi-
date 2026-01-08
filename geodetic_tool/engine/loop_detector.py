@@ -2,6 +2,7 @@
 Loop Detector Module
 
 Detects closed loops in leveling networks for adjustment and quality control.
+Updated to use Survey of Israel Directive ג2 (2021) regulations.
 """
 from typing import List, Dict, Set, Tuple, Optional
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ..config.models import LevelingLine, MeasurementSummary
+from ..config.israel_survey_regulations import get_class_parameters, CLASS_REGISTRY
 
 
 @dataclass
@@ -35,32 +37,55 @@ class Loop:
     
     @property
     def tolerance_class(self) -> int:
-        """Determine class based on misclosure (1-4, or 0 if exceeds all)."""
-        tolerance_coefficients = [1.0, 2.0, 3.0, 6.0]  # mm/sqrt(km)
+        """
+        Determine class based on misclosure using new regulations (H1-H6).
+
+        Returns:
+            Class number (1-6), or 0 if exceeds all tolerances
+        """
         dist_km = self.total_distance / 1000.0
-        
-        for cls, coeff in enumerate(tolerance_coefficients, 1):
-            allowed = coeff * math.sqrt(dist_km)
-            if abs(self.misclosure * 1000) <= allowed:  # Convert to mm
-                return cls
+        misclosure_mm = abs(self.misclosure * 1000)
+
+        # Check against all classes from strictest (H1) to most lenient (H6)
+        for class_num in range(1, 7):
+            try:
+                params = get_class_parameters(class_num)
+                allowed_mm = params.get_tolerance_mm(dist_km)
+                if misclosure_mm <= allowed_mm:
+                    return class_num
+            except ValueError:
+                continue
+
         return 0  # Exceeds all tolerances
     
-    def calculate_misclosure(self):
-        """Calculate the misclosure of the loop."""
+    def calculate_misclosure(self, target_class: int = 1):
+        """
+        Calculate the misclosure of the loop.
+
+        Args:
+            target_class: Target accuracy class (1-6), defaults to H1 (strictest)
+        """
         total_dh = 0.0
         total_dist = 0.0
-        
+
         for line in self.lines:
             # Determine if line needs to be reversed based on loop direction
             total_dh += line.total_height_diff
             total_dist += line.total_distance
-        
+
         self.misclosure = total_dh
         self.total_distance = total_dist
-        
-        # Calculate allowable tolerance (Class 1: 1mm * sqrt(km))
-        dist_km = total_dist / 1000.0
-        self.allowable_tolerance = 1.0 * math.sqrt(dist_km) * 1000  # Back to mm
+
+        # Calculate allowable tolerance using new regulations
+        # Default to H1 (strictest class: ±3mm√L)
+        try:
+            params = get_class_parameters(target_class)
+            dist_km = total_dist / 1000.0
+            self.allowable_tolerance = params.get_tolerance_mm(dist_km)
+        except ValueError:
+            # Fallback to H1 if invalid class
+            dist_km = total_dist / 1000.0
+            self.allowable_tolerance = 3.0 * math.sqrt(dist_km)
     
     def __str__(self) -> str:
         points_str = " → ".join(self.points)
@@ -221,58 +246,72 @@ class LoopAnalyzer:
         """Find the minimum set of independent loops."""
         return self.graph.find_minimum_loops()
     
-    def analyze_double_run(self, line1: LevelingLine, line2: LevelingLine) -> Dict:
+    def analyze_double_run(self, line1: LevelingLine, line2: LevelingLine,
+                          target_class: int = 1) -> Dict:
         """
-        Analyze a double-run (back-and-forth) measurement.
-        
+        Analyze a double-run (back-and-forth) measurement using new regulations.
+
         Args:
             line1: Forward measurement
             line2: Return measurement
-            
+            target_class: Target accuracy class (1-6), defaults to H1
+
         Returns:
             Analysis results dictionary
         """
-        if not (line1.start_point == line2.end_point and 
+        if not (line1.start_point == line2.end_point and
                 line1.end_point == line2.start_point):
             return {
                 'valid': False,
                 'error': 'Lines do not form a proper double-run'
             }
-        
+
         dh_forward = line1.total_height_diff
         dh_return = line2.total_height_diff
-        
+
         # For double-run, sum should be close to 0
         misclosure = dh_forward + dh_return
-        
+        misclosure_mm = misclosure * 1000
+
         # Calculate mean values
         mean_dh = (dh_forward - dh_return) / 2
         total_distance = line1.total_distance + line2.total_distance
         dist_km = total_distance / 1000.0
-        
-        # Tolerance for double-run (using Class 1: 1mm/sqrt(km))
-        tolerance = 1.0 * math.sqrt(dist_km) / 1000  # Convert to m
-        
-        # Determine class
-        tolerance_class = 0
-        coefficients = [1.0, 2.0, 3.0, 6.0]
-        for cls, coeff in enumerate(coefficients, 1):
-            allowed = coeff * math.sqrt(dist_km) / 1000
-            if abs(misclosure) <= allowed:
-                tolerance_class = cls
-                break
-        
+
+        # Tolerance for double-run using new regulations
+        try:
+            params = get_class_parameters(target_class)
+            tolerance_mm = params.get_tolerance_mm(dist_km)
+        except ValueError:
+            # Fallback to H1
+            tolerance_mm = 3.0 * math.sqrt(dist_km)
+
+        # Determine achieved class (which class does this measurement satisfy)
+        achieved_class = 0
+        for class_num in range(1, 7):
+            try:
+                params = get_class_parameters(class_num)
+                allowed_mm = params.get_tolerance_mm(dist_km)
+                if abs(misclosure_mm) <= allowed_mm:
+                    achieved_class = class_num
+                    break
+            except ValueError:
+                continue
+
         return {
             'valid': True,
             'forward_dh': dh_forward,
             'return_dh': dh_return,
             'misclosure': misclosure,
-            'misclosure_mm': misclosure * 1000,
+            'misclosure_mm': misclosure_mm,
             'mean_dh': mean_dh,
             'total_distance': total_distance,
-            'tolerance_class': tolerance_class,
-            'within_tolerance': abs(misclosure) <= tolerance,
-            'tolerance_mm': tolerance * 1000
+            'target_class': target_class,
+            'achieved_class': achieved_class,
+            'tolerance_class': achieved_class,  # For backward compatibility
+            'within_tolerance': abs(misclosure_mm) <= tolerance_mm,
+            'tolerance_mm': tolerance_mm,
+            'class_name': f"H{achieved_class}" if achieved_class > 0 else "Exceeded"
         }
     
     def get_network_summary(self) -> Dict:

@@ -319,6 +319,702 @@ class LineAdjustmentDialog(tk.Toplevel):
             messagebox.showinfo("Export", f"Results saved to:\n{filename}")
 
 
+class PointExclusionDialog(tk.Toplevel):
+    """
+    Dialog for excluding points across the entire project (Phase 4, Item 15).
+
+    Automatically disables all lines that use a specified point.
+    """
+
+    def __init__(self, parent, all_lines: List[LevelingLine]):
+        super().__init__(parent)
+        self.title("Point Exclusion / ה exclusion נקודה")
+        self.geometry("800x600")
+        self.transient(parent)
+        self.grab_set()
+
+        self.all_lines = all_lines
+        self.all_points = set()
+        self.point_usage = {}  # point_id -> list of lines
+        self.excluded_lines = []
+
+        self._analyze_points()
+        self._create_widgets()
+
+    def _analyze_points(self):
+        """Analyze all points and their usage across files."""
+        for line in self.all_lines:
+            # Collect start and end points
+            if line.start_point:
+                self.all_points.add(line.start_point)
+                if line.start_point not in self.point_usage:
+                    self.point_usage[line.start_point] = []
+                self.point_usage[line.start_point].append(line)
+
+            if line.end_point:
+                self.all_points.add(line.end_point)
+                if line.end_point not in self.point_usage:
+                    self.point_usage[line.end_point] = []
+                self.point_usage[line.end_point].append(line)
+
+            # Collect intermediate turning points
+            for setup in line.setups:
+                for pt in [setup.from_point, setup.to_point]:
+                    if pt:
+                        self.all_points.add(pt)
+                        if pt not in self.point_usage:
+                            self.point_usage[pt] = []
+                        if line not in self.point_usage[pt]:
+                            self.point_usage[pt].append(line)
+
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        # Top frame: Title and instructions
+        top_frame = ttk.Frame(self)
+        top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        ttk.Label(top_frame, text="Point Exclusion Manager / ניהול הדרה נקודות",
+                 font=('Arial', 12, 'bold')).pack()
+        ttk.Label(top_frame,
+                 text="Automatically exclude all lines that use a specified point",
+                 font=('Arial', 9)).pack()
+
+        # Main content paned window
+        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # Left: Points list
+        left_frame = ttk.LabelFrame(paned, text=f"All Points ({len(self.all_points)} total)")
+        paned.add(left_frame, weight=1)
+
+        # Search box
+        search_frame = ttk.Frame(left_frame)
+        search_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=5)
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', self._filter_points)
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # Points listbox
+        points_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL)
+        self.points_listbox = tk.Listbox(left_frame, yscrollcommand=points_scroll.set,
+                                        font=('Courier', 9))
+        points_scroll.config(command=self.points_listbox.yview)
+
+        self.points_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        points_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+
+        self.points_listbox.bind('<<ListboxSelect>>', self._on_point_select)
+
+        # Populate points
+        sorted_points = sorted(self.all_points)
+        for point in sorted_points:
+            usage_count = len(self.point_usage.get(point, []))
+            self.points_listbox.insert(tk.END, f"{point} (used in {usage_count} line(s))")
+
+        # Right: Point details and actions
+        right_frame = ttk.LabelFrame(paned, text="Point Details / פרטי נקודה")
+        paned.add(right_frame, weight=2)
+
+        # Details text
+        self.details_text = scrolledtext.ScrolledText(right_frame, font=('Consolas', 9),
+                                                      wrap=tk.WORD, height=20)
+        self.details_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Action buttons
+        action_frame = ttk.Frame(right_frame)
+        action_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(action_frame, text="Exclude Point / הדר נקודה",
+                  command=self._exclude_point).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Include Point / כלול נקודה",
+                  command=self._include_point).pack(side=tk.LEFT, padx=5)
+
+        # Bottom frame: Actions
+        bottom_frame = ttk.Frame(self)
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(bottom_frame, text="Close / סגור",
+                  command=self.destroy).pack(side=tk.RIGHT, padx=5)
+
+        self.status_label = ttk.Label(bottom_frame, text=f"Total points: {len(self.all_points)}", foreground="blue")
+        self.status_label.pack(side=tk.LEFT, padx=10)
+
+    def _filter_points(self, *args):
+        """Filter points list based on search text."""
+        search_text = self.search_var.get().lower()
+        self.points_listbox.delete(0, tk.END)
+
+        sorted_points = sorted(self.all_points)
+        for point in sorted_points:
+            if search_text in point.lower():
+                usage_count = len(self.point_usage.get(point, []))
+                self.points_listbox.insert(tk.END, f"{point} (used in {usage_count} line(s))")
+
+    def _on_point_select(self, event):
+        """Handle point selection."""
+        selection = self.points_listbox.curselection()
+        if not selection:
+            return
+
+        index = selection[0]
+        selected_text = self.points_listbox.get(index)
+        # Extract point ID (text before first space)
+        point_id = selected_text.split(' ')[0]
+
+        self._show_point_details(point_id)
+
+    def _show_point_details(self, point_id: str):
+        """Show detailed usage information for a point."""
+        self.details_text.delete('1.0', tk.END)
+
+        # Header
+        self.details_text.insert(tk.END, "=" * 70 + "\n")
+        self.details_text.insert(tk.END, f"POINT DETAILS: {point_id}\n")
+        self.details_text.insert(tk.END, "=" * 70 + "\n\n")
+
+        # Usage statistics
+        lines_using_point = self.point_usage.get(point_id, [])
+        used_lines = [line for line in lines_using_point if line.is_used]
+        excluded_lines = [line for line in lines_using_point if not line.is_used]
+
+        self.details_text.insert(tk.END, f"Total Lines Using Point: {len(lines_using_point)}\n")
+        self.details_text.insert(tk.END, f"  • Currently Used: {len(used_lines)}\n")
+        self.details_text.insert(tk.END, f"  • Currently Excluded: {len(excluded_lines)}\n\n")
+
+        # List files
+        self.details_text.insert(tk.END, "FILES USING THIS POINT:\n")
+        self.details_text.insert(tk.END, "-" * 70 + "\n\n")
+
+        for i, line in enumerate(lines_using_point, 1):
+            status = "✓ USED" if line.is_used else "✗ EXCLUDED"
+            self.details_text.insert(tk.END, f"{i}. {status}: {line.filename or 'Unknown'}\n")
+            self.details_text.insert(tk.END, f"   {line.start_point} → {line.end_point}\n")
+            self.details_text.insert(tk.END, f"   Distance: {line.total_distance:.2f} m, Setups: {len(line.setups)}\n\n")
+
+        # Action help
+        self.details_text.insert(tk.END, "=" * 70 + "\n")
+        self.details_text.insert(tk.END, "ACTIONS:\n")
+        self.details_text.insert(tk.END, "=" * 70 + "\n\n")
+        self.details_text.insert(tk.END, "• Exclude Point: Mark all lines using this point as excluded\n")
+        self.details_text.insert(tk.END, "• Include Point: Mark all lines using this point as used\n")
+
+    def _exclude_point(self):
+        """Exclude all lines that use the selected point (Item 15)."""
+        selection = self.points_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a point first")
+            return
+
+        index = selection[0]
+        selected_text = self.points_listbox.get(index)
+        point_id = selected_text.split(' ')[0]
+
+        lines_to_exclude = self.point_usage.get(point_id, [])
+        used_lines = [line for line in lines_to_exclude if line.is_used]
+
+        if not used_lines:
+            messagebox.showinfo("Nothing to Exclude",
+                f"All lines using point '{point_id}' are already excluded.")
+            return
+
+        # Confirm action
+        confirm_msg = (f"Exclude all lines using point '{point_id}'?\n\n"
+                      f"This will exclude {len(used_lines)} line(s):\n")
+        for line in used_lines[:5]:
+            confirm_msg += f"  • {line.filename}\n"
+        if len(used_lines) > 5:
+            confirm_msg += f"  ... and {len(used_lines) - 5} more\n"
+
+        if not messagebox.askyesno("Confirm Exclusion", confirm_msg):
+            return
+
+        # Exclude lines
+        for line in used_lines:
+            line.is_used = False
+
+        self.excluded_lines.extend(used_lines)
+
+        messagebox.showinfo("Point Excluded",
+            f"Excluded {len(used_lines)} line(s) using point '{point_id}'.\n\n"
+            f"Lines marked as excluded.")
+
+        # Refresh display
+        self._show_point_details(point_id)
+        self.status_label.config(text=f"Excluded {len(used_lines)} line(s)")
+
+    def _include_point(self):
+        """Include all lines that use the selected point."""
+        selection = self.points_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a point first")
+            return
+
+        index = selection[0]
+        selected_text = self.points_listbox.get(index)
+        point_id = selected_text.split(' ')[0]
+
+        lines_to_include = self.point_usage.get(point_id, [])
+        excluded_lines = [line for line in lines_to_include if not line.is_used]
+
+        if not excluded_lines:
+            messagebox.showinfo("Nothing to Include",
+                f"All lines using point '{point_id}' are already included.")
+            return
+
+        # Confirm action
+        confirm_msg = (f"Include all lines using point '{point_id}'?\n\n"
+                      f"This will include {len(excluded_lines)} line(s).")
+
+        if not messagebox.askyesno("Confirm Inclusion", confirm_msg):
+            return
+
+        # Include lines
+        for line in excluded_lines:
+            line.is_used = True
+
+        messagebox.showinfo("Point Included",
+            f"Included {len(excluded_lines)} line(s) using point '{point_id}'.")
+
+        # Refresh display
+        self._show_point_details(point_id)
+        self.status_label.config(text=f"Included {len(excluded_lines)} line(s)")
+
+
+class ClassSettingsDialog(tk.Toplevel):
+    """
+    Dialog for viewing and editing Survey of Israel class parameters (Phase 4, Item 4).
+
+    Displays H1-H6 regulation parameters in a visual, editable format.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Class Settings / הגדרות דרגות דיוק")
+        self.geometry("1100x800")
+        self.transient(parent)
+        self.grab_set()
+
+        self.modified = False
+
+        self._create_widgets()
+        self._load_parameters()
+
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        # Top frame: Title and instructions
+        top_frame = ttk.Frame(self)
+        top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        ttk.Label(top_frame, text="Survey of Israel Leveling Class Parameters",
+                 font=('Arial', 12, 'bold')).pack()
+        ttk.Label(top_frame,
+                 text="Based on Directive ג2 (06/06/2021) - Orthometric Height Measurement",
+                 font=('Arial', 9)).pack()
+
+        # Create notebook for class tabs
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # Create a tab for each class
+        self.class_frames = {}
+        for class_num in range(1, 7):
+            frame = self._create_class_tab(class_num)
+            self.class_frames[class_num] = frame
+            self.notebook.add(frame, text=f"H{class_num}")
+
+        # Bottom frame: Actions
+        bottom_frame = ttk.Frame(self)
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(bottom_frame, text="Save Changes / שמור שינויים",
+                  command=self._save_changes).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_frame, text="Reset to Defaults / אפס לברירות מחדל",
+                  command=self._reset_defaults).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_frame, text="Close / סגור",
+                  command=self.destroy).pack(side=tk.RIGHT, padx=5)
+
+        self.status_label = ttk.Label(bottom_frame, text="", foreground="blue")
+        self.status_label.pack(side=tk.LEFT, padx=10)
+
+    def _create_class_tab(self, class_num: int) -> ttk.Frame:
+        """Create parameter display tab for a specific class."""
+        frame = ttk.Frame(self.notebook)
+
+        # Create scrolled frame
+        canvas = tk.Canvas(frame)
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Store reference to scrollable frame
+        frame.scrollable_frame = scrollable_frame
+
+        return frame
+
+    def _load_parameters(self):
+        """Load and display parameters for all classes."""
+        from ..config.israel_survey_regulations import CLASS_REGISTRY
+
+        for class_num, params in CLASS_REGISTRY.items():
+            frame = self.class_frames[class_num].scrollable_frame
+
+            # Class header
+            header_frame = ttk.LabelFrame(frame, text=f"Class {params.class_name} Parameters")
+            header_frame.pack(fill=tk.X, padx=10, pady=10)
+
+            # Tolerance formula
+            ttk.Label(header_frame, text="Tolerance Formula:",
+                     font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+            ttk.Label(header_frame, text=f"±{params.tolerance_coefficient} mm × √(Distance_km)",
+                     font=('Courier', 10)).grid(row=0, column=1, sticky=tk.W, pady=5)
+
+            # Distance limits
+            ttk.Label(header_frame, text="Max Line Length:",
+                     font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+            max_length = f"{params.max_line_length_km} km" if params.max_line_length_km else "Unlimited (אין)"
+            ttk.Label(header_frame, text=max_length).grid(row=1, column=1, sticky=tk.W, pady=5)
+
+            # Sight distances
+            sight_frame = ttk.LabelFrame(frame, text="Sight Distance Limits")
+            sight_frame.pack(fill=tk.X, padx=10, pady=10)
+
+            ttk.Label(sight_frame, text="Geometric Leveling:",
+                     font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+            ttk.Label(sight_frame, text=f"{params.max_sight_distance_geometric_m} m").grid(row=0, column=1, sticky=tk.W, pady=5)
+
+            ttk.Label(sight_frame, text="Trigonometric Leveling:",
+                     font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+            ttk.Label(sight_frame, text=f"{params.max_sight_distance_trigonometric_m} m").grid(row=1, column=1, sticky=tk.W, pady=5)
+
+            # Measurement method
+            method_frame = ttk.LabelFrame(frame, text="Measurement Requirements")
+            method_frame.pack(fill=tk.X, padx=10, pady=10)
+
+            ttk.Label(method_frame, text="Required Method:",
+                     font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+            method_desc = "BFFB (Back-Fore-Fore-Back)" if params.required_method == "BFFB" else "BF (Back-Fore)"
+            ttk.Label(method_frame, text=method_desc).grid(row=0, column=1, sticky=tk.W, pady=5)
+
+            ttk.Label(method_frame, text="Double-Run Required:",
+                     font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+            ttk.Label(method_frame, text="Yes / כן" if params.requires_double_run else "No / לא").grid(row=1, column=1, sticky=tk.W, pady=5)
+
+            # Distance balance
+            balance_frame = ttk.LabelFrame(frame, text="Distance Balance Requirements")
+            balance_frame.pack(fill=tk.X, padx=10, pady=10)
+
+            ttk.Label(balance_frame, text="Max Single Setup Imbalance:",
+                     font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+            ttk.Label(balance_frame, text=f"{params.max_single_distance_imbalance_m} m").grid(row=0, column=1, sticky=tk.W, pady=5)
+
+            ttk.Label(balance_frame, text="Max Cumulative Imbalance:",
+                     font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+            ttk.Label(balance_frame, text=f"{params.max_cumulative_distance_imbalance_m} m").grid(row=1, column=1, sticky=tk.W, pady=5)
+
+            # Special requirements
+            special_frame = ttk.LabelFrame(frame, text="Special Requirements")
+            special_frame.pack(fill=tk.X, padx=10, pady=10)
+
+            row = 0
+            if params.requires_invar_staff:
+                ttk.Label(special_frame, text="• Invar Staff Required (אמה עשויה אינוור)",
+                         font=('Arial', 9)).grid(row=row, column=0, sticky=tk.W, padx=10, pady=2)
+                row += 1
+
+            if params.requires_staff_supports:
+                ttk.Label(special_frame, text="• Staff Supports Required (מוטות משען לייצוב האמות)",
+                         font=('Arial', 9)).grid(row=row, column=0, sticky=tk.W, padx=10, pady=2)
+                row += 1
+
+            if params.requires_calibration_monthly:
+                ttk.Label(special_frame, text="• Monthly Calibration Required",
+                         font=('Arial', 9)).grid(row=row, column=0, sticky=tk.W, padx=10, pady=2)
+                row += 1
+
+            if params.requires_orthometric_correction:
+                ttk.Label(special_frame, text="• Orthometric Correction Required (gravity-based)",
+                         font=('Arial', 9)).grid(row=row, column=0, sticky=tk.W, padx=10, pady=2)
+                row += 1
+
+            if params.max_instrument_error_mm_per_km:
+                ttk.Label(special_frame, text=f"• Max Instrument Error: {params.max_instrument_error_mm_per_km} mm/km",
+                         font=('Arial', 9)).grid(row=row, column=0, sticky=tk.W, padx=10, pady=2)
+                row += 1
+
+            if params.max_days_for_double_run:
+                ttk.Label(special_frame, text=f"• Complete Double-Run Within: {params.max_days_for_double_run} days",
+                         font=('Arial', 9)).grid(row=row, column=0, sticky=tk.W, padx=10, pady=2)
+                row += 1
+
+            if row == 0:
+                ttk.Label(special_frame, text="No special requirements",
+                         font=('Arial', 9, 'italic')).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+
+        self.status_label.config(text="Loaded parameters from regulations")
+
+    def _save_changes(self):
+        """Save modified parameters (placeholder for future implementation)."""
+        messagebox.showinfo("Info",
+            "Parameter editing is view-only in this version.\n\n"
+            "To modify parameters, edit:\n"
+            "geodetic_tool/config/israel_survey_regulations.py\n\n"
+            "Future versions may support in-app editing.")
+
+    def _reset_defaults(self):
+        """Reset to default regulation parameters."""
+        if messagebox.askyesno("Reset Defaults",
+                              "Reset all parameters to Survey of Israel defaults?\n\n"
+                              "This will reload the parameters from regulations."):
+            self._load_parameters()
+            self.status_label.config(text="Reset to defaults")
+
+
+class MergeDialog(tk.Toplevel):
+    """
+    Dialog for merging leveling line segments (Phase 3, Items 5, 12/13, 14).
+
+    Features:
+    - Detects mergeable line segments
+    - Shows smart vector reversal requirements
+    - Displays common nodes and merge preview
+    - Applies merge with state management
+    """
+
+    def __init__(self, parent, all_lines: List[LevelingLine], selected_indices: List[int] = None):
+        super().__init__(parent)
+        self.title("Merge Line Segments / מיזוג קווים")
+        self.geometry("1000x700")
+        self.transient(parent)
+        self.grab_set()
+
+        self.all_lines = all_lines
+        self.selected_indices = selected_indices
+        self.coordinator = None
+        self.candidates = []
+        self.selected_candidate = None
+        self.merged_line = None
+
+        self._create_widgets()
+        self._find_candidates()
+
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        # Top frame: Instructions
+        top_frame = ttk.Frame(self)
+        top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        ttk.Label(top_frame, text="Line Merge Wizard / אשף מיזוג קווים",
+                 font=('Arial', 12, 'bold')).pack()
+        ttk.Label(top_frame,
+                 text="Intelligently merge line segments with automatic direction alignment",
+                 font=('Arial', 9)).pack()
+
+        # Main content paned window
+        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # Left: Candidates list
+        left_frame = ttk.LabelFrame(paned, text="Merge Candidates / אפשרויות מיזוג")
+        paned.add(left_frame, weight=1)
+
+        # Candidates listbox
+        candidates_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL)
+        self.candidates_listbox = tk.Listbox(left_frame, yscrollcommand=candidates_scroll.set,
+                                            font=('Courier', 9))
+        candidates_scroll.config(command=self.candidates_listbox.yview)
+
+        self.candidates_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        candidates_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+
+        self.candidates_listbox.bind('<<ListboxSelect>>', self._on_candidate_select)
+
+        # Right: Merge preview
+        right_frame = ttk.LabelFrame(paned, text="Merge Preview / תצוגה מקדימה")
+        paned.add(right_frame, weight=2)
+
+        # Preview text
+        self.preview_text = scrolledtext.ScrolledText(right_frame, font=('Consolas', 9),
+                                                      wrap=tk.WORD, height=30)
+        self.preview_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Bottom frame: Actions
+        bottom_frame = ttk.Frame(self)
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(bottom_frame, text="Apply Merge / בצע מיזוג",
+                  command=self._apply_merge).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_frame, text="Cancel / ביטול",
+                  command=self.destroy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_frame, text="Refresh / רענן",
+                  command=self._find_candidates).pack(side=tk.LEFT, padx=5)
+
+        self.status_label = ttk.Label(bottom_frame, text="", foreground="blue")
+        self.status_label.pack(side=tk.LEFT, padx=20)
+
+    def _find_candidates(self):
+        """Find merge candidates using LineCoordinator."""
+        from ..engine.line_coordinator import LineCoordinator
+
+        self.candidates_listbox.delete(0, tk.END)
+        self.preview_text.delete('1.0', tk.END)
+
+        # Initialize coordinator
+        if self.selected_indices:
+            lines_to_check = [self.all_lines[i] for i in self.selected_indices
+                            if i < len(self.all_lines)]
+            self.coordinator = LineCoordinator(lines_to_check)
+        else:
+            self.coordinator = LineCoordinator(self.all_lines)
+
+        # Find candidates
+        self.candidates = self.coordinator.find_merge_candidates()
+
+        if not self.candidates:
+            self.candidates_listbox.insert(tk.END, "No merge candidates found.")
+            self.preview_text.insert(tk.END,
+                "No mergeable line segments detected.\n\n"
+                "Lines can be merged if they:\n"
+                "• Share common endpoints (turning points)\n"
+                "• Form a continuous path\n"
+                "• Are marked as 'used' (not excluded)\n\n"
+                "Tip: Select specific lines first, then try merge.")
+            self.status_label.config(text="No candidates found")
+            return
+
+        # Display candidates
+        for i, candidate in enumerate(self.candidates):
+            summary = self.coordinator.get_merge_summary(candidate)
+            display_text = (f"[{i+1}] {summary['start_point']} → {summary['end_point']} "
+                          f"({summary['num_segments']} segments, "
+                          f"{summary['total_distance']:.1f}m, "
+                          f"{summary['total_setups']} setups)")
+            self.candidates_listbox.insert(tk.END, display_text)
+
+        self.status_label.config(text=f"Found {len(self.candidates)} candidate(s)")
+
+        # Auto-select first candidate
+        if self.candidates:
+            self.candidates_listbox.selection_set(0)
+            self._on_candidate_select(None)
+
+    def _on_candidate_select(self, event):
+        """Handle candidate selection."""
+        selection = self.candidates_listbox.curselection()
+        if not selection:
+            return
+
+        index = selection[0]
+        if index >= len(self.candidates):
+            return
+
+        self.selected_candidate = self.candidates[index]
+        self._show_preview()
+
+    def _show_preview(self):
+        """Show detailed preview of selected merge candidate."""
+        if not self.selected_candidate:
+            return
+
+        self.preview_text.delete('1.0', tk.END)
+
+        summary = self.coordinator.get_merge_summary(self.selected_candidate)
+
+        # Header
+        self.preview_text.insert(tk.END, "=" * 70 + "\n")
+        self.preview_text.insert(tk.END, "MERGE PREVIEW / תצוגה מקדימה\n")
+        self.preview_text.insert(tk.END, "=" * 70 + "\n\n")
+
+        # Summary
+        self.preview_text.insert(tk.END, f"Merged Line: {summary['start_point']} → {summary['end_point']}\n")
+        self.preview_text.insert(tk.END, f"Total Distance: {summary['total_distance']:.2f} m "
+                                        f"({summary['total_distance']/1000:.3f} km)\n")
+        self.preview_text.insert(tk.END, f"Total Setups: {summary['total_setups']}\n")
+        self.preview_text.insert(tk.END, f"Number of Segments: {summary['num_segments']}\n\n")
+
+        # Common nodes
+        if summary['common_nodes']:
+            self.preview_text.insert(tk.END, f"Common Nodes (PKT): {', '.join(summary['common_nodes'])}\n\n")
+
+        # Segments detail
+        self.preview_text.insert(tk.END, "SEGMENTS:\n")
+        self.preview_text.insert(tk.END, "-" * 70 + "\n\n")
+
+        for i, seg in enumerate(summary['segments'], 1):
+            self.preview_text.insert(tk.END, f"Segment {i}:\n")
+            self.preview_text.insert(tk.END, f"  File: {seg['filename']}\n")
+            self.preview_text.insert(tk.END, f"  Direction: {seg['direction']}\n")
+
+            if seg['needs_reversal']:
+                self.preview_text.insert(tk.END, f"  ⚠ REVERSAL REQUIRED (direction will be flipped)\n")
+            else:
+                self.preview_text.insert(tk.END, f"  ✓ Direction OK (no reversal needed)\n")
+
+            self.preview_text.insert(tk.END, f"  Distance: {seg['distance']:.2f} m\n")
+            self.preview_text.insert(tk.END, f"  Setups: {seg['setups']}\n\n")
+
+        # Warnings
+        self.preview_text.insert(tk.END, "=" * 70 + "\n")
+        self.preview_text.insert(tk.END, "APPLY MERGE ACTION:\n")
+        self.preview_text.insert(tk.END, "=" * 70 + "\n\n")
+        self.preview_text.insert(tk.END, "When you click 'Apply Merge':\n")
+        self.preview_text.insert(tk.END, f"• New merged line will be created: MERGED_{summary['start_point']}-{summary['end_point']}\n")
+        self.preview_text.insert(tk.END, f"• Original {summary['num_segments']} segment(s) will be marked as EXCLUDED\n")
+        self.preview_text.insert(tk.END, "• Reversals will be applied automatically where needed\n")
+        self.preview_text.insert(tk.END, "• Setups will be renumbered sequentially\n")
+
+    def _apply_merge(self):
+        """Apply the selected merge (Item 14: State management)."""
+        if not self.selected_candidate:
+            messagebox.showwarning("No Selection", "Please select a merge candidate first")
+            return
+
+        # Confirm action
+        summary = self.coordinator.get_merge_summary(self.selected_candidate)
+        confirm_msg = (f"Apply merge?\n\n"
+                      f"Merged line: {summary['start_point']} → {summary['end_point']}\n"
+                      f"Segments: {summary['num_segments']}\n"
+                      f"Total distance: {summary['total_distance']:.2f} m\n\n"
+                      f"Original segments will be excluded.")
+
+        if not messagebox.askyesno("Confirm Merge", confirm_msg):
+            return
+
+        # Apply merge with state management
+        try:
+            self.merged_line = self.coordinator.apply_merge(
+                self.selected_candidate,
+                self.all_lines,
+                merged_filename=None  # Auto-generate
+            )
+
+            messagebox.showinfo("Merge Complete",
+                f"Successfully merged {summary['num_segments']} segments.\n\n"
+                f"New line: {self.merged_line.filename}\n"
+                f"Start: {self.merged_line.start_point}\n"
+                f"End: {self.merged_line.end_point}\n"
+                f"Distance: {self.merged_line.total_distance:.2f} m\n"
+                f"Setups: {len(self.merged_line.setups)}\n\n"
+                f"Original segments marked as excluded.")
+
+            self.destroy()
+
+        except Exception as e:
+            messagebox.showerror("Merge Error", f"Failed to apply merge:\n{str(e)}")
+
+
 class NetworkAdjustmentDialog(tk.Toplevel):
     """Dialog for network least squares adjustment."""
     
@@ -466,8 +1162,10 @@ class NetworkAdjustmentDialog(tk.Toplevel):
         # Bottom buttons
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, pady=10)
-        
-        ttk.Button(btn_frame, text="Export FA1 / ייצוא", command=self._export_fa1).pack(side=tk.RIGHT, padx=5)
+
+        # Export buttons (Item 6: FA0/FA1 export)
+        ttk.Button(btn_frame, text="Export FA0 (Input)", command=self._export_fa0).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Export FA1 (Report)", command=self._export_fa1).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="Export TXT", command=self._export_txt).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="Close / סגור", command=self.destroy).pack(side=tk.RIGHT, padx=5)
     
@@ -587,28 +1285,122 @@ class NetworkAdjustmentDialog(tk.Toplevel):
         self.viz_canvas = None
         self.viz_tab_frame = viz_tab
 
+    def _prepare_export_data(self):
+        """
+        Prepare benchmarks and observations for FA0/FA1 export.
+
+        Returns:
+            Tuple of (benchmarks, observations) or (None, None) if data incomplete
+        """
+        from config.models import Benchmark, MeasurementSummary
+        from datetime import datetime
+        from pathlib import Path
+
+        # Create benchmarks from fixed points
+        benchmarks = []
+        for point_id, height in self.fixed_points.items():
+            benchmarks.append(Benchmark(
+                point_id=point_id,
+                height=height,
+                order=3  # Default order
+            ))
+
+        # Convert lines to observations
+        observations = []
+        for line in self.lines:
+            # Calculate BF difference (mm)
+            # For now, use 0 as we don't have forward/backward separate measurements
+            bf_diff = 0.0
+
+            # Extract date (MMYY format)
+            if line.date:
+                year_month = line.date.strftime("%m%y")
+            else:
+                # Use current date
+                year_month = datetime.now().strftime("%m%y")
+
+            # Source filename
+            source_file = Path(line.filename).stem if line.filename else "unknown"
+
+            obs = MeasurementSummary(
+                from_point=line.start_point,
+                to_point=line.end_point,
+                height_diff=line.total_height_diff,
+                distance=line.total_distance,
+                num_setups=line.num_setups,
+                bf_diff=bf_diff,
+                year_month=year_month,
+                source_file=source_file
+            )
+            observations.append(obs)
+
+        return benchmarks, observations
+
+    def _export_fa0(self):
+        """Export adjustment input to FA0 format (Item 6)."""
+        if not self.fixed_points:
+            messagebox.showinfo("Info", "Please select fixed points first")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".FA0",
+            filetypes=[("FA0 files", "*.FA0"), ("All files", "*.*")],
+            initialfile="network_input.FA0"
+        )
+
+        if filename:
+            try:
+                from exporters import FA0Exporter
+
+                benchmarks, observations = self._prepare_export_data()
+
+                exporter = FA0Exporter()
+                exporter.export(
+                    filepath=filename,
+                    benchmarks=benchmarks,
+                    observations=observations,
+                    project_name=Path(filename).stem
+                )
+                messagebox.showinfo("Export", f"FA0 file saved to:\n{filename}")
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export FA0:\n{str(e)}")
+                import traceback
+                traceback.print_exc()
+
     def _export_fa1(self):
+        """Export adjustment results to FA1 format (Item 6)."""
         if not self.result:
             messagebox.showinfo("Info", "Please run adjustment first")
             return
-        
+
         filename = filedialog.asksaveasfilename(
             defaultextension=".FA1",
             filetypes=[("FA1 files", "*.FA1"), ("All files", "*.*")],
             initialfile="network_adjustment.FA1"
         )
-        
+
         if filename:
             try:
                 from exporters import FA1Exporter
+                from pathlib import Path
+
+                benchmarks, observations = self._prepare_export_data()
+
                 exporter = FA1Exporter()
-                exporter.export(self.result, self.lines, filename)
+                exporter.export(
+                    filepath=filename,
+                    benchmarks=benchmarks,
+                    observations=observations,
+                    result=self.result,
+                    project_name=Path(filename).stem
+                )
                 messagebox.showinfo("Export", f"FA1 file saved to:\n{filename}")
             except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export FA1:\n{str(e)}\n\nFalling back to text export")
                 # Fallback - save as text
                 with open(filename, 'w', encoding='cp1255', errors='replace') as f:
                     f.write(self.results_text.get('1.0', tk.END))
-                messagebox.showinfo("Export", f"Results saved to:\n{filename}")
+                messagebox.showinfo("Export", f"Results saved as text to:\n{filename}")
     
     def _export_txt(self):
         if not self.result:
@@ -1873,6 +2665,11 @@ class GeodeticToolGUI:
         self.lines: List[LevelingLine] = []
         self.file_paths: List[str] = []
 
+        # NEW: Session tracking for removed/excluded files (Item 16)
+        self.removed_files_log: List[Dict[str, Any]] = []
+        from datetime import datetime
+        self.session_start_time = datetime.now()
+
         # NEW: Project management
         from ..config.models import ProjectData
         from ..config.project_manager import ProjectManager
@@ -1908,6 +2705,8 @@ class GeodeticToolGUI:
         file_menu.add_command(label="Export Results... / ייצוא תוצאות", command=self._export_results)
         file_menu.add_command(label="Export to QGIS... / ייצוא ל-QGIS", command=self._export_qgis)
         file_menu.add_separator()
+        file_menu.add_command(label="View Removed Files Report... / דוח קבצים שהוסרו", command=self._view_removed_files_report)
+        file_menu.add_separator()
         file_menu.add_command(label="Exit / יציאה", command=self.root.quit, accelerator="Alt+F4")
 
         # NEW: Project menu
@@ -1931,7 +2730,19 @@ class GeodeticToolGUI:
         analysis_menu.add_command(label="Network Adjustment (LSA) / תיאום רשת", command=self._network_adjustment)
         analysis_menu.add_command(label="Network Adjustment (Enhanced) / תיאום רשת משופר",
                                  command=self._network_adjustment_enhanced, accelerator="Ctrl+Shift+N")
-        
+        analysis_menu.add_separator()
+        analysis_menu.add_command(label="Merge Line Segments... / מיזוג קווים",
+                                 command=self._merge_lines, accelerator="Ctrl+M")
+
+        # Settings menu (Phase 4, Item 4, 15)
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Settings / הגדרות", menu=settings_menu)
+        settings_menu.add_command(label="Class Parameters... / פרמטרי דרגות דיוק",
+                                 command=self._show_class_settings)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Point Exclusion... / הדרת נקודות",
+                                 command=self._manage_point_exclusion)
+
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help / עזרה", menu=help_menu)
@@ -1941,6 +2752,7 @@ class GeodeticToolGUI:
         # Keyboard shortcuts
         self.root.bind('<Control-o>', lambda e: self._open_files())
         self.root.bind('<Control-Shift-N>', lambda e: self._network_adjustment_enhanced())
+        self.root.bind('<Control-m>', lambda e: self._merge_lines())
     
     def _create_main_layout(self):
         """Create the main layout with paned windows."""
@@ -2075,25 +2887,47 @@ class GeodeticToolGUI:
         setups_scroll.pack(side=tk.RIGHT, fill=tk.Y)
     
     def _create_validation_panel(self, parent: ttk.Frame):
-        """Create the validation results panel."""
-        columns = ('File', 'Start', 'End', 'Setups', 'Distance', 'dH', 'Status', 'Errors')
+        """Create the validation results panel with enhanced features (Phase 2, Items 1,2,7,8,11)."""
+        # Action buttons frame at top
+        action_frame = ttk.Frame(parent)
+        action_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(action_frame, text="Actions / פעולות:").pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Toggle Direction / הפוך כיוון",
+                   command=self._toggle_validation_direction).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_frame, text="Toggle Use / שנה שימוש",
+                   command=self._toggle_validation_use).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_frame, text="Refresh / רענן",
+                   command=self._validate_all).pack(side=tk.LEFT, padx=2)
+
+        # Enhanced columns with Δh (Measured) and better status
+        columns = ('File', 'Start', 'End', 'Setups', 'Distance', 'dH', 'Δh_Meas', 'Status', 'Details')
         self.validation_tree = ttk.Treeview(parent, columns=columns, show='headings')
-        
-        for col in columns:
-            self.validation_tree.heading(col, text=col)
-        
+
+        # Dynamic headers will be set in _validate_all based on data
+        self.validation_tree.heading('File', text='File')
+        self.validation_tree.heading('Start', text='Start')
+        self.validation_tree.heading('End', text='End')
+        self.validation_tree.heading('Setups', text='Setups')
+        self.validation_tree.heading('Distance', text='Distance')  # Will be updated dynamically
+        self.validation_tree.heading('dH', text='dH [m]')
+        self.validation_tree.heading('Δh_Meas', text='Δh (Meas) [mm]')
+        self.validation_tree.heading('Status', text='Status')
+        self.validation_tree.heading('Details', text='Details')
+
         self.validation_tree.column('File', width=100)
         self.validation_tree.column('Start', width=80)
         self.validation_tree.column('End', width=80)
         self.validation_tree.column('Setups', width=60)
         self.validation_tree.column('Distance', width=80)
         self.validation_tree.column('dH', width=100)
-        self.validation_tree.column('Status', width=80)
-        self.validation_tree.column('Errors', width=200)
-        
+        self.validation_tree.column('Δh_Meas', width=100)
+        self.validation_tree.column('Status', width=120)
+        self.validation_tree.column('Details', width=250)
+
         scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.validation_tree.yview)
         self.validation_tree.configure(yscrollcommand=scrollbar.set)
-        
+
         self.validation_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
     
@@ -2187,7 +3021,21 @@ class GeodeticToolGUI:
         self._set_status("Ready")
     
     def _clear_files(self):
-        """Clear all loaded files."""
+        """Clear all loaded files (Item 16: logs to removed files report)."""
+        from datetime import datetime
+
+        # Log all cleared files to removed files report
+        for line in self.lines:
+            self.removed_files_log.append({
+                'timestamp': datetime.now(),
+                'filename': line.filename,
+                'action': 'Cleared',
+                'reason': 'User cleared all files',
+                'start_point': line.start_point,
+                'end_point': line.end_point,
+                'distance_m': line.total_distance
+            })
+
         self.lines.clear()
         self.file_paths.clear()
         self.file_listbox.delete(0, tk.END)
@@ -2200,7 +3048,23 @@ class GeodeticToolGUI:
         paths = self.file_paths.copy()
         self._clear_files()
         self._load_files(paths)
-    
+
+    def _refresh_file_list(self):
+        """Refresh file listbox to reflect current state of all lines (Phase 3, Item 14)."""
+        # Clear listbox
+        self.file_listbox.delete(0, tk.END)
+
+        # Repopulate with all lines
+        for line in self.lines:
+            display_name = line.filename or f"{line.start_point}-{line.end_point}"
+            used_marker = "✓" if line.is_used else "✗"
+            self.file_listbox.insert(tk.END, f"{used_marker} {display_name}: {line.start_point} → {line.end_point}")
+
+        # Update summary
+        total_dist = sum(line.total_distance for line in self.lines if line.is_used)
+        used_count = sum(1 for line in self.lines if line.is_used)
+        self.summary_label.config(text=f"{used_count}/{len(self.lines)} files used, {total_dist:.0f} m total")
+
     def _on_file_select(self, event):
         """Handle file selection."""
         selection = self.file_listbox.curselection()
@@ -2268,38 +3132,100 @@ class GeodeticToolGUI:
         self.setups_tree.delete(*self.setups_tree.get_children())
     
     def _validate_all(self):
-        """Validate all loaded files."""
+        """Validate all loaded files with enhanced reporting (Phase 2, Items 1,2,11)."""
         if not self.lines:
             messagebox.showinfo("No Files", "Please load files first")
             return
-        
+
         self._set_status("Validating...")
-        
+
         # Clear previous results
         self.validation_tree.delete(*self.validation_tree.get_children())
-        
+
+        # Item 1: Determine dynamic unit for distance column
+        if self.lines:
+            avg_distance = sum(line.total_distance for line in self.lines) / len(self.lines)
+            use_km = avg_distance > 1000.0
+            distance_unit = "km" if use_km else "m"
+            self.validation_tree.heading('Distance', text=f'Distance [{distance_unit}]')
+
+        # Item 11: Detect double-run pairs for Δh (Measured) column
+        double_run_pairs = detect_double_runs(self.lines)
+        double_run_map = {}  # Maps line to its pair and misclosure
+        analyzer = LoopAnalyzer()
+
+        for fwd, ret in double_run_pairs:
+            result = analyzer.analyze_double_run(fwd, ret)
+            if result['valid']:
+                # Store misclosure in mm for both forward and return
+                delta_h_mm = result['misclosure_mm']
+                double_run_map[id(fwd)] = {'pair': ret, 'delta_h': delta_h_mm}
+                double_run_map[id(ret)] = {'pair': fwd, 'delta_h': delta_h_mm}
+
+        # Validate all lines
         validator = BatchValidator()
         results = validator.validate_batch(self.lines)
-        
+
         for line, result in results:
-            status_text = "✓ Valid" if result.is_valid else "✗ Invalid"
-            errors = "; ".join(result.errors) if result.errors else ""
-            
+            # Item 2: Enhanced status with specific failure reasons
+            if result.is_valid:
+                status_text = "✓ PASS"
+                status_detail = "All checks passed"
+            else:
+                # Determine primary failure reason
+                if not result.endpoint_valid:
+                    status_text = "✗ FAIL: Endpoint"
+                    status_detail = "Invalid endpoint (turning point or numeric)"
+                elif not result.naming_valid:
+                    status_text = "✗ FAIL: Naming"
+                    status_detail = "Front-to-back naming error"
+                elif not result.tolerance_valid:
+                    status_text = "✗ FAIL: Tolerance"
+                    if line.misclosure:
+                        status_detail = f"Misclosure {line.misclosure:.2f}mm exceeds tolerance"
+                    else:
+                        status_detail = "Exceeds tolerance limits"
+                elif not result.data_complete:
+                    status_text = "✗ FAIL: Incomplete"
+                    status_detail = "Missing data or insufficient setups"
+                else:
+                    status_text = "✗ FAIL: Other"
+                    status_detail = "; ".join(result.errors[:2]) if result.errors else "Validation failed"
+
+            # Format distance with dynamic unit
+            if use_km:
+                distance_str = f"{line.total_distance / 1000.0:.3f}"
+            else:
+                distance_str = f"{line.total_distance:.2f}"
+
+            # Item 11: Get Δh (Measured) for double-runs
+            delta_h_str = "-"
+            if id(line) in double_run_map:
+                delta_h_str = f"{double_run_map[id(line)]['delta_h']:.2f}"
+
+            # Add warnings to detail if present
+            if result.warnings:
+                if status_detail == "All checks passed":
+                    status_detail = f"⚠ {'; '.join(result.warnings[:2])}"
+                else:
+                    status_detail += f" | ⚠ {result.warnings[0]}"
+
             self.validation_tree.insert('', tk.END, values=(
                 line.filename or "-",
                 line.start_point or "-",
                 line.end_point or "-",
                 len(line.setups),
-                f"{line.total_distance:.2f}",
+                distance_str,
                 f"{line.total_height_diff:.5f}",
+                delta_h_str,
                 status_text,
-                errors
+                status_detail
             ))
-        
+
         # Switch to validation tab
         self.notebook.select(1)
         self._set_status("Validation complete")
-        self._log(f"Validated {len(self.lines)} files")
+        self._log(f"Validated {len(self.lines)} files ({len(double_run_pairs)} double-run pairs detected)")
     
     def _detect_double_runs(self):
         """Detect double-run pairs."""
@@ -2434,7 +3360,36 @@ class GeodeticToolGUI:
         self.root.wait_window(dialog)
         if dialog.result:
             self._log("Enhanced network adjustment completed")
-    
+
+    def _merge_lines(self):
+        """Open merge line segments dialog (Phase 3, Items 5, 12/13, 14)."""
+        if not self.lines:
+            messagebox.showinfo(
+                "No Data",
+                "Please load leveling files first."
+            )
+            return
+
+        if len(self.lines) < 2:
+            messagebox.showinfo(
+                "Not Enough Lines",
+                "Merge requires at least 2 lines."
+            )
+            return
+
+        # Get selected lines from listbox (if any)
+        selection = self.file_listbox.curselection()
+        selected_indices = list(selection) if selection else None
+
+        # Open merge dialog
+        dialog = MergeDialog(self.root, self.lines, selected_indices)
+        self.root.wait_window(dialog)
+
+        if dialog.merged_line:
+            # Refresh file listbox to show merged line and excluded originals
+            self._refresh_file_list()
+            self._log(f"Merge completed: {dialog.merged_line.filename}")
+
     def _export_results(self):
         """Export results to files."""
         if not self.lines:
@@ -2522,7 +3477,30 @@ TOLERANCE CLASSES:
 • Class 4: 20 mm × √km (Fourth order)
         """
         messagebox.showinfo("Documentation", docs_text)
-    
+
+    def _show_class_settings(self):
+        """Show class settings dialog (Phase 4, Item 4)."""
+        dialog = ClassSettingsDialog(self.root)
+        self.root.wait_window(dialog)
+        self._log("Viewed class parameters")
+
+    def _manage_point_exclusion(self):
+        """Open point exclusion dialog (Phase 4, Item 15)."""
+        if not self.lines:
+            messagebox.showinfo(
+                "No Data",
+                "Please load leveling files first."
+            )
+            return
+
+        dialog = PointExclusionDialog(self.root, self.lines)
+        self.root.wait_window(dialog)
+
+        if dialog.excluded_lines:
+            # Refresh file listbox to reflect exclusions
+            self._refresh_file_list()
+            self._log(f"Point exclusion: {len(dialog.excluded_lines)} line(s) affected")
+
     def _show_about(self):
         """Show about dialog."""
         about_text = """
@@ -2720,21 +3698,36 @@ Total Points: {len(self.current_project.get_all_points())}
         if index < len(self.lines):
             line = self.lines[index]
             old_method = line.method
+            old_start = line.start_point
+            old_end = line.end_point
+
+            # Toggle direction (swaps start/end and inverts dH)
             line.toggle_direction()
 
-            # Update display
+            # CRITICAL FIX: Update listbox entry to reflect new start/end points
+            # This prevents name duplication bugs (e.g., PointA -> PointA_1)
+            display_name = line.filename or f"{line.start_point}-{line.end_point}"
+            used_marker = "✓" if line.is_used else "✗"
+            self.file_listbox.delete(index)
+            self.file_listbox.insert(index, f"{used_marker} {display_name}: {line.start_point} → {line.end_point}")
+            self.file_listbox.selection_set(index)  # Re-select the item
+
+            # Update detail panel
             self._show_line_details(line)
+
             messagebox.showinfo("Direction Toggled",
                 f"Line direction changed:\n"
                 f"{old_method} → {line.method}\n\n"
-                f"Start: {line.start_point}\n"
-                f"End: {line.end_point}\n"
+                f"Old: {old_start} → {old_end}\n"
+                f"New: {line.start_point} → {line.end_point}\n\n"
                 f"Height difference inverted: {line.total_height_diff:.5f} m"
             )
-            self._log(f"Toggled direction for {line.filename}: {old_method} → {line.method}")
+            self._log(f"Toggled direction for {line.filename}: {old_start}→{old_end} to {line.start_point}→{line.end_point}")
 
     def _toggle_line_used(self):
-        """Toggle is_used flag for selected line."""
+        """Toggle is_used flag for selected line (Item 16: tracks exclusions)."""
+        from datetime import datetime
+
         selection = self.file_listbox.curselection()
         if not selection:
             messagebox.showinfo("No Selection", "Please select a line first")
@@ -2743,7 +3736,21 @@ Total Points: {len(self.current_project.get_all_points())}
         index = selection[0]
         if index < len(self.lines):
             line = self.lines[index]
+            old_status = line.is_used
             line.is_used = not line.is_used
+
+            # Track file exclusion in removed files log (Item 16)
+            if old_status and not line.is_used:
+                # File was excluded
+                self.removed_files_log.append({
+                    'timestamp': datetime.now(),
+                    'filename': line.filename,
+                    'action': 'Excluded',
+                    'reason': 'User toggled file to excluded state',
+                    'start_point': line.start_point,
+                    'end_point': line.end_point,
+                    'distance_m': line.total_distance
+                })
 
             # Update display
             display_name = line.filename or f"{line.start_point}-{line.end_point}"
@@ -2754,6 +3761,197 @@ Total Points: {len(self.current_project.get_all_points())}
 
             status = "Included" if line.is_used else "Excluded"
             self._log(f"{status}: {line.filename}")
+
+    def _toggle_validation_direction(self):
+        """Toggle direction for line selected in validation table (Item 7)."""
+        selection = self.validation_tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Please select a line from the validation table first")
+            return
+
+        # Get selected item index
+        selected_item = selection[0]
+        item_values = self.validation_tree.item(selected_item)['values']
+        filename = item_values[0]
+
+        # Find corresponding line
+        line = None
+        for l in self.lines:
+            if (l.filename or "-") == filename:
+                line = l
+                break
+
+        if not line:
+            messagebox.showerror("Error", "Could not find corresponding line")
+            return
+
+        old_start = line.start_point
+        old_end = line.end_point
+
+        # Toggle direction
+        line.toggle_direction()
+
+        # Update file listbox if the line is displayed there
+        for i, l in enumerate(self.lines):
+            if l is line:
+                display_name = line.filename or f"{line.start_point}-{line.end_point}"
+                used_marker = "✓" if line.is_used else "✗"
+                self.file_listbox.delete(i)
+                self.file_listbox.insert(i, f"{used_marker} {display_name}: {line.start_point} → {line.end_point}")
+                break
+
+        # Refresh validation table (Item 8: immediate recalculation)
+        self._validate_all()
+
+        self._log(f"Toggled direction in validation: {old_start}→{old_end} to {line.start_point}→{line.end_point}")
+
+    def _toggle_validation_use(self):
+        """Toggle is_used flag for line selected in validation table (Item 8: immediate recalculation)."""
+        from datetime import datetime
+
+        selection = self.validation_tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Please select a line from the validation table first")
+            return
+
+        # Get selected item index
+        selected_item = selection[0]
+        item_values = self.validation_tree.item(selected_item)['values']
+        filename = item_values[0]
+
+        # Find corresponding line
+        line = None
+        line_index = -1
+        for i, l in enumerate(self.lines):
+            if (l.filename or "-") == filename:
+                line = l
+                line_index = i
+                break
+
+        if not line:
+            messagebox.showerror("Error", "Could not find corresponding line")
+            return
+
+        old_status = line.is_used
+        line.is_used = not line.is_used
+
+        # Track file exclusion in removed files log (Item 16)
+        if old_status and not line.is_used:
+            self.removed_files_log.append({
+                'timestamp': datetime.now(),
+                'filename': line.filename,
+                'action': 'Excluded',
+                'reason': 'User toggled file to excluded state from validation table',
+                'start_point': line.start_point,
+                'end_point': line.end_point,
+                'distance_m': line.total_distance
+            })
+
+        # Update file listbox
+        if line_index >= 0:
+            display_name = line.filename or f"{line.start_point}-{line.end_point}"
+            used_marker = "✓" if line.is_used else "✗"
+            self.file_listbox.delete(line_index)
+            self.file_listbox.insert(line_index, f"{used_marker} {display_name}: {line.start_point} → {line.end_point}")
+
+        # Refresh validation table (Item 8: immediate recalculation)
+        self._validate_all()
+
+        status = "Included" if line.is_used else "Excluded"
+        self._log(f"{status} from validation table: {line.filename}")
+
+    def _view_removed_files_report(self):
+        """View removed/excluded files report (Item 16)."""
+        if not self.removed_files_log:
+            messagebox.showinfo("No Removed Files",
+                "No files have been removed or excluded during this session.\n\n"
+                f"Session started: {self.session_start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            return
+
+        # Create report dialog
+        report_dialog = tk.Toplevel(self.root)
+        report_dialog.title("Removed Files Report - דוח קבצים שהוסרו")
+        report_dialog.geometry("900x600")
+        report_dialog.transient(self.root)
+
+        # Header
+        header_frame = ttk.Frame(report_dialog)
+        header_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(header_frame, text="Removed/Excluded Files Report",
+                 font=('Arial', 14, 'bold')).pack(anchor=tk.W)
+        ttk.Label(header_frame,
+                 text=f"Session start: {self.session_start_time.strftime('%Y-%m-%d %H:%M:%S')}",
+                 font=('Arial', 10)).pack(anchor=tk.W)
+        ttk.Label(header_frame,
+                 text=f"Total removed/excluded: {len(self.removed_files_log)} file(s)",
+                 font=('Arial', 10, 'bold'), foreground='red').pack(anchor=tk.W)
+
+        # Report text area
+        text_frame = ttk.Frame(report_dialog)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        report_text = scrolledtext.ScrolledText(text_frame, font=('Consolas', 10), wrap=tk.WORD)
+        report_text.pack(fill=tk.BOTH, expand=True)
+
+        # Build report content
+        report_text.insert(tk.END, "=" * 100 + "\n")
+        report_text.insert(tk.END, "REMOVED/EXCLUDED FILES REPORT\n")
+        report_text.insert(tk.END, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        report_text.insert(tk.END, "=" * 100 + "\n\n")
+
+        for i, entry in enumerate(self.removed_files_log, 1):
+            report_text.insert(tk.END, f"[{i}] {entry['action'].upper()}\n")
+            report_text.insert(tk.END, f"    Time:     {entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}\n")
+            report_text.insert(tk.END, f"    File:     {entry['filename']}\n")
+            report_text.insert(tk.END, f"    Points:   {entry['start_point']} → {entry['end_point']}\n")
+            report_text.insert(tk.END, f"    Distance: {entry['distance_m']:.2f} m\n")
+            report_text.insert(tk.END, f"    Reason:   {entry['reason']}\n")
+            report_text.insert(tk.END, "-" * 100 + "\n\n")
+
+        report_text.insert(tk.END, "=" * 100 + "\n")
+        report_text.insert(tk.END, f"END OF REPORT - Total: {len(self.removed_files_log)} file(s)\n")
+        report_text.configure(state='disabled')
+
+        # Buttons
+        btn_frame = ttk.Frame(report_dialog)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(btn_frame, text="Export Report",
+                  command=lambda: self._export_removed_files_report(report_text.get('1.0', tk.END))).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Clear Log",
+                  command=lambda: self._clear_removed_files_log(report_dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=report_dialog.destroy).pack(side=tk.RIGHT, padx=5)
+
+    def _export_removed_files_report(self, report_content: str):
+        """Export removed files report to text file."""
+        from tkinter import filedialog
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"removed_files_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(report_content)
+                messagebox.showinfo("Export Successful", f"Report exported to:\n{filename}")
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export report:\n{str(e)}")
+
+    def _clear_removed_files_log(self, dialog=None):
+        """Clear the removed files log."""
+        if messagebox.askyesno("Confirm Clear",
+            "Are you sure you want to clear the removed files log?\n\n"
+            "This action cannot be undone."):
+            self.removed_files_log.clear()
+            self._log("Removed files log cleared")
+            if dialog:
+                dialog.destroy()
+            messagebox.showinfo("Log Cleared", "Removed files log has been cleared.")
 
 
 def main():

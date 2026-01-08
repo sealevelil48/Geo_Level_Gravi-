@@ -2,6 +2,7 @@
 Validators Package
 
 Validation logic for geodetic leveling data.
+Updated to comply with Survey of Israel Directive ג2 (2021).
 """
 import re
 from pathlib import Path
@@ -12,10 +13,13 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ..config.models import (
-    LevelingLine, ValidationResult, LineStatus
+    LevelingLine, ValidationResult, LineStatus, StationSetup
 )
 from ..config.settings import (
     get_settings, is_benchmark, is_turning_point, calculate_tolerance
+)
+from ..config.israel_survey_regulations import (
+    get_class_parameters, calculate_new_tolerance, MeasurementType
 )
 
 
@@ -23,35 +27,61 @@ logger = logging.getLogger(__name__)
 
 
 class LevelingValidator:
-    """Validator for leveling lines."""
-    
-    def __init__(self):
+    """
+    Validator for leveling lines.
+
+    Validates according to Survey of Israel Directive ג2 (06/06/2021).
+    Supports accuracy classes H1-H6 with specific requirements for each.
+    """
+
+    def __init__(self, leveling_class: int = 3, use_new_regulations: bool = True):
+        """
+        Initialize validator.
+
+        Args:
+            leveling_class: Accuracy class (1-6), defaults to H3
+            use_new_regulations: Use new 2021 regulations (recommended)
+        """
         self.settings = get_settings()
+        self.leveling_class = leveling_class
+        self.use_new_regulations = use_new_regulations
+
+        if use_new_regulations:
+            try:
+                self.class_params = get_class_parameters(leveling_class)
+            except ValueError as e:
+                logger.warning(f"Failed to load class parameters: {e}. Using defaults.")
+                self.class_params = None
+        else:
+            self.class_params = None
     
     def validate(self, line: LevelingLine) -> ValidationResult:
         """
         Perform all validation checks on a leveling line.
-        
+
         Args:
             line: LevelingLine to validate
-            
+
         Returns:
             ValidationResult with all checks
         """
         result = ValidationResult(is_valid=True)
-        
-        # Check endpoint
+
+        # Standard checks
         result.endpoint_valid = self._check_endpoint(line, result)
-        
-        # Check naming convention
         result.naming_valid = self._check_naming(line, result)
-        
-        # Check data completeness
         result.data_complete = self._check_completeness(line, result)
-        
-        # Check tolerance if we have known heights
+
+        # New regulation-based checks (if enabled)
+        if self.use_new_regulations and self.class_params:
+            self._check_line_length(line, result)
+            self._check_sight_distances(line, result)
+            self._check_measurement_method(line, result)
+            self._check_distance_balance(line, result)
+
+        # Tolerance check (uses new formula if available)
         result.tolerance_valid = self._check_tolerance(line, result)
-        
+
         return result
     
     def _check_endpoint(self, line: LevelingLine, result: ValidationResult) -> bool:
@@ -130,11 +160,156 @@ class LevelingValidator:
         
         return True
     
+    def _check_line_length(self, line: LevelingLine, result: ValidationResult) -> bool:
+        """
+        Check if line length is within class limits (נספח ב', סעיף 1.2).
+
+        Args:
+            line: LevelingLine to check
+            result: ValidationResult to update
+
+        Returns:
+            True if valid or no limit, False if exceeds
+        """
+        if not self.class_params:
+            return True
+
+        distance_km = line.total_distance / 1000.0
+        is_valid, message = self.class_params.validate_line_length(distance_km)
+
+        if not is_valid:
+            result.add_error(message)
+            return False
+
+        return True
+
+    def _check_sight_distances(self, line: LevelingLine, result: ValidationResult) -> bool:
+        """
+        Check if sight distances are within class limits (נספח ב', סעיף 2.1, 3.1).
+
+        Validates individual setup distances against maximum allowed
+        for geometric or trigonometric leveling.
+
+        Args:
+            line: LevelingLine to check
+            result: ValidationResult to update
+
+        Returns:
+            True if all distances valid, False otherwise
+        """
+        if not self.class_params:
+            return True
+
+        # Determine measurement type from method
+        # For now, assume geometric if method is BF/BFFB
+        # In future, could be enhanced with actual instrument type
+        measurement_type = MeasurementType.GEOMETRIC
+
+        all_valid = True
+        max_violations = 5  # Limit error messages
+
+        for i, setup in enumerate(line.setups):
+            if i >= max_violations:
+                result.add_warning(f"... and {len(line.setups) - i} more setups not checked")
+                break
+
+            # Check backsight distance
+            if setup.distance_back is not None:
+                is_valid, message = self.class_params.validate_sight_distance(
+                    setup.distance_back, measurement_type
+                )
+                if not is_valid:
+                    result.add_error(f"Setup {setup.setup_number} backsight: {message}")
+                    all_valid = False
+
+            # Check foresight distance
+            if setup.distance_fore is not None:
+                is_valid, message = self.class_params.validate_sight_distance(
+                    setup.distance_fore, measurement_type
+                )
+                if not is_valid:
+                    result.add_error(f"Setup {setup.setup_number} foresight: {message}")
+                    all_valid = False
+
+        return all_valid
+
+    def _check_measurement_method(self, line: LevelingLine, result: ValidationResult) -> bool:
+        """
+        Check if measurement method meets class requirements (נספח ב', סעיף 1.5).
+
+        Args:
+            line: LevelingLine to check
+            result: ValidationResult to update
+
+        Returns:
+            True if method is valid, False otherwise
+        """
+        if not self.class_params:
+            return True
+
+        is_valid, message = self.class_params.validate_method(line.method)
+
+        if not is_valid:
+            result.add_error(message)
+            return False
+
+        return True
+
+    def _check_distance_balance(self, line: LevelingLine, result: ValidationResult) -> bool:
+        """
+        Check if backsight/foresight distances are balanced (נספח ב', סעיף 1.3, 1.4).
+
+        Validates:
+        1. Individual setup balance (max difference per setup)
+        2. Cumulative balance over entire line
+
+        Args:
+            line: LevelingLine to check
+            result: ValidationResult to update
+
+        Returns:
+            True if balanced, False otherwise
+        """
+        if not self.class_params:
+            return True
+
+        cumulative_diff = 0.0
+        all_valid = True
+
+        for setup in line.setups:
+            if setup.distance_back is None or setup.distance_fore is None:
+                continue
+
+            # Check individual setup balance
+            diff = abs(setup.distance_back - setup.distance_fore)
+            if diff > self.class_params.max_single_distance_imbalance_m:
+                result.add_error(
+                    f"Setup {setup.setup_number}: Distance imbalance {diff:.2f} m "
+                    f"exceeds limit {self.class_params.max_single_distance_imbalance_m} m"
+                )
+                all_valid = False
+
+            # Accumulate for cumulative check
+            cumulative_diff += (setup.distance_back - setup.distance_fore)
+
+        # Check cumulative balance
+        if abs(cumulative_diff) > self.class_params.max_cumulative_distance_imbalance_m:
+            result.add_error(
+                f"Cumulative distance imbalance {abs(cumulative_diff):.2f} m "
+                f"exceeds limit {self.class_params.max_cumulative_distance_imbalance_m} m"
+            )
+            all_valid = False
+
+        return all_valid
+
     def _check_tolerance(self, line: LevelingLine, result: ValidationResult,
                          known_dh: float = None) -> bool:
         """
         Check if misclosure is within tolerance.
-        
+
+        Uses new Survey of Israel formula if enabled:
+        Tolerance = k × √(Distance_km)
+
         Args:
             line: LevelingLine to check
             result: ValidationResult to update
@@ -143,31 +318,47 @@ class LevelingValidator:
         if known_dh is None:
             # Cannot check without known heights
             return True
-        
+
         # Calculate misclosure
         computed_dh = line.total_height_diff
-        misclosure = abs(computed_dh - known_dh) * 1000  # Convert to mm
-        
-        # Calculate allowable tolerance
-        tolerance = calculate_tolerance(line.total_distance)
-        
-        line.misclosure = misclosure
-        
-        if misclosure > tolerance:
+        misclosure_m = abs(computed_dh - known_dh)
+        misclosure_mm = misclosure_m * 1000
+
+        # Calculate allowable tolerance (using new or old formula)
+        if self.use_new_regulations and self.class_params:
+            distance_km = line.total_distance / 1000.0
+            tolerance_mm = self.class_params.get_tolerance_mm(distance_km)
+            formula_used = f"±{self.class_params.tolerance_coefficient}√L"
+        else:
+            tolerance_mm = calculate_tolerance(line.total_distance, self.leveling_class)
+            formula_used = "legacy"
+
+        line.misclosure = misclosure_mm
+
+        if misclosure_mm > tolerance_mm:
             result.add_error(
-                f"Misclosure ({misclosure:.2f} mm) exceeds tolerance ({tolerance:.2f} mm)"
+                f"Misclosure {misclosure_mm:.2f} mm exceeds tolerance {tolerance_mm:.2f} mm "
+                f"(Class {self.class_params.class_name if self.class_params else self.leveling_class}, "
+                f"formula: {formula_used})"
             )
             line.status = LineStatus.EXCEEDED_TOLERANCE
             return False
-        
+
         return True
 
 
 class BatchValidator:
     """Validator for multiple leveling lines."""
-    
-    def __init__(self):
-        self.validator = LevelingValidator()
+
+    def __init__(self, leveling_class: int = 3, use_new_regulations: bool = True):
+        """
+        Initialize batch validator.
+
+        Args:
+            leveling_class: Accuracy class (1-6), defaults to H3
+            use_new_regulations: Use new 2021 regulations (recommended)
+        """
+        self.validator = LevelingValidator(leveling_class, use_new_regulations)
     
     def validate_batch(self, lines: List[LevelingLine]) -> List[Tuple[LevelingLine, ValidationResult]]:
         """
