@@ -19,7 +19,8 @@ from ..config.settings import (
     get_settings, is_benchmark, is_turning_point, calculate_tolerance
 )
 from ..config.israel_survey_regulations import (
-    get_class_parameters, calculate_new_tolerance, MeasurementType
+    get_class_parameters, calculate_new_tolerance, MeasurementType,
+    get_default_class, get_class_parameters_by_name
 )
 
 
@@ -34,15 +35,22 @@ class LevelingValidator:
     Supports accuracy classes H1-H6 with specific requirements for each.
     """
 
-    def __init__(self, leveling_class: int = 3, use_new_regulations: bool = True):
+    def __init__(self, leveling_class: Optional[int] = None, use_new_regulations: bool = True):
         """
         Initialize validator.
 
         Args:
-            leveling_class: Accuracy class (1-6), defaults to H3
+            leveling_class: Accuracy class (1-6), if None uses user's default class setting
             use_new_regulations: Use new 2021 regulations (recommended)
         """
         self.settings = get_settings()
+
+        # If no class specified, use user's default class setting
+        if leveling_class is None:
+            default_class_name = get_default_class()
+            # Convert class name (H3) to number (3)
+            leveling_class = int(default_class_name[1])  # Extract number from "H3" -> 3
+
         self.leveling_class = leveling_class
         self.use_new_regulations = use_new_regulations
 
@@ -237,6 +245,9 @@ class LevelingValidator:
         """
         Check if measurement method meets class requirements (נספח ב', סעיף 1.5).
 
+        If the measurement method doesn't match the target class requirements,
+        attempts to find a compatible class and validates against that instead.
+
         Args:
             line: LevelingLine to check
             result: ValidationResult to update
@@ -250,6 +261,30 @@ class LevelingValidator:
         is_valid, message = self.class_params.validate_method(line.method)
 
         if not is_valid:
+            # Try to find a compatible class for this method
+            # BF method is allowed in H4-H6, BFFB method is required in H1-H3
+            compatible_class = None
+            if line.method == "BF":
+                # Use H4 as default for BF measurements
+                compatible_class = 4
+            elif line.method == "BFFB":
+                # Keep current class if it requires BFFB
+                if self.leveling_class in [1, 2, 3]:
+                    compatible_class = self.leveling_class
+                else:
+                    compatible_class = 3  # Default to H3 for BFFB
+
+            if compatible_class:
+                # Update to compatible class parameters
+                try:
+                    self.class_params = get_class_parameters(compatible_class)
+                    self.leveling_class = compatible_class
+                    # Add informational message
+                    result.add_warning(f"Line uses {line.method} method, auto-classified as H{compatible_class}")
+                    return True
+                except ValueError:
+                    pass
+
             result.add_error(message)
             return False
 
@@ -350,12 +385,12 @@ class LevelingValidator:
 class BatchValidator:
     """Validator for multiple leveling lines."""
 
-    def __init__(self, leveling_class: int = 3, use_new_regulations: bool = True):
+    def __init__(self, leveling_class: Optional[int] = None, use_new_regulations: bool = True):
         """
         Initialize batch validator.
 
         Args:
-            leveling_class: Accuracy class (1-6), defaults to H3
+            leveling_class: Accuracy class (1-6), if None uses user's default class setting
             use_new_regulations: Use new 2021 regulations (recommended)
         """
         self.validator = LevelingValidator(leveling_class, use_new_regulations)

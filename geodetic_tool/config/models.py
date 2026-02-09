@@ -24,6 +24,8 @@ class LineStatus(Enum):
     INCOMPLETE = "incomplete"              # Missing data
     EXCEEDED_TOLERANCE = "exceeded_tolerance"
     EXCLUDED_FROM_MERGE = "excluded_from_merge"  # Original line merged into another (Phase 3, Item 14)
+    MERGED = "merged"  # Resulting merged line (Item 14)
+    EXCLUDED = "excluded"  # General exclusion (manual or point-based)
 
 
 @dataclass

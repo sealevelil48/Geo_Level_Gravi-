@@ -36,9 +36,10 @@ try:
     from matplotlib.figure import Figure
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
-except ImportError:
+    print("Info: matplotlib loaded successfully. Visualization features enabled.")
+except Exception as e:
     MATPLOTLIB_AVAILABLE = False
-    print("Warning: matplotlib not available. Visualization features will be disabled.")
+    print(f"Warning: matplotlib not available. Visualization features will be disabled. Error: {e}")
 
 
 class BenchmarkDialog(tk.Toplevel):
@@ -598,6 +599,7 @@ class ClassSettingsDialog(tk.Toplevel):
         self.grab_set()
 
         self.modified = False
+        self.param_entries = {}  # Store entry widgets for editing
 
         self._create_widgets()
         self._load_parameters()
@@ -675,29 +677,44 @@ class ClassSettingsDialog(tk.Toplevel):
             header_frame = ttk.LabelFrame(frame, text=f"Class {params.class_name} Parameters")
             header_frame.pack(fill=tk.X, padx=10, pady=10)
 
-            # Tolerance formula
-            ttk.Label(header_frame, text="Tolerance Formula:",
+            # Tolerance formula (editable)
+            ttk.Label(header_frame, text="Tolerance Coefficient (mm×√km):",
                      font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
-            ttk.Label(header_frame, text=f"±{params.tolerance_coefficient} mm × √(Distance_km)",
-                     font=('Courier', 10)).grid(row=0, column=1, sticky=tk.W, pady=5)
+            tolerance_var = tk.DoubleVar(value=params.tolerance_coefficient)
+            tolerance_entry = ttk.Entry(header_frame, textvariable=tolerance_var, width=15)
+            tolerance_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
+            self.param_entries[f"H{class_num}_tolerance"] = (tolerance_var, 'tolerance_coefficient')
+            tolerance_entry.bind('<KeyRelease>', lambda e: setattr(self, 'modified', True))
 
-            # Distance limits
-            ttk.Label(header_frame, text="Max Line Length:",
+            # Distance limits (editable)
+            ttk.Label(header_frame, text="Max Line Length (km, 0=unlimited):",
                      font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
-            max_length = f"{params.max_line_length_km} km" if params.max_line_length_km else "Unlimited (אין)"
-            ttk.Label(header_frame, text=max_length).grid(row=1, column=1, sticky=tk.W, pady=5)
+            max_length_val = params.max_line_length_km if params.max_line_length_km else 0
+            max_length_var = tk.DoubleVar(value=max_length_val)
+            max_length_entry = ttk.Entry(header_frame, textvariable=max_length_var, width=15)
+            max_length_entry.grid(row=1, column=1, sticky=tk.W, pady=5)
+            self.param_entries[f"H{class_num}_max_length"] = (max_length_var, 'max_line_length_km')
+            max_length_entry.bind('<KeyRelease>', lambda e: setattr(self, 'modified', True))
 
-            # Sight distances
-            sight_frame = ttk.LabelFrame(frame, text="Sight Distance Limits")
+            # Sight distances (editable)
+            sight_frame = ttk.LabelFrame(frame, text="Sight Distance Limits (meters)")
             sight_frame.pack(fill=tk.X, padx=10, pady=10)
 
-            ttk.Label(sight_frame, text="Geometric Leveling:",
+            ttk.Label(sight_frame, text="Geometric Leveling (m):",
                      font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
-            ttk.Label(sight_frame, text=f"{params.max_sight_distance_geometric_m} m").grid(row=0, column=1, sticky=tk.W, pady=5)
+            sight_geom_var = tk.DoubleVar(value=params.max_sight_distance_geometric_m)
+            sight_geom_entry = ttk.Entry(sight_frame, textvariable=sight_geom_var, width=15)
+            sight_geom_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
+            self.param_entries[f"H{class_num}_sight_geom"] = (sight_geom_var, 'max_sight_distance_geometric_m')
+            sight_geom_entry.bind('<KeyRelease>', lambda e: setattr(self, 'modified', True))
 
-            ttk.Label(sight_frame, text="Trigonometric Leveling:",
+            ttk.Label(sight_frame, text="Trigonometric Leveling (m):",
                      font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
-            ttk.Label(sight_frame, text=f"{params.max_sight_distance_trigonometric_m} m").grid(row=1, column=1, sticky=tk.W, pady=5)
+            sight_trig_var = tk.DoubleVar(value=params.max_sight_distance_trigonometric_m)
+            sight_trig_entry = ttk.Entry(sight_frame, textvariable=sight_trig_var, width=15)
+            sight_trig_entry.grid(row=1, column=1, sticky=tk.W, pady=5)
+            self.param_entries[f"H{class_num}_sight_trig"] = (sight_trig_var, 'max_sight_distance_trigonometric_m')
+            sight_trig_entry.bind('<KeyRelease>', lambda e: setattr(self, 'modified', True))
 
             # Measurement method
             method_frame = ttk.LabelFrame(frame, text="Measurement Requirements")
@@ -712,17 +729,25 @@ class ClassSettingsDialog(tk.Toplevel):
                      font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
             ttk.Label(method_frame, text="Yes / כן" if params.requires_double_run else "No / לא").grid(row=1, column=1, sticky=tk.W, pady=5)
 
-            # Distance balance
-            balance_frame = ttk.LabelFrame(frame, text="Distance Balance Requirements")
+            # Distance balance (editable)
+            balance_frame = ttk.LabelFrame(frame, text="Distance Balance Requirements (meters)")
             balance_frame.pack(fill=tk.X, padx=10, pady=10)
 
-            ttk.Label(balance_frame, text="Max Single Setup Imbalance:",
+            ttk.Label(balance_frame, text="Max Single Setup Imbalance (m):",
                      font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
-            ttk.Label(balance_frame, text=f"{params.max_single_distance_imbalance_m} m").grid(row=0, column=1, sticky=tk.W, pady=5)
+            single_imb_var = tk.DoubleVar(value=params.max_single_distance_imbalance_m)
+            single_imb_entry = ttk.Entry(balance_frame, textvariable=single_imb_var, width=15)
+            single_imb_entry.grid(row=0, column=1, sticky=tk.W, pady=5)
+            self.param_entries[f"H{class_num}_single_imb"] = (single_imb_var, 'max_single_distance_imbalance_m')
+            single_imb_entry.bind('<KeyRelease>', lambda e: setattr(self, 'modified', True))
 
-            ttk.Label(balance_frame, text="Max Cumulative Imbalance:",
+            ttk.Label(balance_frame, text="Max Cumulative Imbalance (m):",
                      font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
-            ttk.Label(balance_frame, text=f"{params.max_cumulative_distance_imbalance_m} m").grid(row=1, column=1, sticky=tk.W, pady=5)
+            cum_imb_var = tk.DoubleVar(value=params.max_cumulative_distance_imbalance_m)
+            cum_imb_entry = ttk.Entry(balance_frame, textvariable=cum_imb_var, width=15)
+            cum_imb_entry.grid(row=1, column=1, sticky=tk.W, pady=5)
+            self.param_entries[f"H{class_num}_cum_imb"] = (cum_imb_var, 'max_cumulative_distance_imbalance_m')
+            cum_imb_entry.bind('<KeyRelease>', lambda e: setattr(self, 'modified', True))
 
             # Special requirements
             special_frame = ttk.LabelFrame(frame, text="Special Requirements")
@@ -766,20 +791,83 @@ class ClassSettingsDialog(tk.Toplevel):
         self.status_label.config(text="Loaded parameters from regulations")
 
     def _save_changes(self):
-        """Save modified parameters (placeholder for future implementation)."""
-        messagebox.showinfo("Info",
-            "Parameter editing is view-only in this version.\n\n"
-            "To modify parameters, edit:\n"
-            "geodetic_tool/config/israel_survey_regulations.py\n\n"
-            "Future versions may support in-app editing.")
+        """Save modified parameters to settings file (Item 5)."""
+        from ..config import israel_survey_regulations
+        from ..config.israel_survey_regulations import CLASS_REGISTRY
+
+        if not self.modified:
+            messagebox.showinfo("No Changes", "No changes to save.")
+            return
+
+        # Validate and apply changes to CLASS_REGISTRY
+        try:
+            for key, (var, attr_name) in self.param_entries.items():
+                # Extract class number from key (e.g., "H3_tolerance" -> 3)
+                class_num = int(key.split('_')[0][1:])
+                value = var.get()
+
+                # Validate value
+                if value < 0:
+                    raise ValueError(f"Negative value not allowed for {attr_name}")
+
+                # Special handling for max_line_length_km (0 means None)
+                if attr_name == 'max_line_length_km' and value == 0:
+                    value = None
+
+                # Update CLASS_REGISTRY
+                setattr(CLASS_REGISTRY[class_num], attr_name, value)
+
+            # Save current parameters to settings file
+            success = israel_survey_regulations.save_user_settings()
+
+        except ValueError as e:
+            messagebox.showerror("Validation Error", f"Invalid parameter value:\n{str(e)}")
+            return
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to apply changes:\n{str(e)}")
+            return
+
+        if success:
+            self.status_label.config(text="✓ Settings saved successfully", foreground="green")
+            messagebox.showinfo("Success",
+                "Settings saved to:\n~/.geodetic_tool/settings.json\n\n"
+                "Changes will be applied on next application start.")
+        else:
+            self.status_label.config(text="✗ Failed to save settings", foreground="red")
+            messagebox.showerror("Error", "Failed to save settings file")
 
     def _reset_defaults(self):
-        """Reset to default regulation parameters."""
-        if messagebox.askyesno("Reset Defaults",
-                              "Reset all parameters to Survey of Israel defaults?\n\n"
-                              "This will reload the parameters from regulations."):
+        """Reset to default Survey of Israel regulation parameters (Item 5)."""
+        from ..config import israel_survey_regulations
+
+        if not messagebox.askyesno("Reset Defaults",
+                                  "Reset all parameters to Survey of Israel defaults?\n\n"
+                                  "This will delete your custom settings file and\n"
+                                  "revert to official Directive ג2 (2021) specifications.\n\n"
+                                  "Continue?"):
+            return
+
+        # Reset settings file
+        success = israel_survey_regulations.reset_to_defaults()
+
+        if success:
+            # Reload parameters from defaults
+            israel_survey_regulations.load_user_settings()
+
+            # Clear and reload UI
+            for frame in self.class_frames.values():
+                for widget in frame.scrollable_frame.winfo_children():
+                    widget.destroy()
+
             self._load_parameters()
-            self.status_label.config(text="Reset to defaults")
+
+            self.status_label.config(text="✓ Reset to Survey of Israel defaults", foreground="green")
+            messagebox.showinfo("Reset Complete",
+                "Parameters reset to official Survey of Israel defaults.\n\n"
+                "Directive ג2 (06/06/2021) specifications restored.")
+        else:
+            self.status_label.config(text="✗ Failed to reset settings", foreground="red")
+            messagebox.showerror("Error", "Failed to reset settings")
 
 
 class MergeDialog(tk.Toplevel):
@@ -2253,7 +2341,7 @@ class EnhancedNetworkAdjustmentDialog(tk.Toplevel):
         for line in self.lines:
             from_pt = line.start_point
             to_pt = line.end_point
-            observed_dh = line.height_diff
+            observed_dh = line.total_height_diff
 
             # Calculate adjusted dH
             if from_pt in self.result.adjusted_heights and to_pt in self.result.adjusted_heights:
@@ -2263,8 +2351,9 @@ class EnhancedNetworkAdjustmentDialog(tk.Toplevel):
 
                 # Calculate standardized residual if available
                 std_residual = 0.0
-                if hasattr(self.result, 'residuals') and line in self.result.residuals:
-                    std_residual = self.result.residuals[line]
+                line_key = f"{from_pt}-{to_pt}"
+                if hasattr(self.result, 'residuals') and line_key in self.result.residuals:
+                    std_residual = self.result.residuals[line_key]
 
                 # Determine tag based on residual magnitude
                 if abs(residual_mm) > 3.0:
@@ -2343,88 +2432,102 @@ class EnhancedNetworkAdjustmentDialog(tk.Toplevel):
     def _populate_visualization(self):
         """Create visualization of residuals using matplotlib."""
         if not self.result or not MATPLOTLIB_AVAILABLE:
+            logger.warning("Visualization skipped: result=%s, matplotlib=%s",
+                          bool(self.result), MATPLOTLIB_AVAILABLE)
             return
 
-        # Get visualization tab
-        viz_tab = self.results_notebook.nametowidget(
-            self.results_notebook.tabs()[3]  # 4th tab (index 3)
-        )
+        try:
+            # Get visualization tab
+            viz_tab = self.results_notebook.nametowidget(
+                self.results_notebook.tabs()[3]  # 4th tab (index 3)
+            )
 
-        # Clear existing canvas if any
-        for widget in viz_tab.winfo_children():
-            widget.destroy()
+            # Clear existing canvas if any
+            for widget in viz_tab.winfo_children():
+                widget.destroy()
 
-        # Create matplotlib figure
-        fig = Figure(figsize=(10, 6), dpi=100)
+            # Create matplotlib figure
+            fig = Figure(figsize=(10, 6), dpi=100)
 
-        # Create two subplots: bar chart and histogram
-        ax1 = fig.add_subplot(121)
-        ax2 = fig.add_subplot(122)
+            # Create two subplots: bar chart and histogram
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
 
-        # Collect residuals
-        residuals_mm = []
-        line_labels = []
+            # Collect residuals
+            residuals_mm = []
+            line_labels = []
 
-        for line in self.lines:
-            from_pt = line.start_point
-            to_pt = line.end_point
-            observed_dh = line.height_diff
+            for line in self.lines:
+                from_pt = line.start_point
+                to_pt = line.end_point
+                observed_dh = line.total_height_diff
 
-            if from_pt in self.result.adjusted_heights and to_pt in self.result.adjusted_heights:
-                adjusted_dh = self.result.adjusted_heights[to_pt] - self.result.adjusted_heights[from_pt]
-                residual = (observed_dh - adjusted_dh) * 1000  # mm
-                residuals_mm.append(residual)
-                line_labels.append(f"{from_pt}-{to_pt}")
+                if from_pt in self.result.adjusted_heights and to_pt in self.result.adjusted_heights:
+                    adjusted_dh = self.result.adjusted_heights[to_pt] - self.result.adjusted_heights[from_pt]
+                    residual = (observed_dh - adjusted_dh) * 1000  # mm
+                    residuals_mm.append(residual)
+                    line_labels.append(f"{from_pt}-{to_pt}")
 
-        # Plot 1: Bar chart of residuals
-        colors = ['red' if abs(r) > 3.0 else 'orange' if abs(r) > 2.0 else 'green'
-                  for r in residuals_mm]
-        ax1.bar(range(len(residuals_mm)), residuals_mm, color=colors, alpha=0.7)
-        ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        ax1.axhline(y=2, color='orange', linestyle='--', linewidth=0.5, alpha=0.5)
-        ax1.axhline(y=-2, color='orange', linestyle='--', linewidth=0.5, alpha=0.5)
-        ax1.axhline(y=3, color='red', linestyle='--', linewidth=0.5, alpha=0.5)
-        ax1.axhline(y=-3, color='red', linestyle='--', linewidth=0.5, alpha=0.5)
-        ax1.set_xlabel('Observation Number')
-        ax1.set_ylabel('Residual (mm)')
-        ax1.set_title('Residuals by Observation')
-        ax1.grid(True, alpha=0.3)
+            # Plot 1: Bar chart of residuals
+            colors = ['red' if abs(r) > 3.0 else 'orange' if abs(r) > 2.0 else 'green'
+                      for r in residuals_mm]
+            ax1.bar(range(len(residuals_mm)), residuals_mm, color=colors, alpha=0.7)
+            ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+            ax1.axhline(y=2, color='orange', linestyle='--', linewidth=0.5, alpha=0.5)
+            ax1.axhline(y=-2, color='orange', linestyle='--', linewidth=0.5, alpha=0.5)
+            ax1.axhline(y=3, color='red', linestyle='--', linewidth=0.5, alpha=0.5)
+            ax1.axhline(y=-3, color='red', linestyle='--', linewidth=0.5, alpha=0.5)
+            ax1.set_xlabel('Observation Number')
+            ax1.set_ylabel('Residual (mm)')
+            ax1.set_title('Residuals by Observation')
+            ax1.grid(True, alpha=0.3)
 
-        # Plot 2: Histogram
-        ax2.hist(residuals_mm, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
-        ax2.axvline(x=0, color='black', linestyle='-', linewidth=1)
-        ax2.set_xlabel('Residual (mm)')
-        ax2.set_ylabel('Frequency')
-        ax2.set_title('Residual Distribution')
-        ax2.grid(True, alpha=0.3)
+            # Plot 2: Histogram
+            ax2.hist(residuals_mm, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
+            ax2.axvline(x=0, color='black', linestyle='-', linewidth=1)
+            ax2.set_xlabel('Residual (mm)')
+            ax2.set_ylabel('Frequency')
+            ax2.set_title('Residual Distribution')
+            ax2.grid(True, alpha=0.3)
 
-        # Add statistics text
-        import numpy as np
-        mean_res = np.mean(residuals_mm)
-        std_res = np.std(residuals_mm)
-        ax2.text(
-            0.95, 0.95,
-            f'Mean: {mean_res:.2f} mm\nStd: {std_res:.2f} mm',
-            transform=ax2.transAxes,
-            verticalalignment='top',
-            horizontalalignment='right',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-        )
+            # Add statistics text
+            import numpy as np
+            mean_res = np.mean(residuals_mm)
+            std_res = np.std(residuals_mm)
+            ax2.text(
+                0.95, 0.95,
+                f'Mean: {mean_res:.2f} mm\nStd: {std_res:.2f} mm',
+                transform=ax2.transAxes,
+                verticalalignment='top',
+                horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+            )
 
-        fig.tight_layout()
+            fig.tight_layout()
 
-        # Create canvas
-        canvas = FigureCanvasTkAgg(fig, master=viz_tab)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            # Create canvas
+            canvas = FigureCanvasTkAgg(fig, master=viz_tab)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Add toolbar
-        toolbar_frame = ttk.Frame(viz_tab)
-        toolbar_frame.pack(fill=tk.X)
-        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
-        toolbar.update()
+            # Add toolbar
+            toolbar_frame = ttk.Frame(viz_tab)
+            toolbar_frame.pack(fill=tk.X)
+            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+            toolbar.update()
 
-        self.viz_canvas = canvas
+            self.viz_canvas = canvas
+
+        except Exception as e:
+            logger.error(f"Error creating visualization: {e}", exc_info=True)
+            # Show error message in viz tab
+            error_label = ttk.Label(
+                viz_tab,
+                text=f"Error creating visualization:\n{str(e)}\n\nCheck logs for details.",
+                font=('Arial', 10),
+                foreground='red'
+            )
+            error_label.pack(expand=True)
 
     # Export Methods
 
@@ -2492,7 +2595,7 @@ class EnhancedNetworkAdjustmentDialog(tk.Toplevel):
                     for line in self.lines:
                         from_pt = line.start_point
                         to_pt = line.end_point
-                        observed_dh = line.height_diff
+                        observed_dh = line.total_height_diff
 
                         if from_pt in self.result.adjusted_heights and to_pt in self.result.adjusted_heights:
                             adjusted_dh = self.result.adjusted_heights[to_pt] - self.result.adjusted_heights[from_pt]
@@ -2551,7 +2654,7 @@ class EnhancedNetworkAdjustmentDialog(tk.Toplevel):
                     for line in self.lines:
                         from_pt = line.start_point
                         to_pt = line.end_point
-                        observed_dh = line.height_diff
+                        observed_dh = line.total_height_diff
 
                         if from_pt in self.result.adjusted_heights and to_pt in self.result.adjusted_heights:
                             adjusted_dh = self.result.adjusted_heights[to_pt] - self.result.adjusted_heights[from_pt]
@@ -2599,7 +2702,7 @@ class EnhancedNetworkAdjustmentDialog(tk.Toplevel):
                 for line in self.lines:
                     from_pt = line.start_point
                     to_pt = line.end_point
-                    observed_dh = line.height_diff
+                    observed_dh = line.total_height_diff
 
                     if from_pt in self.result.adjusted_heights and to_pt in self.result.adjusted_heights:
                         adjusted_dh = self.result.adjusted_heights[to_pt] - self.result.adjusted_heights[from_pt]
@@ -2660,10 +2763,14 @@ class GeodeticToolGUI:
         self.root.title("Geodetic Leveling Tool - פילוס גיאודטי")
         self.root.geometry("1200x800")
         self.root.minsize(800, 600)
-        
+
         # Data storage
         self.lines: List[LevelingLine] = []
         self.file_paths: List[str] = []
+
+        # Settings
+        from ..config.settings import get_settings
+        self.settings = get_settings()
 
         # NEW: Session tracking for removed/excluded files (Item 16)
         self.removed_files_log: List[Dict[str, Any]] = []
@@ -2739,6 +2846,8 @@ class GeodeticToolGUI:
         menubar.add_cascade(label="Settings / הגדרות", menu=settings_menu)
         settings_menu.add_command(label="Class Parameters... / פרמטרי דרגות דיוק",
                                  command=self._show_class_settings)
+        settings_menu.add_command(label="Encoding... / קידוד תווים",
+                                 command=self._show_encoding_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="Point Exclusion... / הדרת נקודות",
                                  command=self._manage_point_exclusion)
@@ -2900,9 +3009,13 @@ class GeodeticToolGUI:
         ttk.Button(action_frame, text="Refresh / רענן",
                    command=self._validate_all).pack(side=tk.LEFT, padx=2)
 
+        # Create container frame for treeview and scrollbars (to allow grid inside pack)
+        tree_container = ttk.Frame(parent)
+        tree_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
         # Enhanced columns with Δh (Measured) and better status
         columns = ('File', 'Start', 'End', 'Setups', 'Distance', 'dH', 'Δh_Meas', 'Status', 'Details')
-        self.validation_tree = ttk.Treeview(parent, columns=columns, show='headings')
+        self.validation_tree = ttk.Treeview(tree_container, columns=columns, show='headings')
 
         # Dynamic headers will be set in _validate_all based on data
         self.validation_tree.heading('File', text='File')
@@ -2923,13 +3036,21 @@ class GeodeticToolGUI:
         self.validation_tree.column('dH', width=100)
         self.validation_tree.column('Δh_Meas', width=100)
         self.validation_tree.column('Status', width=120)
-        self.validation_tree.column('Details', width=250)
+        self.validation_tree.column('Details', width=400)  # Increased width for better readability
 
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.validation_tree.yview)
-        self.validation_tree.configure(yscrollcommand=scrollbar.set)
+        # Add both vertical and horizontal scrollbars using grid inside container
+        v_scrollbar = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.validation_tree.yview)
+        h_scrollbar = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL, command=self.validation_tree.xview)
+        self.validation_tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
 
-        self.validation_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+        # Use grid inside the container
+        self.validation_tree.grid(row=0, column=0, sticky='nsew')
+        v_scrollbar.grid(row=0, column=1, sticky='ns')
+        h_scrollbar.grid(row=1, column=0, sticky='ew')
+
+        # Configure grid weights for proper resizing
+        tree_container.grid_rowconfigure(0, weight=1)
+        tree_container.grid_columnconfigure(0, weight=1)
     
     def _create_analysis_panel(self, parent: ttk.Frame):
         """Create the analysis results panel."""
@@ -2942,15 +3063,111 @@ class GeodeticToolGUI:
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     
     def _create_status_bar(self):
-        """Create the status bar."""
+        """Create the status bar with class selector."""
+        status_frame = ttk.Frame(self.root, relief=tk.SUNKEN)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Status message (left side)
         self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        status_label = ttk.Label(status_frame, textvariable=self.status_var, anchor=tk.W)
+        status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # Class selector (right side)
+        class_frame = ttk.Frame(status_frame)
+        class_frame.pack(side=tk.RIGHT, padx=10, pady=2)
+
+        ttk.Label(class_frame, text="Active Class / דרגת דיוק:", font=('Arial', 9)).pack(side=tk.LEFT, padx=(0, 5))
+
+        # Load current default class
+        from ..config.israel_survey_regulations import get_default_class
+        current_class = get_default_class()
+
+        self.class_selector_var = tk.StringVar(value=current_class)
+        class_selector = ttk.Combobox(
+            class_frame,
+            textvariable=self.class_selector_var,
+            values=["H1", "H2", "H3", "H4", "H5", "H6"],
+            state="readonly",
+            width=6,
+            font=('Arial', 9, 'bold')
+        )
+        class_selector.pack(side=tk.LEFT)
+        class_selector.bind('<<ComboboxSelected>>', self._on_class_changed)
+
+        # Add info button next to class selector
+        info_btn = ttk.Button(class_frame, text="ℹ️", width=3, command=self._show_class_info)
+        info_btn.pack(side=tk.LEFT, padx=2)
     
     def _set_status(self, message: str):
         """Update status bar."""
         self.status_var.set(message)
         self.root.update_idletasks()
+
+    def _on_class_changed(self, event=None):
+        """Handle class selection change."""
+        from ..config.israel_survey_regulations import set_default_class, get_class_parameters_by_name
+
+        selected_class = self.class_selector_var.get()
+
+        # Save the new default class
+        success = set_default_class(selected_class)
+
+        if success:
+            # Get class parameters for display
+            params = get_class_parameters_by_name(selected_class)
+            self._set_status(f"Active class set to {selected_class} (Tolerance: ±{params.tolerance_coefficient}mm√L)")
+            self._log(f"Active leveling class changed to {selected_class}")
+        else:
+            messagebox.showerror("Error", "Failed to save class selection")
+            self._set_status("Error saving class selection")
+
+    def _show_class_info(self):
+        """Show information about the currently selected class."""
+        from ..config.israel_survey_regulations import get_class_parameters_by_name
+
+        selected_class = self.class_selector_var.get()
+        params = get_class_parameters_by_name(selected_class)
+
+        info_text = f"""Class {selected_class} Parameters (Survey of Israel Directive ג2)
+
+Tolerance: ±{params.tolerance_coefficient} mm × √(Distance_km)
+
+Distance Limits:
+• Max Line Length: {params.max_line_length_km if params.max_line_length_km else 'Unlimited'} km
+
+Sight Distance Limits:
+• Geometric Leveling: {params.max_sight_distance_geometric_m} m
+• Trigonometric Leveling: {params.max_sight_distance_trigonometric_m} m
+
+Measurement Requirements:
+• Method: {params.required_method} {'(Back-Fore-Fore-Back)' if params.required_method == 'BFFB' else '(Back-Fore)'}
+• Double-Run Required: {'Yes' if params.requires_double_run else 'No'}
+
+Distance Balance:
+• Max Single Setup Imbalance: {params.max_single_distance_imbalance_m} m
+• Max Cumulative Imbalance: {params.max_cumulative_distance_imbalance_m} m
+
+Special Requirements:"""
+
+        if params.requires_invar_staff:
+            info_text += "\n• Invar Staff Required"
+        if params.requires_staff_supports:
+            info_text += "\n• Staff Supports Required"
+        if params.requires_calibration_monthly:
+            info_text += "\n• Monthly Calibration Required"
+        if params.requires_orthometric_correction:
+            info_text += "\n• Orthometric Correction Required"
+        if params.max_instrument_error_mm_per_km:
+            info_text += f"\n• Max Instrument Error: {params.max_instrument_error_mm_per_km} mm/km"
+        if params.max_days_for_double_run:
+            info_text += f"\n• Complete Double-Run Within: {params.max_days_for_double_run} days"
+
+        if not any([params.requires_invar_staff, params.requires_staff_supports,
+                   params.requires_calibration_monthly, params.requires_orthometric_correction,
+                   params.max_instrument_error_mm_per_km, params.max_days_for_double_run]):
+            info_text += "\n• None"
+
+        messagebox.showinfo(f"Class {selected_class} Information", info_text)
     
     def _log(self, message: str):
         """Add message to log."""
@@ -3101,7 +3318,21 @@ class GeodeticToolGUI:
         self.detail_vars['setups'].set(str(len(line.setups)))
         self.detail_vars['distance'].set(f"{line.total_distance:.2f} m")
         self.detail_vars['height_diff'].set(f"{line.total_height_diff:.5f} m")
-        self.detail_vars['status'].set(line.status.value if hasattr(line.status, 'value') else str(line.status))
+
+        # Show actual validation result, not cached status
+        validator = BatchValidator()
+        validation_result = validator.validate_single(line)
+        if validation_result.is_valid:
+            status_text = "valid - all checks passed"
+            if validation_result.warnings:
+                status_text += f" (⚠ {len(validation_result.warnings)} warning(s))"
+        else:
+            if validation_result.errors:
+                status_text = f"invalid - {validation_result.errors[0]}"
+            else:
+                status_text = "invalid"
+
+        self.detail_vars['status'].set(status_text)
         
         # Update setups table
         self.setups_tree.delete(*self.setups_tree.get_children())
@@ -3483,6 +3714,61 @@ TOLERANCE CLASSES:
         dialog = ClassSettingsDialog(self.root)
         self.root.wait_window(dialog)
         self._log("Viewed class parameters")
+
+    def _show_encoding_settings(self):
+        """Show encoding settings dialog."""
+        current_encoding = self.settings.encoding.output_encoding
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Encoding Settings / הגדרות קידוד")
+        dialog.geometry("500x300")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Main frame
+        main_frame = ttk.Frame(dialog, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title
+        title_label = ttk.Label(main_frame, text="File Encoding Configuration",
+                               font=("Arial", 14, "bold"))
+        title_label.pack(pady=(0, 20))
+
+        # Current settings frame
+        settings_frame = ttk.LabelFrame(main_frame, text="Current Settings", padding="15")
+        settings_frame.pack(fill=tk.X, pady=10)
+
+        # Output encoding
+        output_frame = ttk.Frame(settings_frame)
+        output_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(output_frame, text="Output Encoding (for exports):", width=30).pack(side=tk.LEFT)
+        ttk.Label(output_frame, text=current_encoding,
+                 font=("Courier", 10, "bold")).pack(side=tk.LEFT)
+
+        # Input encoding
+        input_frame = ttk.Frame(settings_frame)
+        input_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(input_frame, text="Input Encoding (for reading files):", width=30).pack(side=tk.LEFT)
+        ttk.Label(input_frame, text=self.settings.encoding.default_encoding,
+                 font=("Courier", 10, "bold")).pack(side=tk.LEFT)
+
+        # Info label
+        info_text = (
+            "Hebrew Support:\n"
+            "• cp1255 (Windows-1255) - Recommended for Hebrew files\n"
+            "• utf-8 - Universal encoding (may have issues with Hebrew)\n\n"
+            "Current configuration uses cp1255 for proper Hebrew character support."
+        )
+        info_label = ttk.Label(main_frame, text=info_text, justify=tk.LEFT,
+                              foreground="navy")
+        info_label.pack(pady=20)
+
+        # Close button
+        close_btn = ttk.Button(main_frame, text="Close / סגור",
+                              command=dialog.destroy)
+        close_btn.pack(pady=10)
+
+        self._log("Viewed encoding settings")
 
     def _manage_point_exclusion(self):
         """Open point exclusion dialog (Phase 4, Item 15)."""

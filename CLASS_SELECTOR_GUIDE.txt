@@ -1,0 +1,141 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    CLASS SELECTOR FEATURE - QUICK GUIDE                      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+✓ IMPLEMENTATION COMPLETE - All Tests Passed!
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ LOCATION IN GUI                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+The class selector is located at the BOTTOM-RIGHT of the main window:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Geodetic Leveling Tool - פילוס גיאודטי                          [_][□][X] │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ File   Project   Analysis   Settings   Help                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│                        [Your workspace here]                                │
+│                                                                             │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Ready                        Active Class / דרגת דיוק: [H3 ▼] [ℹ]          │
+└─────────────────────────────────────────────────────────────────────────────┘
+        ↑                                                    ↑      ↑
+   Status msg                                         Selector  Info button
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ HOW TO USE                                                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+1. SELECT A CLASS:
+   - Click the dropdown showing "H3" (or current class)
+   - Choose from: H1, H2, H3, H4, H5, H6
+   - Selection is saved automatically
+
+2. VIEW CLASS INFO:
+   - Click the [ℹ] button next to the selector
+   - See all parameters for the selected class:
+     • Tolerance formula
+     • Distance limits
+     • Sight distance limits
+     • Measurement requirements
+     • Special requirements
+
+3. ALL OPERATIONS USE THE SELECTED CLASS:
+   - Validations
+   - Tolerance calculations
+   - Network adjustments
+   - Export functions
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ CLASS COMPARISON                                                             │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+╔════════╦═════════════╦═══════════════╦══════════════╦═════════════════════╗
+║ Class  ║ Tolerance   ║ Max Line (km) ║ Max Sight (m)║ Required Method     ║
+╠════════╬═════════════╬═══════════════╬══════════════╬═════════════════════╣
+║   H1   ║ ±3mm√L      ║   Unlimited   ║      30      ║ BFFB (highest)      ║
+║   H2   ║ ±5mm√L      ║      60       ║      40      ║ BFFB                ║
+║   H3   ║ ±10mm√L     ║      24       ║      50      ║ BFFB (recommended)  ║
+║   H4   ║ ±20mm√L     ║      10       ║      80      ║ BF                  ║
+║   H5   ║ ±30mm√L     ║       5       ║     100      ║ BF                  ║
+║   H6   ║ ±60mm√L     ║       4       ║     100      ║ BF (lowest)         ║
+╚════════╩═════════════╩═══════════════╩══════════════╩═════════════════════╝
+
+Legend:
+  • √L = Square root of distance in kilometers
+  • BFFB = Back-Fore-Fore-Back (higher precision)
+  • BF = Back-Fore (standard)
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ SETTINGS FILE                                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Your class selection is saved to:
+  Windows: C:\Users\<username>\.geodetic_tool\settings.json
+  Linux:   ~/.geodetic_tool/settings.json
+
+The file is created automatically when you select a class.
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ WHAT'S NEW                                                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+✓ Visual class selector in status bar
+✓ Info button for quick reference
+✓ Automatic persistence across sessions
+✓ All validators use default class
+✓ All calculations use default class
+✓ Backwards compatible (existing code unchanged)
+✓ Compliant with Israeli Survey Directive ג2 (2021)
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ EXAMPLE WORKFLOW                                                             │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+1. Open the Geodetic Tool
+2. Set your project class (e.g., H3 for third-order surveys)
+3. Load your leveling files
+4. All validations automatically use H3 parameters
+5. Perform network adjustment
+6. Export results
+7. Next session: H3 is still selected automatically
+
+That's it! The tool remembers your preference.
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ TESTING                                                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Run the test suite to verify functionality:
+  > python test_class_selector.py
+
+All 5 tests passed successfully:
+  [PASS] Test 1: Default Class Setting
+  [PASS] Test 2: Class Parameters
+  [PASS] Test 3: Validator Using Default Class
+  [PASS] Test 4: Tolerance Calculation
+  [PASS] Test 5: Settings Persistence
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ SUPPORT                                                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+For more details, see:
+  - FEATURE_CLASS_SELECTOR.md (detailed documentation)
+  - test_class_selector.py (test suite and examples)
+  - geodetic_tool/config/israel_survey_regulations.py (class definitions)
+
+Based on:
+  Survey of Israel Directive ג2
+  "מדידה וחישוב גבהים אורתומטריים בשיטות קרקעיות"
+  Date: 06/06/2021, Edition 1

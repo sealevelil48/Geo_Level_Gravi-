@@ -41,7 +41,8 @@ class Loop:
         Determine class based on misclosure using new regulations (H1-H6).
 
         Returns:
-            Class number (1-6), or 0 if exceeds all tolerances
+            Class number (1-6). If exceeds all tolerances, returns 6 (least precise class).
+            Note: Removed "exceed all" (0) logic per Item 10 - always returns valid class.
         """
         dist_km = self.total_distance / 1000.0
         misclosure_mm = abs(self.misclosure * 1000)
@@ -56,14 +57,36 @@ class Loop:
             except ValueError:
                 continue
 
-        return 0  # Exceeds all tolerances
+        # If exceeds all, return H6 (not 0!)
+        # The caller should use check_tolerance() to determine if it exceeds target class
+        return 6
+
+    def check_tolerance(self, target_class: int = 3) -> tuple[bool, float, float]:
+        """
+        Check if loop satisfies target class tolerance (Item 10).
+
+        Args:
+            target_class: Target class (1-6), default H3
+
+        Returns:
+            (within_tolerance, misclosure_mm, tolerance_mm)
+        """
+        dist_km = self.total_distance / 1000.0
+        misclosure_mm = abs(self.misclosure * 1000)
+
+        params = get_class_parameters(target_class)
+        tolerance_mm = params.get_tolerance_mm(dist_km)
+
+        within_tolerance = misclosure_mm <= tolerance_mm
+
+        return within_tolerance, misclosure_mm, tolerance_mm
     
-    def calculate_misclosure(self, target_class: int = 1):
+    def calculate_misclosure(self, target_class: int = 3):
         """
         Calculate the misclosure of the loop.
 
         Args:
-            target_class: Target accuracy class (1-6), defaults to H1 (strictest)
+            target_class: Target accuracy class (1-6), defaults to H3 (Item 10 - changed from H1)
         """
         total_dh = 0.0
         total_dist = 0.0
@@ -76,16 +99,15 @@ class Loop:
         self.misclosure = total_dh
         self.total_distance = total_dist
 
-        # Calculate allowable tolerance using new regulations
-        # Default to H1 (strictest class: ±3mm√L)
+        # Calculate allowable tolerance using target class (Item 10: changed default to H3)
         try:
             params = get_class_parameters(target_class)
             dist_km = total_dist / 1000.0
             self.allowable_tolerance = params.get_tolerance_mm(dist_km)
         except ValueError:
-            # Fallback to H1 if invalid class
+            # Fallback to H3 if invalid class (not H1!)
             dist_km = total_dist / 1000.0
-            self.allowable_tolerance = 3.0 * math.sqrt(dist_km)
+            self.allowable_tolerance = 10.0 * math.sqrt(dist_km)
     
     def __str__(self) -> str:
         points_str = " → ".join(self.points)
@@ -247,14 +269,14 @@ class LoopAnalyzer:
         return self.graph.find_minimum_loops()
     
     def analyze_double_run(self, line1: LevelingLine, line2: LevelingLine,
-                          target_class: int = 1) -> Dict:
+                          target_class: int = 3) -> Dict:
         """
         Analyze a double-run (back-and-forth) measurement using new regulations.
 
         Args:
             line1: Forward measurement
             line2: Return measurement
-            target_class: Target accuracy class (1-6), defaults to H1
+            target_class: Target accuracy class (1-6), defaults to H3 (Item 10 - changed from H1)
 
         Returns:
             Analysis results dictionary
@@ -283,11 +305,11 @@ class LoopAnalyzer:
             params = get_class_parameters(target_class)
             tolerance_mm = params.get_tolerance_mm(dist_km)
         except ValueError:
-            # Fallback to H1
-            tolerance_mm = 3.0 * math.sqrt(dist_km)
+            # Fallback to H3 (not H1!) - Item 10
+            tolerance_mm = 10.0 * math.sqrt(dist_km)
 
         # Determine achieved class (which class does this measurement satisfy)
-        achieved_class = 0
+        achieved_class = 6  # Default to H6 if exceeds all (not 0!)
         for class_num in range(1, 7):
             try:
                 params = get_class_parameters(class_num)

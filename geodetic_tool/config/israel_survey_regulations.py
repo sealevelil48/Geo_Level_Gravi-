@@ -302,17 +302,22 @@ def get_class_parameters_by_name(class_name: str) -> ClassParameters:
     return CLASS_REGISTRY_BY_NAME[class_name]
 
 
-def calculate_new_tolerance(distance_m: float, leveling_class: int = 3) -> float:
+def calculate_new_tolerance(distance_m: float, leveling_class: Optional[int] = None) -> float:
     """
     Calculate tolerance using new Survey of Israel regulations.
 
     Args:
         distance_m: Distance in meters
-        leveling_class: Class (1-6), defaults to 3
+        leveling_class: Class (1-6), if None uses user's default class setting
 
     Returns:
         Tolerance in millimeters
     """
+    if leveling_class is None:
+        # Use user's default class setting
+        default_class_name = get_default_class()
+        leveling_class = int(default_class_name[1])  # Extract number from "H3" -> 3
+
     params = get_class_parameters(leveling_class)
     distance_km = distance_m / 1000.0
     return params.get_tolerance_mm(distance_km)
@@ -324,3 +329,158 @@ def get_all_classes_summary() -> Dict[str, Dict[str, Any]]:
         name: params.to_dict()
         for name, params in CLASS_REGISTRY_BY_NAME.items()
     }
+
+
+def get_default_class() -> str:
+    """
+    Get the user's default leveling class setting.
+
+    Returns:
+        Default class name (H1-H6)
+    """
+    try:
+        from .settings_manager import get_settings_manager
+        manager = get_settings_manager()
+        return manager.get_default_class()
+    except Exception:
+        return "H3"  # Fallback default
+
+
+def set_default_class(class_name: str) -> bool:
+    """
+    Set the user's default leveling class.
+
+    Args:
+        class_name: Class name (H1-H6)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from .settings_manager import get_settings_manager
+        manager = get_settings_manager()
+        return manager.set_default_class(class_name)
+    except Exception:
+        return False
+
+
+def get_default_class_parameters() -> ClassParameters:
+    """
+    Get parameters for the user's default leveling class.
+
+    Returns:
+        ClassParameters object for default class
+    """
+    class_name = get_default_class()
+    return get_class_parameters_by_name(class_name)
+
+
+# ============================================================================
+# SETTINGS PERSISTENCE (Item 5)
+# ============================================================================
+
+def load_user_settings() -> bool:
+    """
+    Load user-customized class parameters from settings file if available.
+
+    Returns:
+        True if settings were loaded and applied, False if using defaults
+    """
+    try:
+        from .settings_manager import get_settings_manager
+
+        manager = get_settings_manager()
+        user_params = manager.load_class_parameters()
+
+        if user_params:
+            # Update CLASS_REGISTRY with user values
+            for class_name, params_dict in user_params.items():
+                if class_name in CLASS_REGISTRY_BY_NAME:
+                    param_obj = CLASS_REGISTRY_BY_NAME[class_name]
+
+                    # Update mutable fields (excluding Enum and immutable fields)
+                    editable_fields = [
+                        'tolerance_coefficient',
+                        'max_line_length_km',
+                        'max_sight_distance_geometric_m',
+                        'max_sight_distance_trigonometric_m',
+                        'required_method',
+                        'max_single_distance_imbalance_m',
+                        'max_cumulative_distance_imbalance_m',
+                        'max_fb_difference_mm',
+                        'max_instrument_error_mm_per_km',
+                        'max_days_for_double_run'
+                    ]
+
+                    for key, value in params_dict.items():
+                        if key in editable_fields and hasattr(param_obj, key):
+                            setattr(param_obj, key, value)
+
+            return True
+        return False
+
+    except Exception as e:
+        import logging
+        logging.warning(f"Failed to load user settings, using defaults: {e}")
+        return False
+
+
+def save_user_settings() -> bool:
+    """
+    Save current class parameters to settings file.
+
+    Returns:
+        True if save successful, False otherwise
+    """
+    try:
+        from .settings_manager import get_settings_manager
+        from dataclasses import asdict
+
+        manager = get_settings_manager()
+
+        # Convert to dict - filter out Enum objects and non-serializable fields
+        params_dict = {}
+        for name, params in CLASS_REGISTRY_BY_NAME.items():
+            param_dict = asdict(params)
+
+            # Remove non-serializable fields
+            param_dict.pop('class_level', None)  # Enum
+
+            params_dict[name] = param_dict
+
+        return manager.save_class_parameters(params_dict)
+
+    except Exception as e:
+        import logging
+        logging.error(f"Failed to save user settings: {e}")
+        return False
+
+
+def reset_to_defaults() -> bool:
+    """
+    Reset all parameters to Survey of Israel defaults.
+
+    Returns:
+        True if reset successful, False otherwise
+    """
+    try:
+        from .settings_manager import get_settings_manager
+
+        manager = get_settings_manager()
+        success = manager.reset_to_defaults()
+
+        if success:
+            # Reload defaults by reimporting the module
+            # (In practice, user should restart the application)
+            pass
+
+        return success
+
+    except Exception as e:
+        import logging
+        logging.error(f"Failed to reset settings: {e}")
+        return False
+
+
+# Load user settings on module import
+load_user_settings()
