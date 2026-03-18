@@ -3321,7 +3321,7 @@ Special Requirements:"""
 
         # Show actual validation result, not cached status
         validator = BatchValidator()
-        validation_result = validator.validate_single(line)
+        validation_result = validator.validate_batch([line])[0][1]
         if validation_result.is_valid:
             status_text = "valid - all checks passed"
             if validation_result.warnings:
