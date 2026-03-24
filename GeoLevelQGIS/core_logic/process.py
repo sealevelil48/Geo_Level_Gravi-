@@ -14,11 +14,6 @@ import logging
 from pathlib import Path
 from typing import List, Dict
 
-# Make core_logic importable regardless of QGIS sys.path state
-_HERE = Path(__file__).parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
 log = logging.getLogger("GeoLevelGravi")
 
 
@@ -48,10 +43,10 @@ def process_geodetic_data(
     # ------------------------------------------------------------------ #
     # 1. Parse files
     # ------------------------------------------------------------------ #
-    from parsers.base_parser import create_parser
-    from validators import BatchValidator
-    from gis.geojson_export import export_network_to_geojson
-    from config.israel_survey_regulations import get_class_parameters_by_name
+    from core_logic.parsers.base_parser import create_parser
+    from core_logic.validators import BatchValidator
+    from core_logic.gis.geojson_export import export_network_to_geojson
+    from core_logic.config.israel_survey_regulations import get_class_parameters_by_name
 
     lines = []
     parse_errors = []

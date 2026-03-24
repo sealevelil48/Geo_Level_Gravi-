@@ -3,17 +3,15 @@ Base Parser Module
 
 Abstract base class for all file format parsers.
 """
+import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, List, Tuple
 import pandas as pd
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from config.models import LevelingLine, StationSetup, MeasurementDirection
-from config.settings import get_settings, FileFormat
+from core_logic.config.models import LevelingLine, StationSetup, MeasurementDirection
+from core_logic.config.settings import get_settings, FileFormat
 
 
 logger = logging.getLogger(__name__)
@@ -188,10 +186,10 @@ def create_parser(filepath: str) -> Optional[BaseParser]:
     file_format = detect_file_format(filepath)
     
     if file_format == FileFormat.TRIMBLE_DAT:
-        from parsers.trimble_parser import TrimbleParser
+        from core_logic.parsers.trimble_parser import TrimbleParser
         return TrimbleParser()
     elif file_format == FileFormat.LEICA_GSI:
-        from parsers.leica_parser import LeicaParser
+        from core_logic.parsers.leica_parser import LeicaParser
         return LeicaParser()
     else:
         logger.warning(f"Unknown file format for {filepath}")

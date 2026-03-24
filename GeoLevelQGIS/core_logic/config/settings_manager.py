@@ -129,6 +129,22 @@ class SettingsManager:
             logger.error(f"Failed to load settings: {e}")
             return None
 
+    def update_class_parameters(self, class_name: str, params: Dict[str, Any]) -> bool:
+        """
+        Update parameters for a single class and persist to disk.
+
+        Args:
+            class_name : "H1"–"H6"
+            params     : dict of field-name → value to merge into that class
+
+        Returns:
+            True if save successful, False otherwise
+        """
+        existing = self.load_class_parameters() or {}
+        existing.setdefault(class_name, {})
+        existing[class_name].update(params)
+        return self.save_class_parameters(existing)
+
     def reset_to_defaults(self) -> bool:
         """
         Delete settings file to revert to Survey of Israel defaults.

@@ -9,16 +9,13 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from ..config.models import (
+from core_logic.config.models import (
     LevelingLine, ValidationResult, LineStatus, StationSetup
 )
-from ..config.settings import (
+from core_logic.config.settings import (
     get_settings, is_benchmark, is_turning_point, calculate_tolerance
 )
-from ..config.israel_survey_regulations import (
+from core_logic.config.israel_survey_regulations import (
     get_class_parameters, calculate_new_tolerance, MeasurementType,
     get_default_class, get_class_parameters_by_name
 )
