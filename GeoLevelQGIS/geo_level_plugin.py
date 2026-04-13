@@ -11,9 +11,10 @@ from pathlib import Path
 
 from qgis.PyQt.QtWidgets import (
     QAction, QMessageBox, QProgressDialog,
-    QInputDialog, QMenu, QFileDialog
+    QInputDialog, QMenu, QFileDialog, QTableWidgetItem
 )
 from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtGui import QColor
 from qgis.core import (
     QgsMessageLog, Qgis, QgsVectorLayer, QgsProject
 )
@@ -67,15 +68,20 @@ class GeoLevelPlugin:
         # ── Analysis sub-menu ─────────────────────────────────────────
         anal_menu = self._menu.addMenu("Analysis / ניתוח")
         anal_menu.addAction("Validate All Lines").triggered.connect(self._run_batch_validation)
-        anal_menu.addAction("Detect Loops / Double-Runs").triggered.connect(self._detect_loops)
+        anal_menu.addAction("Detect Double-Runs").triggered.connect(self._detect_double_runs)
+        anal_menu.addAction("Find Loops").triggered.connect(self._detect_loops)
         anal_menu.addSeparator()
-        anal_menu.addAction("Network Adjustment (LSA)…").triggered.connect(self._run_lsa)
-        anal_menu.addAction("Adjust Selected Line").triggered.connect(self._adjust_current_line)
+        anal_menu.addAction("Line Adjustment...").triggered.connect(self._adjust_current_line)
+        anal_menu.addAction("Network Adjustment (LSA)...").triggered.connect(self._run_lsa)
+        anal_menu.addAction("Network Adjustment (Enhanced)...").triggered.connect(self._run_enhanced_lsa)
+        anal_menu.addSeparator()
+        anal_menu.addAction("Merge Line Segments...").triggered.connect(self._open_merge_dialog)
 
         # ── Settings sub-menu ─────────────────────────────────────────
         sett_menu = self._menu.addMenu("Settings / הגדרות")
         sett_menu.addAction("Class Parameters…").triggered.connect(self._show_class_settings)
         sett_menu.addAction("Encoding…").triggered.connect(self._show_encoding_settings)
+        sett_menu.addAction("Point Exclusion...").triggered.connect(self._show_point_exclusion)
 
         # ── Help sub-menu ─────────────────────────────────────────────
         help_menu = self._menu.addMenu("Help / עזרה")
@@ -117,6 +123,9 @@ class GeoLevelPlugin:
         self.dock.adjust_line_requested.connect(self._adjust_single_line)
         self.dock.lsa_requested.connect(self._run_lsa)
         self.dock.files_added.connect(self._process_files)
+        self.dock.double_runs_requested.connect(self._detect_double_runs)
+        self.dock.loops_requested.connect(self._detect_loops)
+        self.dock.enhanced_lsa_requested.connect(self._run_enhanced_lsa)
 
     def _show_dock(self):
         if self.dock:
@@ -167,18 +176,32 @@ class GeoLevelPlugin:
         self._process_files(file_paths, leveling_class, output_dir)
 
     def _process_files(self, file_paths, leveling_class=None, output_dir=None):
-        """Core parse → validate → export pipeline."""
+        """Core parse -> validate -> export pipeline. Appends new files, deduplicates."""
         leveling_class = leveling_class or self._last_class or "H3"
         output_dir     = output_dir or self._last_output_dir
 
         if not output_dir:
-            output_dir, _ = QFileDialog.getExistingDirectory(
+            output_dir = QFileDialog.getExistingDirectory(
                 self.iface.mainWindow(), "Select Output Directory"
-            ), None
+            )
             if not output_dir:
                 return
 
-        progress = QProgressDialog("Processing geodetic data…", "Cancel", 0, 0,
+        # Deduplicate: skip files whose basename is already loaded
+        existing = {os.path.basename(ln.filename) for ln in self._lines}
+        existing.update({ln.filename for ln in self._lines})
+        new_paths = [fp for fp in file_paths if fp not in existing
+                     and os.path.basename(fp) not in existing]
+        if not new_paths:
+            self.iface.messageBar().pushMessage(
+                "Geo Level Gravi", "All selected files are already loaded.",
+                level=Qgis.Info, duration=4)
+            return
+
+        self._last_class      = leveling_class
+        self._last_output_dir = output_dir
+
+        progress = QProgressDialog("Processing geodetic data...", "Cancel", 0, 0,
                                    self.iface.mainWindow())
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
@@ -187,7 +210,7 @@ class GeoLevelPlugin:
         try:
             from core_logic.process import process_geodetic_data
             result = process_geodetic_data(
-                file_paths=file_paths,
+                file_paths=new_paths,
                 leveling_class=leveling_class,
                 output_dir=output_dir,
             )
@@ -195,31 +218,34 @@ class GeoLevelPlugin:
             progress.close()
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)
-            QMessageBox.critical(self.iface.mainWindow(), "Geo Level Gravi — Error",
-                                 f"Processing failed:\n\n{exc}")
+            QMessageBox.critical(self.iface.mainWindow(), "Geo Level Gravi -- Error",
+                                 "Processing failed:\n\n" + str(exc))
             return
 
         progress.close()
 
-        self._lines       = result["lines"]
-        self._val_results = result.get("val_results", [])
+        # Append new lines to existing list
+        new_lines = result["lines"]
+        self._lines.extend(new_lines)
 
-        if not self._val_results and self._lines:
-            try:
-                from core_logic.validators import BatchValidator
-                bv = BatchValidator(leveling_class=int(leveling_class[1]))
-                self._val_results = bv.validate_batch(self._lines)
-            except Exception:
-                self._val_results = []
+        # Re-validate the full combined set
+        try:
+            from core_logic.validators import BatchValidator
+            bv = BatchValidator(leveling_class=int(leveling_class[1]))
+            self._val_results = bv.validate_batch(self._lines)
+        except Exception:
+            self._val_results = result.get("val_results", [])
 
         self._load_layer(result["lines_geojson"], result["line_style"])
         self._show_dock()
         self.dock.load_lines(self._lines, self._val_results)
 
         s = result["summary"]
+        total_loaded = len(self._lines)
         self.iface.messageBar().pushMessage(
             "Geo Level Gravi",
-            f"Done — {s['valid']}/{s['total']} lines valid",
+            "Added " + str(len(new_lines)) + " line(s) -- total " + str(total_loaded)
+            + "  (" + str(s["valid"]) + "/" + str(s["total"]) + " new valid)",
             level=Qgis.Success, duration=6,
         )
 
@@ -341,45 +367,144 @@ class GeoLevelPlugin:
             # Refresh dock list colours
             self.dock.load_lines(self._lines, self._val_results)
             summary = bv.get_summary([vr for _, vr in self._val_results])
-            self.iface.messageBar().pushMessage(
-                "Validation",
-                f"{summary['valid']}/{summary['total']} valid  |  "
-                f"{summary['endpoint_issues']} endpoint  |  "
-                f"{summary['naming_issues']} naming  |  "
-                f"{summary['tolerance_issues']} tolerance",
-                level=Qgis.Info, duration=8,
+            val_msg = (
+                "Validation complete: "
+                + str(summary["valid"]) + "/" + str(summary["total"]) + " valid  |  "
+                + str(summary["endpoint_issues"]) + " endpoint  |  "
+                + str(summary["naming_issues"]) + " naming  |  "
+                + str(summary["tolerance_issues"]) + " tolerance"
             )
+            self.iface.messageBar().pushMessage(
+                "Validation", val_msg, level=Qgis.Info, duration=8
+            )
+            if self.dock:
+                self.dock.show_analysis_result(val_msg)
+                self.dock.log("Validate All completed.")
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)
-            QMessageBox.critical(self.iface.mainWindow(), "Validate All — Error", str(exc))
+            if self.dock:
+                self.dock.log("Validate All ERROR: " + str(exc))
+            QMessageBox.critical(self.iface.mainWindow(), "Validate All -- Error", str(exc))
 
     def _detect_loops(self):
         if not self._lines:
-            QMessageBox.information(self.iface.mainWindow(), "Detect Loops",
+            QMessageBox.information(self.iface.mainWindow(), "Find Loops",
                                     "No lines loaded.")
             return
         try:
             from core_logic.engine.loop_detector import LoopAnalyzer
             analyzer = LoopAnalyzer(self._lines)
             loops = analyzer.find_loops()
+
+            tbl = self.dock.loop_table
+            tbl.setRowCount(0)
+
             if not loops:
-                msg = "No closed loops detected in the current network."
+                self.dock.log("Find Loops: no closed loops detected.")
             else:
-                parts = [f"Found {len(loops)} loop(s):\n"]
                 for i, loop in enumerate(loops, 1):
                     ok, mis_mm, tol_mm = loop.check_tolerance()
-                    parts.append(
-                        f"  {i}. {' → '.join(loop.points)}\n"
-                        f"     Misclosure: {mis_mm:.2f} mm  |  "
-                        f"Tolerance: ±{tol_mm:.2f} mm  {'✅' if ok else '❌'}"
+                    row = tbl.rowCount()
+                    tbl.insertRow(row)
+
+                    path_str = " -> ".join(loop.points)
+                    dist_m   = getattr(loop, "total_distance", 0.0)
+
+                    values = [
+                        str(i),
+                        path_str,
+                        "{:.1f}".format(dist_m),
+                        "{:.3f}".format(mis_mm),
+                        "{:.2f}".format(tol_mm),
+                    ]
+                    for col, val in enumerate(values):
+                        item = QTableWidgetItem(val)
+                        item.setTextAlignment(Qt.AlignCenter)
+                        tbl.setItem(row, col, item)
+
+                    status_item = QTableWidgetItem("PASS" if ok else "FAIL")
+                    status_item.setTextAlignment(Qt.AlignCenter)
+                    status_item.setForeground(
+                        QColor("#2e7d32") if ok else QColor("#c62828")
                     )
-                msg = "\n".join(parts)
-            QMessageBox.information(self.iface.mainWindow(), "Detect Loops", msg)
+                    tbl.setItem(row, 5, status_item)
+
+                self.dock.log("Find Loops: " + str(len(loops)) + " loop(s) found.")
+
+            # Switch to Analysis tab -> Loops sub-tab
+            self.dock.tabs.setCurrentIndex(2)
+            self.dock.analysis_tabs.setCurrentIndex(1)
+            self._show_dock()
+
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)
-            QMessageBox.critical(self.iface.mainWindow(), "Detect Loops — Error", str(exc))
+            if self.dock:
+                self.dock.log("Find Loops ERROR: " + str(exc))
+            QMessageBox.critical(self.iface.mainWindow(), "Find Loops -- Error", str(exc))
+
+    def _detect_double_runs(self):
+        if not self._lines:
+            QMessageBox.information(self.iface.mainWindow(), "Detect Double-Runs",
+                                    "No lines loaded.")
+            return
+        try:
+            from core_logic.engine.loop_detector import detect_double_runs, LoopAnalyzer
+            pairs = detect_double_runs(self._lines)
+
+            tbl = self.dock.double_run_table
+            tbl.setRowCount(0)
+
+            if not pairs:
+                self.dock.log("Detect Double-Runs: no pairs found.")
+            else:
+                cls = self.dock.get_selected_class() if self.dock else self._last_class
+                analyzer = LoopAnalyzer(self._lines)
+                for fwd, ret in pairs:
+                    res = analyzer.analyze_double_run(fwd, ret, int(cls[1]))
+                    row = tbl.rowCount()
+                    tbl.insertRow(row)
+
+                    pair_label = fwd.start_point + " <-> " + fwd.end_point
+                    mean_dh = (fwd.total_height_diff - ret.total_height_diff) / 2.0
+                    mis_mm  = res["misclosure_mm"]
+                    tol_mm  = res["tolerance_mm"]
+                    passed  = res["within_tolerance"]
+
+                    values = [
+                        pair_label,
+                        os.path.basename(fwd.filename),
+                        os.path.basename(ret.filename),
+                        "{:.5f}".format(mean_dh),
+                        "{:.3f}".format(mis_mm),
+                        "{:.2f}".format(tol_mm),
+                    ]
+                    for col, val in enumerate(values):
+                        item = QTableWidgetItem(val)
+                        item.setTextAlignment(Qt.AlignCenter)
+                        tbl.setItem(row, col, item)
+
+                    status_item = QTableWidgetItem("PASS" if passed else "FAIL")
+                    status_item.setTextAlignment(Qt.AlignCenter)
+                    status_item.setForeground(
+                        QColor("#2e7d32") if passed else QColor("#c62828")
+                    )
+                    tbl.setItem(row, 6, status_item)
+
+                self.dock.log("Detect Double-Runs: " + str(len(pairs)) + " pair(s) found.")
+
+            # Switch to Analysis tab -> Double-Runs sub-tab
+            self.dock.tabs.setCurrentIndex(2)
+            self.dock.analysis_tabs.setCurrentIndex(0)
+            self._show_dock()
+
+        except Exception as exc:
+            QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
+                                     level=Qgis.Critical)
+            if self.dock:
+                self.dock.log("Double-Runs ERROR: " + str(exc))
+            QMessageBox.critical(self.iface.mainWindow(), "Double-Runs -- Error", str(exc))
 
     def _run_lsa(self):
         if not self._lines:
@@ -437,7 +562,8 @@ class GeoLevelPlugin:
                 summary += f"  {pid:20s}  {h:.5f} m  ±{sigma:.3f} mm\n"
             QgsMessageLog.logMessage(summary, "GeoLevelPlugin", level=Qgis.Info)
             if self.dock:
-                self.dock.show_adjustment_result(summary)
+                self.dock.show_analysis_result(summary)
+                self.dock.log("LSA completed.")
 
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
@@ -488,21 +614,137 @@ class GeoLevelPlugin:
             return
         line = self._lines[idx]
         try:
-            from core_logic.engine.line_adjustment import LineAdjuster
-            adjusted = LineAdjuster().adjust(line)
-            text = (
-                f"Line: {line.start_point} → {line.end_point}\n"
-                f"Total ΔH (before): {line.total_height_diff:.5f} m\n"
-                f"Total ΔH (after) : {adjusted.total_height_diff:.5f} m\n"
-                f"Misclosure       : "
-                f"{(line.total_height_diff - adjusted.total_height_diff)*1000:.3f} mm\n"
-            )
-            if self.dock:
-                self.dock.show_adjustment_result(text)
+            from geo_level_line_adj_dialog import GeoLevelLineAdjDialog
+            dlg = GeoLevelLineAdjDialog(line, self.iface.mainWindow())
+            dlg.exec_()
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)
-            QMessageBox.critical(self.iface.mainWindow(), "Adjust Line — Error", str(exc))
+            QMessageBox.critical(self.iface.mainWindow(), "Adjust Line -- Error", str(exc))
+
+    def _run_enhanced_lsa(self):
+        if not self._lines:
+            QMessageBox.information(self.iface.mainWindow(), "Enhanced LSA",
+                                    "No lines loaded.")
+            return
+        try:
+            from geo_level_enhanced_lsa_dialog import GeoLevelEnhancedLSADialog
+            dlg = GeoLevelEnhancedLSADialog(self._lines, self.iface.mainWindow())
+            if dlg.exec_() and dlg.result:
+                self._apply_lsa_to_layer(dlg.result)
+        except Exception as exc:
+            QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
+                                     level=Qgis.Critical)
+            QMessageBox.critical(self.iface.mainWindow(), "Enhanced LSA -- Error", str(exc))
+
+    def _open_merge_dialog(self):
+        if not self._lines:
+            QMessageBox.information(self.iface.mainWindow(), "Merge Segments",
+                                    "No lines loaded.")
+            return
+        try:
+            from geo_level_merge_dialog import GeoLevelMergeDialog
+            dlg = GeoLevelMergeDialog(self._lines, self.iface.mainWindow())
+            if dlg.exec_():
+                self._lines = dlg.merged_lines
+                try:
+                    from core_logic.validators import BatchValidator
+                    cls = self.dock.get_selected_class() if self.dock else self._last_class
+                    bv = BatchValidator(leveling_class=int(cls[1]))
+                    self._val_results = bv.validate_batch(self._lines)
+                except Exception:
+                    pass
+                if self.dock:
+                    self.dock.load_lines(self._lines, self._val_results)
+                self.iface.messageBar().pushMessage(
+                    "Merge",
+                    "Lines updated -- " + str(len(self._lines)) + " total",
+                    level=Qgis.Success, duration=4)
+        except Exception as exc:
+            QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
+                                     level=Qgis.Critical)
+            QMessageBox.critical(self.iface.mainWindow(), "Merge -- Error", str(exc))
+
+    def _create_joint_project(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self.iface.mainWindow(), "Select Project Files to Join",
+            _PROJECTS_DIR, "Geo Level Project (*.glp)"
+        )
+        if len(paths) < 2:
+            QMessageBox.information(self.iface.mainWindow(), "Create Joint Project",
+                                    "Please select at least two .glp project files.")
+            return
+        combined_files, combined_class, combined_output = [], "H3", self._last_output_dir
+        for p in paths:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                combined_files.extend(data.get("files", []))
+                combined_class = data.get("class", combined_class)
+                combined_output = data.get("output_dir", combined_output) or combined_output
+            except Exception:
+                pass
+        seen, unique_files = set(), []
+        for fp in combined_files:
+            if fp not in seen:
+                seen.add(fp)
+                unique_files.append(fp)
+        save_path, _ = QFileDialog.getSaveFileName(
+            self.iface.mainWindow(), "Save Joint Project",
+            _PROJECTS_DIR, "Geo Level Project (*.glp)"
+        )
+        if not save_path:
+            return
+        os.makedirs(_PROJECTS_DIR, exist_ok=True)
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump({"class": combined_class, "output_dir": combined_output,
+                       "files": unique_files}, f, indent=2)
+        self.iface.messageBar().pushMessage(
+            "Joint Project",
+            "Saved " + str(len(unique_files)) + " files to " + save_path,
+            level=Qgis.Success, duration=5)
+
+    def _export_results(self):
+        if not self._lines:
+            QMessageBox.information(self.iface.mainWindow(), "Export Results",
+                                    "No lines loaded.")
+            return
+        output_dir = QFileDialog.getExistingDirectory(
+            self.iface.mainWindow(), "Select Export Directory", self._last_output_dir
+        )
+        if not output_dir:
+            return
+        try:
+            from core_logic.gis.geojson_export import export_network_to_geojson
+            files = export_network_to_geojson(
+                self._lines, output_dir, project_name="geo_level_export"
+            )
+            msg = "Exported:\n  GeoJSON: " + files["lines_geojson"]
+            try:
+                from core_logic.exporters import export_fteg
+                fteg_path = os.path.join(output_dir, "export.fteg")
+                export_fteg(self._lines, fteg_path)
+                msg += "\n  FTEG: " + fteg_path
+            except Exception:
+                pass
+            QMessageBox.information(self.iface.mainWindow(), "Export Results", msg)
+        except Exception as exc:
+            QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
+                                     level=Qgis.Critical)
+            QMessageBox.critical(self.iface.mainWindow(), "Export -- Error", str(exc))
+
+    def _show_point_exclusion(self):
+        try:
+            from geo_level_point_exclusion_dialog import GeoLevelPointExclusionDialog
+            dlg = GeoLevelPointExclusionDialog(self._lines, self.iface.mainWindow())
+            if dlg.exec_():
+                self._lines = dlg.updated_lines
+                if self.dock:
+                    self.dock.load_lines(self._lines, self._val_results)
+        except Exception as exc:
+            QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
+                                     level=Qgis.Critical)
+            QMessageBox.critical(self.iface.mainWindow(), "Point Exclusion -- Error", str(exc))
 
     # ------------------------------------------------------------------
     # Settings menu actions

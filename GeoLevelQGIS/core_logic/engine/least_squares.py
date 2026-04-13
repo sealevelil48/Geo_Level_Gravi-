@@ -41,15 +41,12 @@ from pathlib import Path
 import numpy as np
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from ..config.models import (
+from core_logic.config.models import (
     LevelingLine, Benchmark, AdjustmentResult, MeasurementSummary
 )
-from ..config.settings import calculate_tolerance
-from .adjustment_computations import AdjustmentComputations
-from .ADJwarnings import (
+from core_logic.config.settings import calculate_tolerance
+from core_logic.engine.adjustment_computations import AdjustmentComputations
+from core_logic.engine.ADJwarnings import (
     SingularMatrixError,
     InsufficientObservationsError,
     ConvergenceError

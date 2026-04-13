@@ -15,11 +15,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 import logging
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from ..config.models import LevelingLine, StationSetup, LineStatus
+from core_logic.config.models import LevelingLine, StationSetup, LineStatus
 
 logger = logging.getLogger(__name__)
 

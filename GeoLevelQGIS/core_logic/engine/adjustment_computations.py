@@ -14,10 +14,7 @@ import logging
 import warnings
 from pathlib import Path
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from .ADJwarnings import (
+from core_logic.engine.ADJwarnings import (
     IllConditionedMatrixWarning,
     SingularMatrixError,
     InsufficientObservationsError,

@@ -8,11 +8,8 @@ from pathlib import Path
 import numpy as np
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from ..config.models import LevelingLine, StationSetup, MeasurementSummary
-from ..config.settings import calculate_tolerance
+from core_logic.config.models import LevelingLine, StationSetup, MeasurementSummary
+from core_logic.config.settings import calculate_tolerance
 
 
 logger = logging.getLogger(__name__)

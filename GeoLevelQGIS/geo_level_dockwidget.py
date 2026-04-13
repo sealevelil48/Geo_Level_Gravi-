@@ -1,14 +1,14 @@
 """
 geo_level_dockwidget.py
-Professional QGIS Dock Widget for Geo Level Gravi plugin.
+QGIS Dock Widget for Geo Level Gravi — 4-tab layout matching app.py.
 
-Layout
-------
-Left  : QListWidget — loaded leveling lines (files)
-Right : QTabWidget
-          Tab 0 "Line Details"  — QTableWidget with setups (BS, FS, Distance)
-          Tab 1 "Validation"    — H1-H6 status + error list
-          Tab 2 "Adjustment"    — Adjust This Line / LSA buttons
+Left panel  : file list + Add Files + Toggle Dir/Use + class selector
+Right panel : QTabWidget
+    Tab 0  Line Details   — setup table for selected line
+    Tab 1  Validation     — all-lines table (File/Start/End/Setups/Dist/dH/Status/Details)
+                            + Toggle Direction / Toggle Use / Refresh buttons
+    Tab 2  Analysis       — read-only QTextEdit for loop/double-run output
+    Tab 3  Log            — read-only QTextEdit for general log messages
 """
 
 import os
@@ -16,58 +16,49 @@ from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QTabWidget, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QTextEdit, QSplitter, QHeaderView,
-    QAbstractItemView, QGroupBox, QComboBox, QSizePolicy
+    QAbstractItemView, QGroupBox, QComboBox, QFileDialog
 )
 from qgis.PyQt.QtCore import Qt, pyqtSignal
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtGui import QColor, QFont
 
 
 CLASS_DESCRIPTIONS = {
-    "H1": "H1 — ±3 mm√km  |  BFFB  |  sight ≤ 30 m",
-    "H2": "H2 — ±5 mm√km  |  BFFB  |  sight ≤ 40 m",
-    "H3": "H3 — ±10 mm√km |  BFFB  |  sight ≤ 50 m  (default)",
-    "H4": "H4 — ±20 mm√km |  BF    |  sight ≤ 80 m",
-    "H5": "H5 — ±30 mm√km |  BF    |  sight ≤ 100 m",
-    "H6": "H6 — ±60 mm√km |  BF    |  sight ≤ 100 m",
+    "H1": "H1 -- +/-3 mm*sqrt(km)  |  BFFB  |  sight <= 30 m",
+    "H2": "H2 -- +/-5 mm*sqrt(km)  |  BFFB  |  sight <= 40 m",
+    "H3": "H3 -- +/-10 mm*sqrt(km) |  BFFB  |  sight <= 50 m  (default)",
+    "H4": "H4 -- +/-20 mm*sqrt(km) |  BF    |  sight <= 80 m",
+    "H5": "H5 -- +/-30 mm*sqrt(km) |  BF    |  sight <= 100 m",
+    "H6": "H6 -- +/-60 mm*sqrt(km) |  BF    |  sight <= 100 m",
 }
 
-STATUS_COLORS = {
-    "valid":               "#2e7d32",
-    "invalid_endpoint":    "#c62828",
-    "naming_error":        "#e65100",
-    "exceeded_tolerance":  "#c62828",
-    "incomplete":          "#f57f17",
-}
+VAL_COLS = ["File", "Start", "End", "Setups", "Distance (m)", "dH (m)", "Status", "Details"]
 
 
 class GeoLevelDockWidget(QDockWidget):
-    """Main dock widget — replaces the popup dialog."""
+    """Main dock widget."""
 
-    # Emitted when user selects a line in the list; carries the line index
-    line_selected = pyqtSignal(int)
-    # Emitted when user requests single-line adjustment
+    line_selected         = pyqtSignal(int)
     adjust_line_requested = pyqtSignal(int)
-    # Emitted when user requests full LSA
-    lsa_requested = pyqtSignal()
-    # Emitted to tell the plugin to run the full parse→validate→export pipeline
-    run_requested = pyqtSignal(list, str, str)  # file_paths, class, output_dir
-    # Emitted when user adds files via the + Add Files button
-    files_added = pyqtSignal(list, str, str)    # file_paths, class, output_dir
+    lsa_requested         = pyqtSignal()
+    files_added           = pyqtSignal(list, str, str)
+    double_runs_requested = pyqtSignal()
+    loops_requested       = pyqtSignal()
+    enhanced_lsa_requested = pyqtSignal()
 
     def __init__(self, parent=None):
-        super().__init__("Geo Level Gravi — פילוס גיאודטי", parent)
+        super().__init__("Geo Level Gravi", parent)
         self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self.setMinimumWidth(700)
+        self.setMinimumWidth(760)
 
-        self._lines = []          # list of LevelingLine objects
-        self._val_results = []    # list of (LevelingLine, ValidationResult)
+        self._lines       = []
+        self._val_results = []
         self._current_idx = -1
 
         self._build_ui()
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # UI construction
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     def _build_ui(self):
         root = QWidget()
@@ -77,12 +68,13 @@ class GeoLevelDockWidget(QDockWidget):
 
         splitter = QSplitter(Qt.Horizontal)
         layout.addWidget(splitter)
-
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([220, 480])
+        splitter.setSizes([220, 540])
 
-    def _build_left_panel(self) -> QWidget:
+    # ── Left panel ──────────────────────────────────────────────────── #
+
+    def _build_left_panel(self):
         panel = QWidget()
         vbox = QVBoxLayout(panel)
         vbox.setContentsMargins(0, 0, 0, 0)
@@ -96,14 +88,24 @@ class GeoLevelDockWidget(QDockWidget):
         self.line_list.currentRowChanged.connect(self._on_line_selected)
         vbox.addWidget(self.line_list)
 
-        # Add Files button
-        from qgis.PyQt.QtWidgets import QFileDialog as _QFD
-        self._qfd = _QFD
         btn_add = QPushButton("+ Add Files")
         btn_add.clicked.connect(self._on_add_files)
         vbox.addWidget(btn_add)
 
-        # Class selector
+        toggle_row = QHBoxLayout()
+        self.btn_toggle_dir = QPushButton("Toggle Dir")
+        self.btn_toggle_dir.setToolTip("Reverse direction of selected line")
+        self.btn_toggle_dir.setEnabled(False)
+        self.btn_toggle_dir.clicked.connect(self._on_toggle_dir)
+        toggle_row.addWidget(self.btn_toggle_dir)
+
+        self.btn_toggle_use = QPushButton("Toggle Use")
+        self.btn_toggle_use.setToolTip("Include / exclude selected line from adjustment")
+        self.btn_toggle_use.setEnabled(False)
+        self.btn_toggle_use.clicked.connect(self._on_toggle_use)
+        toggle_row.addWidget(self.btn_toggle_use)
+        vbox.addLayout(toggle_row)
+
         grp = QGroupBox("Precision Class")
         hbox = QHBoxLayout(grp)
         self.class_combo = QComboBox()
@@ -121,7 +123,9 @@ class GeoLevelDockWidget(QDockWidget):
 
         return panel
 
-    def _build_right_panel(self) -> QWidget:
+    # ── Right panel ─────────────────────────────────────────────────── #
+
+    def _build_right_panel(self):
         panel = QWidget()
         vbox = QVBoxLayout(panel)
         vbox.setContentsMargins(0, 0, 0, 0)
@@ -131,11 +135,14 @@ class GeoLevelDockWidget(QDockWidget):
 
         self.tabs.addTab(self._build_details_tab(),    "Line Details")
         self.tabs.addTab(self._build_validation_tab(), "Validation")
-        self.tabs.addTab(self._build_adjustment_tab(), "Adjustment")
+        self.tabs.addTab(self._build_analysis_tab(),   "Analysis")
+        self.tabs.addTab(self._build_log_tab(),        "Log")
 
         return panel
 
-    def _build_details_tab(self) -> QWidget:
+    # ── Tab 0: Line Details ─────────────────────────────────────────── #
+
+    def _build_details_tab(self):
         w = QWidget()
         vbox = QVBoxLayout(w)
 
@@ -143,12 +150,7 @@ class GeoLevelDockWidget(QDockWidget):
         self.line_info_lbl.setStyleSheet("font-weight: bold; padding: 2px;")
         vbox.addWidget(self.line_info_lbl)
 
-        self.setup_table = QTableWidget(0, 5)
-        self.setup_table.setHorizontalHeaderLabels(
-            ["#", "From", "To", "Backsight (m)", "Foresight (m)", ]
-        )
-        # Extend to 6 columns — add Distance
-        self.setup_table.setColumnCount(6)
+        self.setup_table = QTableWidget(0, 6)
         self.setup_table.setHorizontalHeaderLabels(
             ["#", "From", "To", "Backsight (m)", "Foresight (m)", "Distance (m)"]
         )
@@ -157,223 +159,371 @@ class GeoLevelDockWidget(QDockWidget):
         self.setup_table.setAlternatingRowColors(True)
         vbox.addWidget(self.setup_table)
 
-        return w
-
-    def _build_validation_tab(self) -> QWidget:
-        w = QWidget()
-        vbox = QVBoxLayout(w)
-
-        self.val_status_lbl = QLabel("—")
-        self.val_status_lbl.setStyleSheet("font-size: 14px; font-weight: bold; padding: 4px;")
-        vbox.addWidget(self.val_status_lbl)
-
-        self.val_class_lbl = QLabel("")
-        vbox.addWidget(self.val_class_lbl)
-
-        self.val_errors = QTextEdit()
-        self.val_errors.setReadOnly(True)
-        self.val_errors.setPlaceholderText("Validation errors and warnings appear here…")
-        vbox.addWidget(self.val_errors)
-
-        return w
-
-    def _build_adjustment_tab(self) -> QWidget:
-        w = QWidget()
-        vbox = QVBoxLayout(w)
-        vbox.setAlignment(Qt.AlignTop)
-
-        desc = QLabel(
-            "Adjust This Line — applies proportional misclosure distribution "
-            "to the currently selected line.\n\n"
-            "LSA — runs a full Least Squares Adjustment across all loaded lines."
-        )
-        desc.setWordWrap(True)
-        vbox.addWidget(desc)
-
-        self.btn_adjust_line = QPushButton("⚙  Adjust This Line")
-        self.btn_adjust_line.setFixedHeight(36)
+        btn_row = QHBoxLayout()
+        self.btn_adjust_line = QPushButton("Adjust This Line")
         self.btn_adjust_line.setEnabled(False)
         self.btn_adjust_line.clicked.connect(self._on_adjust_line)
-        vbox.addWidget(self.btn_adjust_line)
+        btn_row.addWidget(self.btn_adjust_line)
 
-        self.btn_lsa = QPushButton("∑  LSA — Full Network Adjustment")
-        self.btn_lsa.setFixedHeight(36)
+        self.btn_lsa = QPushButton("LSA -- Full Network Adjustment")
         self.btn_lsa.setEnabled(False)
         self.btn_lsa.clicked.connect(self.lsa_requested.emit)
-        vbox.addWidget(self.btn_lsa)
-
-        self.adj_result_lbl = QTextEdit()
-        self.adj_result_lbl.setReadOnly(True)
-        self.adj_result_lbl.setPlaceholderText("Adjustment results appear here…")
-        vbox.addWidget(self.adj_result_lbl)
+        btn_row.addWidget(self.btn_lsa)
+        vbox.addLayout(btn_row)
 
         return w
 
-    # ------------------------------------------------------------------
-    # Public API — called by the plugin controller
-    # ------------------------------------------------------------------
+    # ── Tab 1: Validation ───────────────────────────────────────────── #
 
-    def populate_line_details(self, line):
-        """Public method — fills the Line Details table for a given LevelingLine."""
-        self.line_info_lbl.setText(
-            f"Line: {line.start_point} ➔ {line.end_point}  |  "
-            f"Dist: {line.total_distance:.2f} m  |  "
-            f"ΔH: {line.total_height_diff:.4f} m"
-        )
-        self._populate_setup_table(line)
+    def _build_validation_tab(self):
+        w = QWidget()
+        vbox = QVBoxLayout(w)
 
-    def update_validation_tab(self, line):
-        """Public method — refreshes the Validation tab for a given LevelingLine."""
-        # Find the matching ValidationResult by object identity or index
-        for i, ln in enumerate(self._lines):
-            if ln is line and i < len(self._val_results):
-                _, vr = self._val_results[i]
-                self._populate_validation(vr, line)
-                return
-        # Fallback: show line status only
-        status_val = line.status.value if hasattr(line.status, 'value') else str(line.status)
-        color = STATUS_COLORS.get(status_val, "#555555")
-        self.val_status_lbl.setText(f"Status: {status_val}")
-        self.val_status_lbl.setStyleSheet(
-            f"font-size: 14px; font-weight: bold; color: {color}; padding: 4px;"
-        )
+        # Toolbar buttons
+        btn_row = QHBoxLayout()
+        btn_tog_dir = QPushButton("Toggle Direction")
+        btn_tog_dir.clicked.connect(self._on_toggle_dir)
+        btn_row.addWidget(btn_tog_dir)
+
+        btn_tog_use = QPushButton("Toggle Use")
+        btn_tog_use.clicked.connect(self._on_toggle_use)
+        btn_row.addWidget(btn_tog_use)
+
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.clicked.connect(self._refresh_val_table)
+        btn_row.addWidget(btn_refresh)
+        btn_row.addStretch()
+        vbox.addLayout(btn_row)
+
+        # All-lines validation table
+        self.val_table = QTableWidget(0, len(VAL_COLS))
+        self.val_table.setHorizontalHeaderLabels(VAL_COLS)
+        self.val_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.val_table.horizontalHeader().setStretchLastSection(True)
+        self.val_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.val_table.setAlternatingRowColors(True)
+        self.val_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.val_table.itemSelectionChanged.connect(self._on_val_table_selection_changed)
+        vbox.addWidget(self.val_table)
+
+        # Per-line detail text
+        self.val_detail_text = QTextEdit()
+        self.val_detail_text.setReadOnly(True)
+        self.val_detail_text.setMaximumHeight(100)
+        self.val_detail_text.setFont(QFont("Courier New", 8))
+        self.val_detail_text.setPlaceholderText("Select a row to see validation details...")
+        vbox.addWidget(self.val_detail_text)
+
+        return w
+
+    # ── Tab 2: Analysis ─────────────────────────────────────────────── #
+
+    def _build_analysis_tab(self):
+        w = QWidget()
+        vbox = QVBoxLayout(w)
+
+        # Action buttons row
+        btn_row = QHBoxLayout()
+        btn_dr = QPushButton("Detect Double-Runs")
+        btn_dr.clicked.connect(self.double_runs_requested.emit)
+        btn_row.addWidget(btn_dr)
+
+        btn_loops = QPushButton("Find Loops")
+        btn_loops.clicked.connect(self.loops_requested.emit)
+        btn_row.addWidget(btn_loops)
+
+        btn_lsa = QPushButton("Network Adjustment (LSA)")
+        btn_lsa.clicked.connect(self.lsa_requested.emit)
+        btn_row.addWidget(btn_lsa)
+
+        btn_elsa = QPushButton("Enhanced LSA")
+        btn_elsa.clicked.connect(self.enhanced_lsa_requested.emit)
+        btn_row.addWidget(btn_elsa)
+        vbox.addLayout(btn_row)
+
+        # Results sub-tabs
+        self.analysis_tabs = QTabWidget()
+        vbox.addWidget(self.analysis_tabs)
+
+        # Sub-tab: Double-Runs
+        dr_widget = QWidget()
+        dr_vbox = QVBoxLayout(dr_widget)
+        self.double_run_table = QTableWidget(0, 7)
+        self.double_run_table.setHorizontalHeaderLabels([
+            "Pair", "Forward File", "Return File",
+            "Mean dH (m)", "Misclosure (mm)", "Tolerance (mm)", "Status"
+        ])
+        self.double_run_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.double_run_table.horizontalHeader().setStretchLastSection(True)
+        self.double_run_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.double_run_table.setAlternatingRowColors(True)
+        dr_vbox.addWidget(self.double_run_table)
+        self.analysis_tabs.addTab(dr_widget, "Double-Runs")
+
+        # Sub-tab: Loops
+        loop_widget = QWidget()
+        loop_vbox = QVBoxLayout(loop_widget)
+        self.loop_table = QTableWidget(0, 6)
+        self.loop_table.setHorizontalHeaderLabels([
+            "Loop ID", "Path", "Distance (m)",
+            "Misclosure (mm)", "Tolerance (mm)", "Status"
+        ])
+        self.loop_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.loop_table.horizontalHeader().setStretchLastSection(True)
+        self.loop_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.loop_table.setAlternatingRowColors(True)
+        loop_vbox.addWidget(self.loop_table)
+        self.analysis_tabs.addTab(loop_widget, "Loops")
+
+        return w
+
+    # ── Tab 3: Log ──────────────────────────────────────────────────── #
+
+    def _build_log_tab(self):
+        w = QWidget()
+        vbox = QVBoxLayout(w)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Courier New", 9))
+        self.log_text.setPlaceholderText("Processing log messages appear here...")
+        vbox.addWidget(self.log_text)
+
+        btn_clear = QPushButton("Clear Log")
+        btn_clear.clicked.connect(self.log_text.clear)
+        vbox.addWidget(btn_clear)
+        return w
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
 
     def load_lines(self, lines, val_results):
-        """Populate the list with parsed LevelingLine objects."""
-        self._lines = lines
-        self._val_results = val_results  # list of (line, ValidationResult)
+        """Populate left list and validation table."""
+        self._lines       = lines
+        self._val_results = val_results
 
+        # Left list
         self.line_list.clear()
         for i, line in enumerate(lines):
-            label = f"{line.start_point} → {line.end_point}  [{line.filename}]"
+            used = getattr(line, "is_used", True)
+            excl = "" if used else " [EXCL]"
+            label = line.start_point + " -> " + line.end_point + "  [" + line.filename + "]" + excl
             self.line_list.addItem(label)
-            # Colour the item by validation status
             if i < len(val_results):
                 _, vr = val_results[i]
-                color = "#2e7d32" if vr.is_valid else "#c62828"
+                color = "#2e7d32" if (vr.is_valid and used) else ("#888888" if not used else "#c62828")
                 self.line_list.item(i).setForeground(QColor(color))
 
         if lines:
             self.btn_lsa.setEnabled(True)
             self.line_list.setCurrentRow(0)
 
-    def show_adjustment_result(self, text: str):
-        """Display adjustment result text in the Adjustment tab."""
-        self.adj_result_lbl.setPlainText(text)
-        self.tabs.setCurrentIndex(2)
+        self._refresh_val_table()
 
-    def get_selected_class(self) -> str:
+    def populate_line_details(self, line):
+        """Fill the Line Details tab for a given LevelingLine."""
+        dist_str = "{:.2f}".format(line.total_distance)
+        dh_str   = "{:.4f}".format(line.total_height_diff)
+        self.line_info_lbl.setText(
+            "Line: " + (line.start_point or "?") + " -> " + (line.end_point or "?")
+            + "  |  Dist: " + dist_str + " m  |  dH: " + dh_str + " m"
+        )
+        self._populate_setup_table(line)
+
+    def update_validation_tab(self, line):
+        """Sync validation detail text when a line is selected."""
+        for i, ln in enumerate(self._lines):
+            if ln is line and i < len(self._val_results):
+                _, vr = self._val_results[i]
+                self._show_val_detail(vr)
+                return
+
+    def show_analysis_result(self, text):
+        """Append text to the Log tab (analysis text output)."""
+        self.log_text.append(text)
+        self.tabs.setCurrentIndex(3)  # Log tab
+
+    def show_adjustment_result(self, text):
+        """Append text to the Log tab (backward-compat alias)."""
+        self.log_text.append(text)
+        self.tabs.setCurrentIndex(3)
+
+    def log(self, text):
+        """Append a message to the Log tab."""
+        self.log_text.append(text)
+
+    def get_selected_class(self):
         return self.class_combo.currentText()
 
-    def get_current_index(self) -> int:
-        """Return the currently selected row index, or -1."""
+    def get_current_index(self):
         return self.line_list.currentRow()
 
-    def select_line_by_filename(self, filename: str):
-        """Select the list row whose line.filename matches; used by map-to-dock sync."""
+    def select_line_by_filename(self, filename):
         for i, line in enumerate(self._lines):
-            if os.path.basename(line.filename) == os.path.basename(filename) \
-                    or line.filename == filename:
-                # Block the signal to avoid re-triggering zoom
+            if (os.path.basename(line.filename) == os.path.basename(filename)
+                    or line.filename == filename):
                 self.line_list.blockSignals(True)
                 self.line_list.setCurrentRow(i)
                 self.line_list.blockSignals(False)
                 self._current_idx = i
                 self.populate_line_details(line)
-                if i < len(self._val_results):
-                    _, vr = self._val_results[i]
-                    self._populate_validation(vr, line)
-                self.tabs.setCurrentIndex(0)  # switch to Line Details
+                self.tabs.setCurrentIndex(0)
                 return
 
-    def update_file_list(self, files: list):
-        """Populate list from bare file paths (basename shown, full path stored)."""
-        self.line_list.clear()
-        self._lines = []
-        self._val_results = []
-        for f in files:
-            self.line_list.addItem(os.path.basename(f))
+    # ------------------------------------------------------------------ #
+    # Private helpers
+    # ------------------------------------------------------------------ #
 
-    # ------------------------------------------------------------------
-    # Slots
-    # ------------------------------------------------------------------
+    def _refresh_val_table(self):
+        """Rebuild the Validation tab table from current lines + results."""
+        self.val_table.setRowCount(0)
+        for i, line in enumerate(self._lines):
+            row = self.val_table.rowCount()
+            self.val_table.insertRow(row)
 
-    def _on_line_selected(self, idx: int):
-        if idx < 0 or idx >= len(self._lines):
-            return
-        self._current_idx = idx
-        line = self._lines[idx]
+            used   = getattr(line, "is_used", True)
+            is_valid = True
+            details  = ""
+            if i < len(self._val_results):
+                _, vr = self._val_results[i]
+                is_valid = vr.is_valid
+                errs = list(vr.errors) + list(vr.warnings)
+                details = errs[0] if errs else ("OK" if is_valid else "See errors")
 
-        # --- Details tab ---
-        self.populate_line_details(line)
+            status_str = "VALID" if is_valid else "INVALID"
+            if not used:
+                status_str = "EXCLUDED"
 
-        # --- Validation tab ---
-        if idx < len(self._val_results):
-            _, vr = self._val_results[idx]
-            self._populate_validation(vr, line)
+            dist_str = "{:.1f}".format(line.total_distance)
+            dh_str   = "{:.4f}".format(line.total_height_diff)
 
-        self.btn_adjust_line.setEnabled(True)
-        self.line_selected.emit(idx)
+            values = [
+                os.path.basename(line.filename),
+                line.start_point or "",
+                line.end_point   or "",
+                str(len(line.setups)),
+                dist_str,
+                dh_str,
+                status_str,
+                details,
+            ]
+            for col, val in enumerate(values):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                if not used:
+                    item.setForeground(QColor("#888888"))
+                elif is_valid:
+                    if col == 6:
+                        item.setForeground(QColor("#2e7d32"))
+                else:
+                    if col == 6:
+                        item.setForeground(QColor("#c62828"))
+                self.val_table.setItem(row, col, item)
+
+    def _show_val_detail(self, vr):
+        lines_out = []
+        for err in vr.errors:
+            lines_out.append("ERROR: " + err)
+        for warn in vr.warnings:
+            lines_out.append("WARN:  " + warn)
+        self.val_detail_text.setPlainText(
+            "\n".join(lines_out) if lines_out else "No issues found."
+        )
 
     def _populate_setup_table(self, line):
-        setups = line.setups
-        self.setup_table.setRowCount(len(setups))
-        for row, s in enumerate(setups):
+        self.setup_table.setRowCount(len(line.setups))
+        for row, s in enumerate(line.setups):
             dist = ((s.distance_back or 0) + (s.distance_fore or 0)) / 2
+            bs = "{:.5f}".format(s.backsight_reading) if s.backsight_reading is not None else "--"
+            fs = "{:.5f}".format(s.foresight_reading) if s.foresight_reading is not None else "--"
             for col, val in enumerate([
-                str(s.setup_number),
-                s.from_point,
-                s.to_point,
-                f"{s.backsight_reading:.5f}" if s.backsight_reading is not None else "—",
-                f"{s.foresight_reading:.5f}" if s.foresight_reading is not None else "—",
-                f"{dist:.2f}",
+                str(s.setup_number), s.from_point, s.to_point,
+                bs, fs, "{:.2f}".format(dist)
             ]):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignCenter)
                 self.setup_table.setItem(row, col, item)
 
-    def _populate_validation(self, vr, line=None):
-        cls_name = self.class_combo.currentText()
-        if vr.is_valid:
-            self.val_status_lbl.setText(f"✅  VALID — {cls_name}")
-            self.val_status_lbl.setStyleSheet(
-                "font-size: 14px; font-weight: bold; color: #2e7d32; padding: 4px;"
-            )
-        else:
-            # Show the specific line.status reason alongside INVALID
-            status_reason = ""
-            if line is not None:
-                status_val = line.status.value if hasattr(line.status, 'value') else str(line.status)
-                status_reason = f" [{status_val}]"
-            self.val_status_lbl.setText(f"❌  INVALID — {cls_name}{status_reason}")
-            self.val_status_lbl.setStyleSheet(
-                "font-size: 14px; font-weight: bold; color: #c62828; padding: 4px;"
-            )
+    # ------------------------------------------------------------------ #
+    # Slots
+    # ------------------------------------------------------------------ #
 
-        self.val_class_lbl.setText(CLASS_DESCRIPTIONS.get(cls_name, ""))
+    def _on_line_selected(self, idx):
+        if idx < 0 or idx >= len(self._lines):
+            return
+        self._current_idx = idx
+        line = self._lines[idx]
+        self.populate_line_details(line)
+        if idx < len(self._val_results):
+            _, vr = self._val_results[idx]
+            self._show_val_detail(vr)
+        self.btn_adjust_line.setEnabled(True)
+        self.btn_toggle_dir.setEnabled(True)
+        self.btn_toggle_use.setEnabled(True)
+        # Sync val table selection
+        self.val_table.blockSignals(True)
+        self.val_table.selectRow(idx)
+        self.val_table.blockSignals(False)
+        self.line_selected.emit(idx)
 
-        lines_out = []
-        for err in vr.errors:
-            lines_out.append(f"❌ {err}")
-        for warn in vr.warnings:
-            lines_out.append(f"⚠  {warn}")
-        self.val_errors.setPlainText("\n".join(lines_out) if lines_out else "No issues found.")
+    def _on_val_table_selection_changed(self):
+        row = self.val_table.currentRow()
+        if row < 0 or row >= len(self._lines):
+            return
+        self.line_list.blockSignals(True)
+        self.line_list.setCurrentRow(row)
+        self.line_list.blockSignals(False)
+        self._current_idx = row
+        self.populate_line_details(self._lines[row])
+        if row < len(self._val_results):
+            _, vr = self._val_results[row]
+            self._show_val_detail(vr)
 
     def _on_add_files(self):
-        """Open file dialog and emit files_added so the plugin processes them."""
-        files, _ = self._qfd.getOpenFileNames(
+        files, _ = QFileDialog.getOpenFileNames(
             self, "Select Measurement Files", "",
             "Geodetic Files (*.DAT *.dat *.RAW *.raw *.GSI *.gsi);;All Files (*)"
         )
         if files:
             cls = self.class_combo.currentText()
-            # Output dir: ask only if we have no prior context
-            output_dir = self._qfd.getExistingDirectory(
-                self, "Select Output Directory"
-            )
+            output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
             if output_dir:
                 self.files_added.emit(files, cls, output_dir)
 
     def _on_adjust_line(self):
         if self._current_idx >= 0:
             self.adjust_line_requested.emit(self._current_idx)
+
+    def _on_toggle_dir(self):
+        idx = self._current_idx
+        if idx < 0 or idx >= len(self._lines):
+            return
+        line = self._lines[idx]
+        try:
+            line.toggle_direction()
+        except AttributeError:
+            line.start_point, line.end_point = line.end_point, line.start_point
+            line.total_height_diff = -line.total_height_diff
+        used  = getattr(line, "is_used", True)
+        excl  = "" if used else " [EXCL]"
+        label = line.start_point + " -> " + line.end_point + "  [" + line.filename + "]" + excl
+        self.line_list.item(idx).setText(label)
+        self.populate_line_details(line)
+        self._refresh_val_table()
+        self.log("Toggled direction: " + line.filename)
+
+    def _on_toggle_use(self):
+        idx = self._current_idx
+        if idx < 0 or idx >= len(self._lines):
+            return
+        line = self._lines[idx]
+        line.is_used = not getattr(line, "is_used", True)
+        used  = line.is_used
+        excl  = "" if used else " [EXCL]"
+        label = line.start_point + " -> " + line.end_point + "  [" + line.filename + "]" + excl
+        item  = self.line_list.item(idx)
+        item.setText(label)
+        item.setForeground(QColor("#2e7d32" if used else "#888888"))
+        self._refresh_val_table()
+        state = "included" if used else "excluded"
+        self.log(line.filename + " marked as " + state)

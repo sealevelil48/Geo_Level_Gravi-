@@ -1,308 +1,287 @@
 """
 geo_level_reporter.py
-PDF report generator for LSA results using Qt's built-in print support.
-Zero external dependencies — QPrinter is bundled with QGIS/OSGeo4W.
+Branded PDF report generator for Geo Level Gravi.
+
+Uses only QGIS-bundled libraries (QPrinter, QTextDocument, QImage).
+Zero external dependencies — works in any OSGeo4W environment.
 """
+
+import os
 from datetime import datetime
 
 from qgis.PyQt.QtPrintSupport import QPrinter
 from qgis.PyQt.QtGui import (
-    QTextDocument, QTextCursor, QTextCharFormat, QTextBlockFormat,
-    QTextTableFormat, QFont, QColor, QPageSize
+    QTextDocument, QTextCursor, QTextTableFormat,
+    QTextCharFormat, QTextBlockFormat, QFont, QColor, QImage
 )
 from qgis.PyQt.QtCore import Qt, QSizeF
 
 
-# ── Hebrew detection ──────────────────────────────────────────────────────────
-def _has_hebrew(text: str) -> bool:
-    return any('\u05d0' <= ch <= '\u05ea' for ch in text)
-
-
-def _detect_bidi(result, fixed_points: dict) -> bool:
-    """Return True if any point ID or project field contains Hebrew."""
-    all_ids = list(result.adjusted_heights.keys()) + list(fixed_points.keys())
-    return any(_has_hebrew(pid) for pid in all_ids)
-
-
-# ── Format helpers ────────────────────────────────────────────────────────────
-def _char_fmt(size: float = 10, bold: bool = False,
-              color: QColor = None) -> QTextCharFormat:
-    fmt = QTextCharFormat()
-    fmt.setFontPointSize(size)
-    if bold:
-        fmt.setFontWeight(QFont.Bold)
-    if color:
-        fmt.setForeground(color)
-    return fmt
-
-
-def _block_fmt(align=Qt.AlignLeft, top_margin: float = 6,
-               bottom_margin: float = 2) -> QTextBlockFormat:
-    fmt = QTextBlockFormat()
-    fmt.setAlignment(align)
-    fmt.setTopMargin(top_margin)
-    fmt.setBottomMargin(bottom_margin)
-    return fmt
-
-
 class GeoLevelReporter:
     """
-    Generates a formal PDF survey report from an AdjustmentResult.
+    Generate a formal A4 PDF survey certificate from LSA results.
 
-    Usage:
-        reporter = GeoLevelReporter(result, fixed_points, project_info)
-        reporter.generate_pdf("/path/to/report.pdf")
+    Parameters
+    ----------
+    result_data : dict
+        Keys expected:
+            'stats'  : dict  — sigma_zero_sq, dof, total_dist_km, iterations
+            'points' : dict  — {point_id: {height, correction_mm, sigma_mm, is_fixed}}
+            'residuals' : list — [{key, residual_mm}]
+    project_info : dict, optional
+        company, surveyor, project_name, class
+    fixed_points : list, optional
+        List of fixed point IDs (highlighted light-blue in table)
     """
 
-    COMPANY_PLACEHOLDER = "[Company Name / שם החברה]"
-    COMPLIANCE_TEXT = "Compliant with Survey of Israel — Directive \u05d32 (2021)"
+    # ------------------------------------------------------------------ #
+    # Colours
+    # ------------------------------------------------------------------ #
+    _NAVY   = QColor(0,   51, 102)
+    _BLUE   = QColor(173, 216, 230)   # light-blue for fixed points
+    _ORANGE = QColor(255, 200, 100)   # residuals > 5 mm
+    _WHITE  = QColor(255, 255, 255)
+    _LGRAY  = QColor(240, 240, 240)
 
-    def __init__(self, result, fixed_points: dict, project_info: dict = None):
-        """
-        Args:
-            result:       AdjustmentResult from LeastSquaresAdjuster
-            fixed_points: {point_id: original_height} used in the adjustment
-            project_info: optional dict with keys: company, surveyor, project_name, class
-        """
-        self.result = result
-        self.fixed_points = fixed_points
-        self.info = project_info or {}
-        self._bidi = _detect_bidi(result, fixed_points)
+    def __init__(self, result_data, fixed_points=None, project_info=None):
+        self.results      = result_data
+        self.fixed_points = set(fixed_points or [])
+        self.project_info = project_info or {}
+        self.logo_path    = os.path.join(os.path.dirname(__file__),
+                                         'survey_of_israel_logo.png')
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
 
     def generate_pdf(self, output_path: str) -> str:
-        """Render the report to a PDF file. Returns output_path."""
+        """Render the report to *output_path* and return the path."""
         printer = QPrinter(QPrinter.HighResolution)
         printer.setOutputFormat(QPrinter.PdfFormat)
         printer.setPageSize(QPrinter.A4)
         printer.setOutputFileName(output_path)
-        printer.setPageMargins(20, 20, 20, 20, QPrinter.Millimeter)
 
-        doc = QTextDocument()
-        doc.setPageSize(QSizeF(printer.pageRect().size()))
+        doc  = QTextDocument()
+        doc.setDefaultFont(QFont("Arial", 10))
+        doc.setDocumentMargin(20)
 
-        # BiDi: if Hebrew detected, set document default direction RTL
-        if self._bidi:
-            from qgis.PyQt.QtGui import QTextOption
-            opt = QTextOption()
-            opt.setTextDirection(Qt.RightToLeft)
-            doc.setDefaultTextOption(opt)
+        # RTL default so Hebrew labels render correctly
+        opt = doc.defaultTextOption()
+        opt.setTextDirection(Qt.RightToLeft)
+        doc.setDefaultTextOption(opt)
 
         cursor = QTextCursor(doc)
-        self._write_header(cursor)
-        self._write_stats(cursor)
-        self._write_heights_table(cursor)
-        self._write_residuals_table(cursor)
-        self._write_stamp(cursor)
+
+        self._insert_header(cursor, printer)
+        self._insert_stats(cursor)
+        self._insert_heights_table(cursor)
+        self._insert_residuals_table(cursor)
+        self._insert_stamp(cursor)
 
         doc.print_(printer)
         return output_path
 
-    # ── Section writers ───────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    # Section builders
+    # ------------------------------------------------------------------ #
 
-    def _write_header(self, cursor: QTextCursor):
-        # Title
-        cursor.setBlockFormat(_block_fmt(Qt.AlignCenter, top_margin=0))
-        cursor.insertText(
-            "Geodetic Leveling Report — LSA Results\n"
-            "\u05d3\u05d5\u05d7 \u05e4\u05d9\u05dc\u05d5\u05e1 \u05d2\u05d9\u05d0\u05d5\u05d3\u05d8\u05d9 — \u05ea\u05d5\u05e6\u05d0\u05d5\u05ea \u05ea\u05d0\u05d5\u05dd \u05e8\u05e9\u05ea",
-            _char_fmt(size=16, bold=True)
-        )
-        cursor.insertBlock()
+    def _insert_header(self, cursor: QTextCursor, printer: QPrinter):
+        """Logo + bilingual title + meta block + navy rule."""
 
-        # Company / surveyor meta
-        cursor.setBlockFormat(_block_fmt(Qt.AlignCenter))
-        company = self.info.get("company", self.COMPANY_PLACEHOLDER)
-        surveyor = self.info.get("surveyor", "")
-        project = self.info.get("project_name", "")
-        cls = self.info.get("class", "")
+        # --- Logo ---
+        img = QImage(self.logo_path)
+        if not img.isNull():
+            scaled = img.scaledToHeight(80, Qt.SmoothTransformation)
+            doc    = cursor.document()
+            doc.addResource(QTextDocument.ImageResource,
+                            # Use a simple string key
+                            __import__('qgis').PyQt.QtCore.QUrl("logo://survey"),
+                            scaled)
+            img_fmt = QTextCharFormat()
+            cursor.insertImage(scaled)
+            cursor.insertText("\n")
 
-        meta_lines = [
-            f"Company / חברה: {company}",
+        # --- Title ---
+        fmt_title = QTextCharFormat()
+        fmt_title.setFontWeight(QFont.Bold)
+        fmt_title.setFontPointSize(16)
+        fmt_title.setForeground(self._NAVY)
+        cursor.insertText("Geodetic Leveling Report — LSA Results\n", fmt_title)
+
+        fmt_heb = QTextCharFormat()
+        fmt_heb.setFontPointSize(13)
+        fmt_heb.setForeground(self._NAVY)
+        cursor.insertText("דוח פילוס גיאודטי — תוצאות כיוון ריבועים פחותים\n\n", fmt_heb)
+
+        # --- Meta ---
+        fmt_meta = QTextCharFormat()
+        fmt_meta.setFontPointSize(9)
+        pi = self.project_info
+        now = datetime.now().strftime("%Y-%m-%d  %H:%M")
+        lines = [
+            f"Company / חברה    : {pi.get('company',  '___________________')}",
+            f"Surveyor / מודד   : {pi.get('surveyor', '___________________')}",
+            f"Project / פרויקט  : {pi.get('project_name', '___________________')}",
+            f"Class / דרגה      : {pi.get('class', 'H3')}",
+            f"Date / תאריך      : {now}",
+            f"Compliance        : Israeli Survey Regulations — Directive \u05d22 (2021)",
         ]
-        if surveyor:
-            meta_lines.append(f"Surveyor / מודד: {surveyor}")
-        if project:
-            meta_lines.append(f"Project / פרויקט: {project}")
-        if cls:
-            meta_lines.append(f"Precision Class / דרגת דיוק: {cls}")
-        meta_lines += [
-            f"Date / תאריך: {datetime.now().strftime('%Y-%m-%d  %H:%M')}",
-            self.COMPLIANCE_TEXT,
-        ]
-        cursor.insertText("\n".join(meta_lines), _char_fmt(size=9))
-        cursor.insertBlock()
+        for ln in lines:
+            cursor.insertText(ln + "\n", fmt_meta)
 
-        # Horizontal rule via a thin table
-        self._insert_rule(cursor)
+        # --- Navy rule ---
+        fmt_rule = QTextCharFormat()
+        fmt_rule.setForeground(self._NAVY)
+        fmt_rule.setFontPointSize(6)
+        cursor.insertText("\n" + "─" * 90 + "\n\n", fmt_rule)
 
-    def _write_stats(self, cursor: QTextCursor):
-        r = self.result
-        dof = max(0, len(r.residuals) - (
-            len(r.adjusted_heights) - len(self.fixed_points)
-        ))
-        ref_var = r.mse_unit_weight ** 2
+    def _insert_stats(self, cursor: QTextCursor):
+        """2-column statistics table."""
+        fmt_h = self._heading_fmt()
+        cursor.insertText("Network Statistics / סטטיסטיקת רשת\n", fmt_h)
 
-        cursor.setBlockFormat(_block_fmt(top_margin=10))
-        cursor.insertText(
-            "Network Statistics / \u05e1\u05d8\u05d8\u05d9\u05e1\u05d8\u05d9\u05e7\u05ea \u05e8\u05e9\u05ea",
-            _char_fmt(size=12, bold=True)
-        )
-        cursor.insertBlock()
-
-        stats = [
-            (f"Reference Variance (\u03c3\u2080\u00b2)", f"{ref_var:.6f} m\u00b2"),
-            (f"Unit Weight Std Dev (\u03c3\u2080)", f"{r.mse_unit_weight * 1000:.3f} mm"),
-            ("Degrees of Freedom", str(dof)),
-            ("Iterations", str(r.iteration)),
-            ("K Coefficient", f"{r.k_coefficient:.4f}"),
-            ("Total Network Distance", f"{r.total_distance_km:.3f} km"),
-            ("Fixed Points", str(len(self.fixed_points))),
-            ("Adjusted Points", str(len(r.adjusted_heights) - len(self.fixed_points))),
+        stats = self.results.get("stats", {})
+        rows = [
+            ("σ₀²  (Reference Variance)",        f"{stats.get('sigma_zero_sq', 0):.6f}"),
+            ("σ₀   (Unit Weight Std Dev mm)",     f"{stats.get('sigma_zero',    0):.4f}"),
+            ("Degrees of Freedom",                str(stats.get("dof",          0))),
+            ("Iterations",                        str(stats.get("iterations",   0))),
+            ("K Coefficient",                     f"{stats.get('k_coeff',       0):.4f}"),
+            ("Total Distance (km)",               f"{stats.get('total_dist_km', 0):.3f}"),
+            ("Fixed Points",                      str(len(self.fixed_points))),
+            ("Adjusted Points",                   str(len(self.results.get("points", {}))
+                                                       - len(self.fixed_points))),
         ]
 
-        tbl_fmt = self._table_fmt(cols=2)
-        tbl = cursor.insertTable(len(stats), 2, tbl_fmt)
-        lbl_fmt = _char_fmt(size=9, bold=True)
-        val_fmt = _char_fmt(size=9)
-        for row, (label, value) in enumerate(stats):
-            tbl.cellAt(row, 0).firstCursorPosition().insertText(label, lbl_fmt)
-            tbl.cellAt(row, 1).firstCursorPosition().insertText(value, val_fmt)
+        tbl_fmt = self._table_fmt(2)
+        tbl = cursor.insertTable(len(rows), 2, tbl_fmt)
+        for r, (label, value) in enumerate(rows):
+            tbl.cellAt(r, 0).firstCursorPosition().insertText(label)
+            tbl.cellAt(r, 1).firstCursorPosition().insertText(value)
 
         cursor.movePosition(QTextCursor.End)
-        cursor.insertBlock()
+        cursor.insertText("\n\n")
 
-    def _write_heights_table(self, cursor: QTextCursor):
-        r = self.result
-        all_pts = sorted(r.adjusted_heights.keys())
-        fixed_first = [p for p in all_pts if p in self.fixed_points] + \
-                      [p for p in all_pts if p not in self.fixed_points]
+    def _insert_heights_table(self, cursor: QTextCursor):
+        """5-column adjusted heights table with colour coding."""
+        fmt_h = self._heading_fmt()
+        cursor.insertText("Adjusted Heights / גבהים מתואמים\n", fmt_h)
 
-        cursor.setBlockFormat(_block_fmt(top_margin=10))
-        cursor.insertText(
-            "Adjusted Heights / \u05d2\u05d1\u05d4\u05d9\u05dd \u05de\u05ea\u05d5\u05d0\u05de\u05d9\u05dd",
-            _char_fmt(size=12, bold=True)
-        )
-        cursor.insertBlock()
-
-        headers = ["Point ID", "Adj. Height (m)", "Correction (mm)", "Std Dev (mm)", "Type"]
-        tbl_fmt = self._table_fmt(cols=len(headers))
-        tbl = cursor.insertTable(len(fixed_first) + 1, len(headers), tbl_fmt)
-
-        hdr_fmt = _char_fmt(size=9, bold=True, color=QColor(255, 255, 255))
-        hdr_bg = QColor(44, 62, 80)  # dark navy
-
-        for col, h in enumerate(headers):
-            cell_cur = tbl.cellAt(0, col).firstCursorPosition()
-            blk = QTextBlockFormat()
-            blk.setBackground(hdr_bg)
-            cell_cur.setBlockFormat(blk)
-            cell_cur.insertText(h, hdr_fmt)
-
-        row_fmt_fixed = QTextBlockFormat()
-        row_fmt_fixed.setBackground(QColor(200, 220, 255))  # light blue for fixed
-        val_fmt = _char_fmt(size=9)
-
-        for row, pid in enumerate(fixed_first, start=1):
-            adj_h = r.adjusted_heights[pid]
-            sigma_mm = r.mse_heights.get(pid, 0.0) * 1000
-            is_fixed = pid in self.fixed_points
-
-            if is_fixed:
-                corr_mm = (adj_h - self.fixed_points[pid]) * 1000
-                corr_str = f"{corr_mm:+.2f}"
-                type_str = "Fixed / קבוע"
-            else:
-                corr_str = "—"
-                type_str = "Adjusted / מתואם"
-
-            row_data = [str(pid), f"{adj_h:.5f}", corr_str, f"{sigma_mm:.3f}", type_str]
-            for col, val in enumerate(row_data):
-                cell_cur = tbl.cellAt(row, col).firstCursorPosition()
-                if is_fixed:
-                    cell_cur.setBlockFormat(row_fmt_fixed)
-                cell_cur.insertText(val, val_fmt)
-
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertBlock()
-
-    def _write_residuals_table(self, cursor: QTextCursor):
-        r = self.result
-        if not r.residuals:
+        points = self.results.get("points", {})
+        if not points:
+            cursor.insertText("No adjusted heights available.\n\n")
             return
 
-        cursor.setBlockFormat(_block_fmt(top_margin=10))
-        cursor.insertText(
-            "Observation Residuals / \u05e9\u05d0\u05e8\u05d9\u05d5\u05ea \u05ea\u05e6\u05e4\u05d9\u05d5\u05ea",
-            _char_fmt(size=12, bold=True)
-        )
-        cursor.insertBlock()
+        headers = ["Point ID", "Height (m)", "Correction (mm)", "Std Dev (mm)", "Type"]
+        tbl_fmt = self._table_fmt(len(headers))
+        tbl_fmt.setHeaderRowCount(1)
+        tbl = cursor.insertTable(len(points) + 1, len(headers), tbl_fmt)
 
-        sorted_resid = sorted(r.residuals.items())
-        tbl_fmt = self._table_fmt(cols=2)
-        tbl = cursor.insertTable(len(sorted_resid) + 1, 2, tbl_fmt)
+        # Header row — navy background
+        for c, h in enumerate(headers):
+            cell   = tbl.cellAt(0, c)
+            cfmt   = cell.format()
+            cfmt.setBackground(self._NAVY)
+            cell.setFormat(cfmt)
+            hfmt = QTextCharFormat()
+            hfmt.setForeground(self._WHITE)
+            hfmt.setFontWeight(QFont.Bold)
+            cell.firstCursorPosition().insertText(h, hfmt)
 
-        hdr_fmt = _char_fmt(size=9, bold=True, color=QColor(255, 255, 255))
-        hdr_bg = QColor(44, 62, 80)
-        for col, h in enumerate(["Observation", "Residual (mm)"]):
-            cell_cur = tbl.cellAt(0, col).firstCursorPosition()
-            blk = QTextBlockFormat()
-            blk.setBackground(hdr_bg)
-            cell_cur.setBlockFormat(blk)
-            cell_cur.insertText(h, hdr_fmt)
+        # Data rows
+        for row, (pid, data) in enumerate(points.items(), start=1):
+            is_fixed = pid in self.fixed_points
+            bg = self._BLUE if is_fixed else self._WHITE
 
-        warn_bg = QTextBlockFormat()
-        warn_bg.setBackground(QColor(255, 200, 100))
-        val_fmt = _char_fmt(size=9)
-
-        for row, (obs_id, v_mm) in enumerate(sorted_resid, start=1):
-            tbl.cellAt(row, 0).firstCursorPosition().insertText(obs_id, val_fmt)
-            cell_cur = tbl.cellAt(row, 1).firstCursorPosition()
-            if abs(v_mm) > 5.0:
-                cell_cur.setBlockFormat(warn_bg)
-            cell_cur.insertText(f"{v_mm:+.3f}", val_fmt)
+            values = [
+                str(pid),
+                f"{data.get('height', 0):.4f}",
+                "—" if is_fixed else f"{data.get('correction_mm', 0):.1f}",
+                f"{data.get('sigma_mm', 0):.2f}",
+                "Fixed" if is_fixed else "Adjusted",
+            ]
+            for c, val in enumerate(values):
+                cell = tbl.cellAt(row, c)
+                cfmt = cell.format()
+                cfmt.setBackground(bg)
+                cell.setFormat(cfmt)
+                cell.firstCursorPosition().insertText(val)
 
         cursor.movePosition(QTextCursor.End)
-        cursor.insertBlock()
+        cursor.insertText("\n\n")
 
-    def _write_stamp(self, cursor: QTextCursor):
-        cursor.setBlockFormat(_block_fmt(top_margin=20))
-        self._insert_rule(cursor)
+    def _insert_residuals_table(self, cursor: QTextCursor):
+        """2-column residuals table; rows > 5 mm highlighted orange."""
+        fmt_h = self._heading_fmt()
+        cursor.insertText("Observation Residuals / שאריות תצפיות\n", fmt_h)
 
-        cursor.setBlockFormat(_block_fmt(Qt.AlignCenter, top_margin=8))
-        stamp_text = (
-            f"Digital Stamp: [GeoLevel-LSA-Verified-{datetime.now().year}]\n"
-            "Authorized Signature / \u05d7\u05ea\u05d9\u05de\u05d4 \u05de\u05d0\u05d5\u05e9\u05e8\u05ea\n\n"
-            "_" * 35 + "\n"
-            f"{self.info.get('surveyor', 'Licensed Surveyor / מודד מוסמך')}\n"
-        )
-        cursor.insertText(stamp_text, _char_fmt(size=9))
+        residuals = self.results.get("residuals", [])
+        if not residuals:
+            cursor.insertText("No residuals available.\n\n")
+            return
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+        headers = ["Observation (FROM–TO)", "Residual (mm)"]
+        tbl_fmt = self._table_fmt(2)
+        tbl_fmt.setHeaderRowCount(1)
+        tbl = cursor.insertTable(len(residuals) + 1, 2, tbl_fmt)
+
+        for c, h in enumerate(headers):
+            cell = tbl.cellAt(0, c)
+            cfmt = cell.format()
+            cfmt.setBackground(self._NAVY)
+            cell.setFormat(cfmt)
+            hfmt = QTextCharFormat()
+            hfmt.setForeground(self._WHITE)
+            hfmt.setFontWeight(QFont.Bold)
+            cell.firstCursorPosition().insertText(h, hfmt)
+
+        for row, item in enumerate(residuals, start=1):
+            res_mm = item.get("residual_mm", 0)
+            bg     = self._ORANGE if abs(res_mm) > 5 else self._WHITE
+            for c, val in enumerate([item.get("key", ""), f"{res_mm:.2f}"]):
+                cell = tbl.cellAt(row, c)
+                cfmt = cell.format()
+                cfmt.setBackground(bg)
+                cell.setFormat(cfmt)
+                cell.firstCursorPosition().insertText(val)
+
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText("\n\n")
+
+    def _insert_stamp(self, cursor: QTextCursor):
+        """Digital stamp + authorised signature line."""
+        year = datetime.now().year
+        fmt  = QTextCharFormat()
+        fmt.setFontPointSize(9)
+        fmt.setForeground(self._NAVY)
+
+        cursor.insertText("─" * 90 + "\n", fmt)
+        cursor.insertText(f"Digital Stamp: [GeoLevel-LSA-Verified-{year}]\n\n", fmt)
+
+        fmt_sig = QTextCharFormat()
+        fmt_sig.setFontPointSize(10)
+        cursor.insertText("_" * 35 + "\n", fmt_sig)
+        cursor.insertText("Authorized Signature / חתימה מאושרת\n", fmt_sig)
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _heading_fmt() -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Bold)
+        fmt.setFontPointSize(12)
+        fmt.setForeground(QColor(0, 51, 102))
+        return fmt
 
     @staticmethod
     def _table_fmt(cols: int) -> QTextTableFormat:
         fmt = QTextTableFormat()
-        fmt.setBorder(0.5)
         fmt.setBorderStyle(QTextTableFormat.BorderStyle_Solid)
+        fmt.setBorder(0.5)
         fmt.setCellPadding(4)
         fmt.setCellSpacing(0)
-        fmt.setWidth(100)  # percentage — full width
+        fmt.setWidth(__import__('qgis').PyQt.QtGui.QTextLength(
+            __import__('qgis').PyQt.QtGui.QTextLength.PercentageLength, 100))
         return fmt
-
-    @staticmethod
-    def _insert_rule(cursor: QTextCursor):
-        """Insert a full-width horizontal rule via a 1-row borderless table."""
-        fmt = QTextTableFormat()
-        fmt.setBorder(0)
-        fmt.setCellPadding(0)
-        fmt.setCellSpacing(0)
-        fmt.setWidth(100)
-        tbl = cursor.insertTable(1, 1, fmt)
-        blk = QTextBlockFormat()
-        blk.setBackground(QColor(44, 62, 80))
-        blk.setTopMargin(1)
-        blk.setBottomMargin(1)
-        tbl.cellAt(0, 0).firstCursorPosition().setBlockFormat(blk)
-        cursor.movePosition(QTextCursor.End)

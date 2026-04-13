@@ -9,12 +9,8 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 import math
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from ..config.models import LevelingLine, MeasurementSummary
-from ..config.israel_survey_regulations import get_class_parameters, CLASS_REGISTRY
+from core_logic.config.models import LevelingLine, MeasurementSummary
+from core_logic.config.israel_survey_regulations import get_class_parameters, CLASS_REGISTRY
 
 
 @dataclass

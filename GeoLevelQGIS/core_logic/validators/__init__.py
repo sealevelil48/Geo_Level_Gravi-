@@ -211,20 +211,15 @@ class LevelingValidator:
         measurement_type = MeasurementType.GEOMETRIC
 
         all_valid = True
-        max_violations = 5  # Limit error messages
 
         for i, setup in enumerate(line.setups):
-            if i >= max_violations:
-                result.add_warning(f"... and {len(line.setups) - i} more setups not checked")
-                break
-
             # Check backsight distance
             if setup.distance_back is not None:
                 is_valid, message = self.class_params.validate_sight_distance(
                     setup.distance_back, measurement_type
                 )
                 if not is_valid:
-                    result.add_error(f"Setup {setup.setup_number} backsight: {message}")
+                    result.add_error("Setup " + str(setup.setup_number) + " backsight: " + message)
                     all_valid = False
 
             # Check foresight distance
@@ -233,7 +228,7 @@ class LevelingValidator:
                     setup.distance_fore, measurement_type
                 )
                 if not is_valid:
-                    result.add_error(f"Setup {setup.setup_number} foresight: {message}")
+                    result.add_error("Setup " + str(setup.setup_number) + " foresight: " + message)
                     all_valid = False
 
         return all_valid

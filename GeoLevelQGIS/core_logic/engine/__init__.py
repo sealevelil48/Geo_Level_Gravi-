@@ -3,7 +3,7 @@ Engine Package
 
 Core geodetic calculation modules.
 """
-from .height_calculator import (
+from core_logic.engine.height_calculator import (
     calculate_height_diff,
     calculate_line_totals,
     calculate_misclosure,
@@ -15,20 +15,20 @@ from .height_calculator import (
     merge_bf_measurements
 )
 
-from .line_adjustment import (
+from core_logic.engine.line_adjustment import (
     LineAdjuster,
     adjust_single_line
 )
 
-from .least_squares import (
+from core_logic.engine.least_squares import (
     LeastSquaresAdjuster,
     ConditionalAdjuster,
     simple_adjustment
 )
 
-from .adjustment_computations import AdjustmentComputations
+from core_logic.engine.adjustment_computations import AdjustmentComputations
 
-from .ADJwarnings import (
+from core_logic.engine.ADJwarnings import (
     IllConditionedMatrixWarning,
     SingularMatrixError,
     InsufficientObservationsError,
@@ -37,7 +37,7 @@ from .ADJwarnings import (
     InvalidNetworkError
 )
 
-from .loop_detector import (
+from core_logic.engine.loop_detector import (
     Loop,
     NetworkGraph,
     LoopAnalyzer,
