@@ -63,6 +63,8 @@ class GeoLevelPlugin:
         proj_menu.addAction("Save Project…").triggered.connect(self._save_project)
         proj_menu.addAction("Load Project…").triggered.connect(self._load_project)
         proj_menu.addSeparator()
+        proj_menu.addAction("Export Results (REZ / GeoJSON)…").triggered.connect(self._export_results)
+        proj_menu.addSeparator()
         proj_menu.addAction("Project Properties…").triggered.connect(self._show_project_properties)
 
         # ── Analysis sub-menu ─────────────────────────────────────────
@@ -242,10 +244,12 @@ class GeoLevelPlugin:
 
         s = result["summary"]
         total_loaded = len(self._lines)
+        rez_path = result.get("rez_path")
+        rez_info = ("  |  REZ: " + os.path.basename(rez_path)) if rez_path else ""
         self.iface.messageBar().pushMessage(
             "Geo Level Gravi",
             "Added " + str(len(new_lines)) + " line(s) -- total " + str(total_loaded)
-            + "  (" + str(s["valid"]) + "/" + str(s["total"]) + " new valid)",
+            + "  (" + str(s["valid"]) + "/" + str(s["total"]) + " new valid)" + rez_info,
             level=Qgis.Success, duration=6,
         )
 
@@ -715,19 +719,25 @@ class GeoLevelPlugin:
         if not output_dir:
             return
         try:
+            exported = []
+
+            # REZ summary
+            from core_logic.exporters import export_rez
+            rez_path = os.path.join(output_dir, "geo_level_export.rez")
+            export_rez(rez_path, self._lines, project_name="geo_level_export")
+            exported.append("REZ: " + rez_path)
+
+            # GeoJSON
             from core_logic.gis.geojson_export import export_network_to_geojson
             files = export_network_to_geojson(
                 self._lines, output_dir, project_name="geo_level_export"
             )
-            msg = "Exported:\n  GeoJSON: " + files["lines_geojson"]
-            try:
-                from core_logic.exporters import export_fteg
-                fteg_path = os.path.join(output_dir, "export.fteg")
-                export_fteg(self._lines, fteg_path)
-                msg += "\n  FTEG: " + fteg_path
-            except Exception:
-                pass
-            QMessageBox.information(self.iface.mainWindow(), "Export Results", msg)
+            exported.append("GeoJSON: " + files["lines_geojson"])
+
+            QMessageBox.information(
+                self.iface.mainWindow(), "Export Results",
+                "Exported:\n  " + "\n  ".join(exported)
+            )
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)

@@ -93,10 +93,23 @@ def process_geodetic_data(
         project_name="geo_level_result",
     )
 
+    # ------------------------------------------------------------------ #
+    # 4. Export REZ summary file (same as standalone CLI "export" command)
+    # ------------------------------------------------------------------ #
+    from core_logic.exporters import export_rez
+    rez_path = str(Path(output_dir) / "geo_level_result.rez")
+    try:
+        export_rez(rez_path, lines, project_name="geo_level_result")
+        log.info("Exported REZ to %s", rez_path)
+    except Exception as exc:
+        log.warning("REZ export failed: %s", exc)
+        rez_path = None
+
     return {
         "lines_geojson": output_files["lines_geojson"],
         "line_style":    output_files["line_style"],
         "point_style":   output_files["point_style"],
+        "rez_path":      rez_path,
         "summary": {
             "total":    len(lines),
             "valid":    valid_count,
