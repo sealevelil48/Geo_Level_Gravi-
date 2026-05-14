@@ -228,11 +228,12 @@ class LeastSquaresAdjuster:
         
         # Calculate M.S.E. of adjusted heights
         try:
+            N = A.T @ P @ A  # recompute N for Qxx (same as inside loop)
             Qxx = np.linalg.inv(N)
             mse_heights = {}
             for j, pid in enumerate(unknown_list):
                 mse_heights[pid] = mse_unit_weight * np.sqrt(Qxx[j, j])
-        except:
+        except Exception:
             mse_heights = {pid: 0.0 for pid in unknown_list}
         
         # Calculate classification coefficient K
@@ -299,35 +300,31 @@ class LeastSquaresAdjuster:
 
 class ConditionalAdjuster:
     """
-    Conditional Adjustment (Bv+W method) for leveling networks.
+    Conditional Adjustment (Bv + W = 0) for leveling networks.
 
-    Implements the conditional equation method where:
-        Bv + w = 0
+    Conditions = independent loops + independent paths between fixed benchmarks.
+    n_conditions = n_loops + (n_BM - 1)
 
-    This method is suitable for:
-    - Loop networks (each loop provides one condition)
-    - Networks with redundant observations
-    - Cases where conditions are more natural than parameters
-
-    The adjustment minimizes v^T * P * v subject to the conditions.
+    Steps:
+        1. Build weight matrix P (diagonal, P[i,i] = 1/dist_km)
+        2. Build condition matrix B (+1/-1/0) and misclosure vector W
+        3. M = B * P^-1 * B^T
+        4. v = -P^-1 * B^T * M^-1 * W
+        5. L_adjusted = L + v
+        6. sigma_0^2 = v^T P v / r
+        7. Propagate adjusted dH from fixed points to get all heights
     """
 
-    def __init__(
-        self,
-        check_stability: bool = True,
-        condition_number_threshold: float = 1e10
-    ):
-        """
-        Initialize conditional adjuster.
-
-        Args:
-            check_stability: Whether to perform matrix stability checks
-            condition_number_threshold: Threshold for ill-conditioned warning
-        """
+    def __init__(self, check_stability: bool = True,
+                 condition_number_threshold: float = 1e10):
         self.check_stability = check_stability
         self.adj_comp = AdjustmentComputations(
             condition_number_threshold=condition_number_threshold
         )
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
 
     def adjust_loops(
         self,
@@ -336,137 +333,219 @@ class ConditionalAdjuster:
         fixed_points: Optional[Dict[str, float]] = None
     ) -> AdjustmentResult:
         """
-        Perform conditional adjustment on a loop network.
+        Perform conditional adjustment.
 
         Args:
-            lines: List of LevelingLine objects
-            loops: List of loops, where each loop is a list of line indices
-            fixed_points: Optional dictionary of fixed benchmark heights
+            lines       : list of LevelingLine objects (active lines only)
+            loops       : list of loop index lists (from find_basis_loops)
+            fixed_points: {point_id: height} for known benchmarks
 
         Returns:
-            AdjustmentResult with adjusted heights and statistics
+            AdjustmentResult
         """
-        # Convert lines to observations
-        observations = []
-        for line in lines:
-            obs = MeasurementSummary(
-                from_point=line.start_point,
-                to_point=line.end_point,
-                height_diff=line.total_height_diff,
-                distance=line.total_distance,
-                num_setups=line.num_setups,
-                bf_diff=0.0,
-                year_month="",
-                source_file=line.filename
-            )
-            observations.append(obs)
+        n_obs = len(lines)
+        fixed_points = fixed_points or {}
 
-        n_obs = len(observations)
-        n_conditions = len(loops)
-
-        # Build weight matrix P (diagonal, weight = 1/distance in km)
+        # ── 1. Weight matrix P (diagonal, P[i,i] = 1/dist_km) ──────────
         P = np.zeros((n_obs, n_obs))
-        for i, obs in enumerate(observations):
-            dist_km = obs.distance / 1000.0
-            if dist_km > 0:
-                P[i, i] = 1.0 / dist_km
-            else:
-                P[i, i] = 1.0
+        for i, line in enumerate(lines):
+            dist_km = line.total_distance / 1000.0
+            P[i, i] = 1.0 / dist_km if dist_km > 0 else 1.0
 
-        # Build condition matrix B and misclosure vector w
-        B = np.zeros((n_conditions, n_obs))
-        w = np.zeros(n_conditions)
+        # ── 2. Build B and W ────────────────────────────────────────────
+        # Condition rows from loops
+        B_rows = []
+        W_vals = []
 
-        for loop_idx, loop in enumerate(loops):
-            loop_misclosure = 0.0
-            for line_idx in loop:
-                if 0 <= line_idx < n_obs:
-                    # Coefficient is +1 or -1 depending on direction
-                    # For now, assume all positive (can be enhanced)
-                    B[loop_idx, line_idx] = 1.0
-                    loop_misclosure += observations[line_idx].height_diff
+        for loop_idx_list in loops:
+            row = np.zeros(n_obs)
+            w_val = 0.0
+            for li in loop_idx_list:
+                if 0 <= li < n_obs:
+                    # Sign: +1 if line direction matches loop traversal,
+                    # -1 if reversed.  We store the sign in the loop list
+                    # as a signed index (negative = reversed).
+                    if isinstance(li, tuple):
+                        idx, sign = li
+                    else:
+                        idx, sign = li, 1
+                    row[idx] = float(sign)
+                    w_val += sign * lines[idx].total_height_diff
+            B_rows.append(row)
+            W_vals.append(w_val)
 
-            w[loop_idx] = loop_misclosure
+        # Condition rows from paths between fixed benchmarks
+        bm_ids = sorted(fixed_points.keys())
+        path_conditions = self._build_path_conditions(
+            lines, bm_ids, fixed_points, n_obs
+        )
+        for row, w_val in path_conditions:
+            B_rows.append(row)
+            W_vals.append(w_val)
 
-        # Perform conditional adjustment
+        if not B_rows:
+            raise InsufficientObservationsError(
+                "No conditions could be formed (no loops and no BM paths)."
+            )
+
+        B = np.array(B_rows)          # (r x n_obs)
+        W = np.array(W_vals)          # (r,)
+        r = len(B_rows)               # redundancy / degrees of freedom
+
+        if r >= n_obs:
+            raise InsufficientObservationsError(
+                "Conditions (%d) >= observations (%d). System is over-determined."
+                % (r, n_obs)
+            )
+
+        # ── 3. Core math: M = B P^-1 B^T ───────────────────────────────
+        P_inv = np.diag(1.0 / np.diag(P))   # diagonal inverse
+        M = B @ P_inv @ B.T                  # (r x r)
+
+        if self.check_stability:
+            self.adj_comp.check_matrix_stability(M, "Condition Normal Matrix M")
+
         try:
-            adj_result = self.adj_comp.run_conditional_adjustment(
-                B, w, P, check_stability=self.check_stability
-            )
+            M_inv = np.linalg.inv(M)
+        except np.linalg.LinAlgError as exc:
+            raise SingularMatrixError("Condition matrix M is singular: " + str(exc))
 
-            v = adj_result['v']  # Residuals
-            k = adj_result['k']  # Correlates
-            sigma_0 = adj_result['sigma_0']
+        # ── 4. Residuals: v = -P^-1 B^T M^-1 W ────────────────────────
+        k = M_inv @ W                        # correlates (r,)
+        v = -P_inv @ B.T @ k                 # observation residuals (n_obs,)
 
-        except SingularMatrixError as e:
-            logger.error(f"Singular matrix in conditional adjustment: {e}")
-            raise ValueError(f"Cannot perform conditional adjustment: {e}")
-        except InsufficientObservationsError as e:
-            logger.error(f"Insufficient observations: {e}")
-            raise ValueError(f"Insufficient observations for adjustment: {e}")
+        # ── 5. Adjusted height differences ─────────────────────────────
+        L_adj = np.array([ln.total_height_diff for ln in lines]) + v
 
-        # Calculate adjusted observations
-        adjusted_obs = []
-        for i, obs in enumerate(observations):
-            adjusted_dh = obs.height_diff + v[i]
-            adjusted_obs.append({
-                'from_point': obs.from_point,
-                'to_point': obs.to_point,
-                'observed_dh': obs.height_diff,
-                'adjusted_dh': adjusted_dh,
-                'residual': v[i],
-                'distance': obs.distance
-            })
+        # ── 6. sigma_0^2 = v^T P v / r ─────────────────────────────────
+        vtPv = float(v @ P @ v)
+        sigma_0_sq = vtPv / r if r > 0 else 0.0
+        sigma_0 = float(np.sqrt(max(sigma_0_sq, 0.0)))
 
-        # Calculate heights if fixed points provided
-        if fixed_points:
-            heights = self._calculate_heights_from_adjusted(
-                adjusted_obs, fixed_points
-            )
-        else:
-            heights = {}
-
-        # Build residuals dictionary
-        residuals = {}
-        for i, obs in enumerate(observations):
-            key = f"{obs.from_point}-{obs.to_point}"
-            residuals[key] = v[i] * 1000  # Convert to mm
-
-        # Calculate statistics
-        total_dist_km = sum(obs.distance for obs in observations) / 1000.0
-        total_diff_mm = sum(abs(v[i]) * 1000 for i in range(n_obs))
-
-        if total_dist_km > 0:
-            k_coefficient = total_diff_mm / np.sqrt(total_dist_km)
-        else:
-            k_coefficient = 0.0
-
-        # Build result
-        result = AdjustmentResult(
-            iteration=1,  # Conditional adjustment is non-iterative
-            mse_unit_weight=sigma_0,
-            adjusted_heights=heights,
-            residuals=residuals,
-            mse_heights={},  # Can be calculated if needed
-            total_distance_km=total_dist_km,
-            total_diff_mm=total_diff_mm,
-            k_coefficient=k_coefficient
+        # ── 7. Propagate heights from fixed points ──────────────────────
+        adjusted_heights = self._propagate_heights(
+            lines, L_adj, fixed_points
         )
 
-        return result
+        # ── Build result ────────────────────────────────────────────────
+        residuals = {}
+        for i, line in enumerate(lines):
+            key = line.start_point + "-" + line.end_point
+            residuals[key] = float(v[i]) * 1000.0   # mm
 
+        total_dist_km = sum(ln.total_distance for ln in lines) / 1000.0
+        total_diff_mm = sum(abs(float(v[i])) * 1000.0 for i in range(n_obs))
+        k_coeff = (total_diff_mm / np.sqrt(total_dist_km)
+                   if total_dist_km > 0 else 0.0)
+
+        return AdjustmentResult(
+            iteration=1,
+            mse_unit_weight=sigma_0,
+            adjusted_heights=adjusted_heights,
+            residuals=residuals,
+            mse_heights={},
+            total_distance_km=total_dist_km,
+            total_diff_mm=total_diff_mm,
+            k_coefficient=float(k_coeff)
+        )
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+
+    def _build_path_conditions(
+        self,
+        lines: List[LevelingLine],
+        bm_ids: List[str],
+        fixed_points: Dict[str, float],
+        n_obs: int
+    ) -> List[Tuple]:
+        """
+        Build condition rows for independent paths between fixed benchmarks.
+        For each pair of adjacent fixed BMs connected through the network,
+        the condition is: sum(signed dH along path) - (H_end - H_start) = 0
+        Returns list of (row_array, w_value) tuples.
+        """
+        if len(bm_ids) < 2:
+            return []
+
+        # Build adjacency: point -> list of (neighbor, line_index, sign)
+        adj = {}
+        for i, line in enumerate(lines):
+            s, e = line.start_point, line.end_point
+            adj.setdefault(s, []).append((e, i, +1))
+            adj.setdefault(e, []).append((s, i, -1))
+
+        conditions = []
+        visited_pairs = set()
+
+        for bm_start in bm_ids:
+            # BFS to find shortest path to each other BM
+            from collections import deque
+            queue = deque([(bm_start, [], [])])  # (current, path_indices, path_signs)
+            seen = {bm_start}
+            while queue:
+                node, p_idx, p_sgn = queue.popleft()
+                for neighbor, li, sign in adj.get(node, []):
+                    if li in p_idx:   # don't reuse lines
+                        continue
+                    new_idx  = p_idx  + [li]
+                    new_sgn  = p_sgn  + [sign]
+                    if neighbor in fixed_points and neighbor != bm_start:
+                        pair_key = tuple(sorted([bm_start, neighbor]))
+                        if pair_key not in visited_pairs:
+                            visited_pairs.add(pair_key)
+                            row = np.zeros(n_obs)
+                            w_val = 0.0
+                            for idx, sg in zip(new_idx, new_sgn):
+                                row[idx] = float(sg)
+                                w_val += sg * lines[idx].total_height_diff
+                            # Subtract known height difference
+                            w_val -= (fixed_points[neighbor] - fixed_points[bm_start])
+                            conditions.append((row, w_val))
+                    elif neighbor not in seen:
+                        seen.add(neighbor)
+                        queue.append((neighbor, new_idx, new_sgn))
+
+        return conditions
+
+    def _propagate_heights(
+        self,
+        lines: List[LevelingLine],
+        L_adj: np.ndarray,
+        fixed_points: Dict[str, float]
+    ) -> Dict[str, float]:
+        """
+        Propagate adjusted height differences from fixed points
+        to compute all unknown point heights.
+        Uses BFS from each fixed point.
+        """
+        heights = dict(fixed_points)
+        # Build adjacency with adjusted dH
+        adj = {}
+        for i, line in enumerate(lines):
+            s, e = line.start_point, line.end_point
+            dh = float(L_adj[i])
+            adj.setdefault(s, []).append((e,  dh))
+            adj.setdefault(e, []).append((s, -dh))
+
+        from collections import deque
+        queue = deque(fixed_points.keys())
+        while queue:
+            node = queue.popleft()
+            for neighbor, dh in adj.get(node, []):
+                if neighbor not in heights:
+                    heights[neighbor] = heights[node] + dh
+                    queue.append(neighbor)
+
+        return heights
+
+    # Keep backward-compat helper used by _calculate_heights_from_adjusted
     def _calculate_heights_from_adjusted(
         self,
         adjusted_obs: List[Dict],
         fixed_points: Dict[str, float]
     ) -> Dict[str, float]:
-        """
-        Calculate heights from adjusted observations using least squares.
-
-        After conditional adjustment adjusts the observations,
-        we can calculate heights using the adjusted observations.
-        """
-        # Use parametric adjuster with adjusted observations
         summaries = []
         for obs in adjusted_obs:
             summary = MeasurementSummary(
@@ -480,10 +559,8 @@ class ConditionalAdjuster:
                 source_file=""
             )
             summaries.append(summary)
-
         adjuster = LeastSquaresAdjuster(check_stability=False)
         result = adjuster.adjust(summaries, fixed_points)
-
         return result.adjusted_heights
 
 
