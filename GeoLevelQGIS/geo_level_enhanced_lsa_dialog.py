@@ -24,11 +24,16 @@ class GeoLevelEnhancedLSADialog(QDialog):
     ----------
     lines       : list of LevelingLine
     parent      : QWidget
+    val_results : list of (LevelingLine, ValidationResult) tuples (optional).
+                  When supplied, only lines that are VALID or have manager_override
+                  are offered to the adjustment engine.  Lines with is_used=False
+                  are always excluded.
     """
 
-    def __init__(self, lines, parent=None):
+    def __init__(self, lines, parent=None, val_results=None):
         super().__init__(parent)
         self.lines = lines
+        self._val_results = val_results or []
         self.result = None
         self.setWindowTitle("Network Adjustment (Enhanced LSA) / כיוון רשת מתקדם")
         self.resize(1000, 650)
@@ -296,6 +301,37 @@ class GeoLevelEnhancedLSADialog(QDialog):
             )
         return fixed
 
+    def _is_eligible(self, line) -> bool:
+        """
+        Return True if a line should be included in the adjustment.
+
+        A line is eligible when ALL of the following hold:
+          1. is_used is True (not manually excluded)
+          2. Either:
+             a. The line is VALID according to its ValidationResult, OR
+             b. The manager_override flag has been set (Force Valid)
+
+        When no val_results were supplied (legacy call), only is_used is checked
+        so existing behaviour is preserved.
+        """
+        if not getattr(line, "is_used", True):
+            return False
+
+        if not self._val_results:
+            return True
+
+        override = getattr(line, "manager_override", False)
+        if override:
+            return True
+
+        # Match line to its ValidationResult by identity
+        from core_logic.config.models import LineStatus
+        for ln, vr in self._val_results:
+            if ln is line:
+                return vr.is_valid
+        # Line not found in val_results — treat as valid (safety fallback)
+        return True
+
     def _run_adjustment(self):
         fixed_points = self._collect_fixed_points()
         if not fixed_points:
@@ -323,7 +359,7 @@ class GeoLevelEnhancedLSADialog(QDialog):
 
         observations = []
         for line in self.lines:
-            if not getattr(line, 'is_used', True):
+            if not self._is_eligible(line):
                 continue
             observations.append(MeasurementSummary(
                 from_point=line.start_point,
@@ -357,7 +393,7 @@ class GeoLevelEnhancedLSADialog(QDialog):
         from core_logic.engine.least_squares import ConditionalAdjuster
         from core_logic.engine.loop_detector import LoopAnalyzer
 
-        active_lines = [ln for ln in self.lines if getattr(ln, 'is_used', True)]
+        active_lines = [ln for ln in self.lines if self._is_eligible(ln)]
         if not active_lines:
             QMessageBox.warning(self, "No Lines", "No active lines to adjust.")
             return

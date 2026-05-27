@@ -21,17 +21,8 @@ class GeoLevelReporter:
     """
     Generate a formal A4 PDF survey certificate from LSA results.
 
-    Parameters
-    ----------
-    result_data : dict
-        Keys expected:
-            'stats'  : dict  — sigma_zero_sq, dof, total_dist_km, iterations
-            'points' : dict  — {point_id: {height, correction_mm, sigma_mm, is_fixed}}
-            'residuals' : list — [{key, residual_mm}]
-    project_info : dict, optional
-        company, surveyor, project_name, class
-    fixed_points : list, optional
-        List of fixed point IDs (highlighted light-blue in table)
+    Accepts either an ``AdjustmentResult`` object (normal usage from the LSA
+    results dialog) or the legacy ``{stats, points, residuals}`` dict format.
     """
 
     # ------------------------------------------------------------------ #
@@ -44,11 +35,96 @@ class GeoLevelReporter:
     _LGRAY  = QColor(240, 240, 240)
 
     def __init__(self, result_data, fixed_points=None, project_info=None):
-        self.results      = result_data
-        self.fixed_points = set(fixed_points or [])
+        """
+        Parameters
+        ----------
+        result_data : AdjustmentResult  OR  dict
+            Accepts either an ``AdjustmentResult`` object (the normal case when
+            called from ``GeoLevelLSADialog.on_export_report``) or the legacy
+            dict format ``{stats: {...}, points: {...}, residuals: [...]}``.
+            When an ``AdjustmentResult`` is supplied it is converted to the
+            internal dict representation automatically.
+        fixed_points : dict | list | set | None
+            Known benchmarks: either a ``{point_id: height}`` dict (from the
+            dialog) or a list/set of IDs.
+        project_info : dict, optional
+            company, surveyor, project_name, class keys for the header.
+        """
+        # Normalise fixed_points to a set of IDs regardless of input type.
+        if isinstance(fixed_points, dict):
+            self.fixed_points = set(fixed_points.keys())
+        else:
+            self.fixed_points = set(fixed_points or [])
+
         self.project_info = project_info or {}
         self.logo_path    = os.path.join(os.path.dirname(__file__),
                                          'survey_of_israel_logo.png')
+
+        # Convert AdjustmentResult → internal dict if needed.
+        if isinstance(result_data, dict):
+            self.results = result_data
+        else:
+            self.results = self._from_adjustment_result(result_data, fixed_points)
+
+    # ------------------------------------------------------------------ #
+    # AdjustmentResult → internal dict converter
+    # ------------------------------------------------------------------ #
+
+    def _from_adjustment_result(self, result, fixed_points_input):
+        """
+        Build the internal ``{stats, points, residuals}`` dict from an
+        ``AdjustmentResult`` object.
+
+        Parameters
+        ----------
+        result            : AdjustmentResult
+        fixed_points_input: dict {pid: height} | list | set | None
+        """
+        # fixed heights lookup (may be dict or collection)
+        if isinstance(fixed_points_input, dict):
+            fp_heights = fixed_points_input
+        else:
+            fp_heights = {}
+
+        n_obs      = len(result.residuals)
+        n_unknowns = len(result.adjusted_heights) - len(self.fixed_points)
+        dof        = max(0, n_obs - n_unknowns)
+        sigma_sq   = result.mse_unit_weight ** 2
+
+        stats = {
+            "sigma_zero_sq":  sigma_sq,
+            "sigma_zero":     result.mse_unit_weight * 1000,   # mm
+            "dof":            dof,
+            "iterations":     result.iteration,
+            "k_coeff":        result.k_coefficient,
+            "total_dist_km":  result.total_distance_km,
+        }
+
+        points = {}
+        for pid, adj_h in result.adjusted_heights.items():
+            is_fixed   = pid in self.fixed_points
+            sigma_mm   = result.mse_heights.get(pid, 0.0) * 1000
+            orig_h     = fp_heights.get(pid, adj_h)
+            corr_mm    = (adj_h - orig_h) * 1000 if is_fixed else (
+                result.residuals.get(
+                    # try to find a residual keyed by this point as destination
+                    next((k for k in result.residuals if k.endswith("-" + pid)), ""),
+                    0.0
+                )
+            )
+            points[pid] = {
+                "height":        adj_h,
+                "correction_mm": corr_mm,
+                "sigma_mm":      sigma_mm,
+                "is_fixed":      is_fixed,
+            }
+
+        residuals = [
+            {"key": key, "residual_mm": v_mm}
+            for key, v_mm in sorted(result.residuals.items())
+        ]
+
+        return {"stats": stats, "points": points, "residuals": residuals}
 
     # ------------------------------------------------------------------ #
     # Public API

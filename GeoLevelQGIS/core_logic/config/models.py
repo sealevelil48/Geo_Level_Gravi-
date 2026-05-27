@@ -26,6 +26,7 @@ class LineStatus(Enum):
     EXCLUDED_FROM_MERGE = "excluded_from_merge"  # Original line merged into another (Phase 3, Item 14)
     MERGED = "merged"  # Resulting merged line (Item 14)
     EXCLUDED = "excluded"  # General exclusion (manual or point-based)
+    VALID_BY_MANAGER = "valid_by_manager"  # Manager override: include despite validation failure
 
 
 @dataclass
@@ -70,6 +71,7 @@ class LevelingLine:
     # NEW: Export control and direction management
     is_used: bool = True  # Flag to include/exclude entire line in exports
     original_direction: str = "BF"  # Track original direction for reversal
+    manager_override: bool = False  # Manager override: treat as valid despite validation failure
     
     @property
     def num_setups(self) -> int:
@@ -293,6 +295,7 @@ class ProjectData:
                 'HeightDiff': line.total_height_diff,
                 'Method': line.method,
                 'Status': line.status.value,
-                'IsUsed': line.is_used  # NEW
+                'IsUsed': line.is_used,
+                'ManagerOverride': line.manager_override
             })
         return pd.DataFrame(data)

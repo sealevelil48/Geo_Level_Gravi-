@@ -11,7 +11,9 @@ from pathlib import Path
 
 from qgis.PyQt.QtWidgets import (
     QAction, QMessageBox, QProgressDialog,
-    QInputDialog, QMenu, QFileDialog, QTableWidgetItem
+    QInputDialog, QMenu, QFileDialog, QTableWidgetItem,
+    QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton,
+    QLabel, QTableWidget, QHeaderView, QSplitter, QWidget
 )
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
@@ -24,6 +26,141 @@ if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
 _PROJECTS_DIR = os.path.join(_PLUGIN_DIR, "projects")
+
+
+class GeoLevelLSAInputDialog(QDialog):
+    """
+    Fixed-points input dialog for the standard LSA Network Adjustment.
+
+    Mirrors the Enhanced LSA dialog's fixed-points table so that:
+    - Users can add/remove rows with a table instead of a single text box.
+    - Auto-Select populates leaf-node endpoints (degree == 1 in network).
+    - Rows with a blank height are SKIPPED (treated as unknowns), preventing
+      the architecture-inversion bug where 0.000 or accidental entries lock
+      extra nodes as fixed constraints.
+    """
+
+    def __init__(self, lines, parent=None):
+        super().__init__(parent)
+        self._lines = lines
+        self.fixed_points = {}
+        self.setWindowTitle("LSA — Fixed Points / נקודות קבועות")
+        self.setMinimumSize(480, 340)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        grp = QGroupBox(
+            "Enter known benchmark heights.\n"
+            "Rows with a blank height are treated as unknown (adjusted) points."
+        )
+        vbox = QVBoxLayout(grp)
+
+        self.fp_table = QTableWidget(0, 2)
+        self.fp_table.setHorizontalHeaderLabels(["Point ID", "Known Height (m)"])
+        self.fp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.fp_table.setMinimumHeight(180)
+        self.fp_table.setToolTip(
+            "Enter Point ID and its KNOWN height.\n"
+            "Leave height blank to treat the point as unknown."
+        )
+        vbox.addWidget(self.fp_table)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("+ Add Row")
+        btn_add.clicked.connect(self._add_row)
+        btn_del = QPushButton("− Remove")
+        btn_del.clicked.connect(self._del_row)
+        btn_auto = QPushButton("Auto-Select")
+        btn_auto.setToolTip("Populate with network leaf-node endpoints")
+        btn_auto.clicked.connect(self._auto_select)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_del)
+        btn_row.addWidget(btn_auto)
+        vbox.addLayout(btn_row)
+        layout.addWidget(grp)
+
+        ok_row = QHBoxLayout()
+        btn_ok = QPushButton("Run Adjustment")
+        btn_ok.setStyleSheet(
+            "font-weight: bold; background: #1565c0; color: white; padding: 5px 14px;"
+        )
+        btn_ok.clicked.connect(self._on_ok)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        ok_row.addStretch()
+        ok_row.addWidget(btn_ok)
+        ok_row.addWidget(btn_cancel)
+        layout.addLayout(ok_row)
+
+    def _add_row(self):
+        row = self.fp_table.rowCount()
+        self.fp_table.insertRow(row)
+        self.fp_table.setItem(row, 0, QTableWidgetItem(""))
+        self.fp_table.setItem(row, 1, QTableWidgetItem(""))
+
+    def _del_row(self):
+        row = self.fp_table.currentRow()
+        if row >= 0:
+            self.fp_table.removeRow(row)
+
+    def _auto_select(self):
+        """Populate table with leaf-node endpoints (degree == 1 in network)."""
+        from collections import Counter
+        degree = Counter()
+        for ln in self._lines:
+            if ln.start_point:
+                degree[ln.start_point] += 1
+            if ln.end_point:
+                degree[ln.end_point] += 1
+        candidates = sorted(pid for pid, cnt in degree.items() if cnt == 1)
+        if not candidates:
+            candidates = sorted(degree.keys())
+        self.fp_table.setRowCount(0)
+        for pid in candidates:
+            r = self.fp_table.rowCount()
+            self.fp_table.insertRow(r)
+            self.fp_table.setItem(r, 0, QTableWidgetItem(pid))
+            self.fp_table.setItem(r, 1, QTableWidgetItem(""))
+
+    def _on_ok(self):
+        fixed = {}
+        skipped = []
+        for row in range(self.fp_table.rowCount()):
+            pid_item = self.fp_table.item(row, 0)
+            h_item   = self.fp_table.item(row, 1)
+            if not pid_item:
+                continue
+            pid = pid_item.text().strip()
+            if not pid:
+                continue
+            h_text = h_item.text().strip() if h_item else ""
+            if not h_text:
+                skipped.append(pid)
+                continue
+            try:
+                fixed[pid] = float(h_text)
+            except ValueError:
+                skipped.append(pid)
+
+        if skipped:
+            QMessageBox.information(
+                self, "Fixed Points — Incomplete Rows",
+                "The following points have no height and will be treated as unknowns "
+                "(adjusted):\n\n" + "\n".join(skipped) + "\n\n"
+                "Enter a known height or remove these rows before running."
+            )
+
+        if not fixed:
+            QMessageBox.warning(
+                self, "No Fixed Points",
+                "Please enter at least one point with a known height."
+            )
+            return
+
+        self.fixed_points = fixed
+        self.accept()
 
 
 class GeoLevelPlugin:
@@ -551,29 +688,31 @@ class GeoLevelPlugin:
                                     "No lines loaded.")
             return
         try:
-            fixed_input, ok = QInputDialog.getText(
-                self.iface.mainWindow(), "LSA — Fixed Points / נקודות קבועות",
-                "Enter fixed benchmarks as  POINT_ID=HEIGHT  (comma-separated):\n"
-                "Example:  BM1=100.000, BM2=105.500"
-            )
-            if not ok:
-                return
-            fixed_points = {}
-            for token in fixed_input.split(","):
-                token = token.strip()
-                if "=" in token:
-                    pid, h = token.split("=", 1)
-                    try:
-                        fixed_points[pid.strip()] = float(h.strip())
-                    except ValueError:
-                        pass
-            if not fixed_points:
+            # ── Step 1: collect eligible lines (VALID or manager-overridden) ──
+            from core_logic.config.models import LineStatus
+            eligible_lines = [
+                ln for ln in self._lines
+                if getattr(ln, "is_used", True) and (
+                    ln.status == LineStatus.VALID
+                    or getattr(ln, "manager_override", False)
+                )
+            ]
+            if not eligible_lines:
                 QMessageBox.warning(self.iface.mainWindow(), "LSA Adjustment",
-                                    "No valid fixed points entered.")
+                                    "No valid lines available for adjustment.\n"
+                                    "Use 'Force Valid (Manager Override)' on lines you wish to include.")
+                return
+
+            # ── Step 2: fixed-points table dialog (replaces bare QInputDialog) ──
+            input_dlg = GeoLevelLSAInputDialog(eligible_lines, self.iface.mainWindow())
+            if not input_dlg.exec_():
+                return
+            fixed_points = input_dlg.fixed_points
+            if not fixed_points:
                 return
 
             from core_logic.engine.least_squares import LeastSquaresAdjuster
-            result = LeastSquaresAdjuster().adjust_from_lines(self._lines, fixed_points)
+            result = LeastSquaresAdjuster().adjust_from_lines(eligible_lines, fixed_points)
 
             # ── Show results dialog ───────────────────────────────────
             from geo_level_lsa_dialog import GeoLevelLSADialog
@@ -668,7 +807,10 @@ class GeoLevelPlugin:
             return
         try:
             from geo_level_enhanced_lsa_dialog import GeoLevelEnhancedLSADialog
-            dlg = GeoLevelEnhancedLSADialog(self._lines, self.iface.mainWindow())
+            dlg = GeoLevelEnhancedLSADialog(
+                self._lines, self.iface.mainWindow(),
+                val_results=self._val_results
+            )
             if dlg.exec_() and dlg.result:
                 self._apply_lsa_to_layer(dlg.result)
         except Exception as exc:
