@@ -17,7 +17,7 @@ from qgis.PyQt.QtWidgets import (
     QListWidget, QTabWidget, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QTextEdit, QSplitter, QHeaderView,
     QAbstractItemView, QGroupBox, QComboBox, QFileDialog,
-    QMenu, QAction, QMessageBox
+    QMessageBox
 )
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QFont
@@ -215,8 +215,6 @@ class GeoLevelDockWidget(QDockWidget):
         self.val_table.setAlternatingRowColors(True)
         self.val_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.val_table.itemSelectionChanged.connect(self._on_val_table_selection_changed)
-        self.val_table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.val_table.customContextMenuRequested.connect(self._on_val_table_context_menu)
         vbox.addWidget(self.val_table)
 
         # Per-line detail text
@@ -318,22 +316,8 @@ class GeoLevelDockWidget(QDockWidget):
         # Left list
         self.line_list.clear()
         for i, line in enumerate(lines):
-            used     = getattr(line, "is_used", True)
-            override = getattr(line, "manager_override", False)
-            excl = "" if used else " [EXCL]"
-            label = line.start_point + " -> " + line.end_point + "  [" + line.filename + "]" + excl
-            self.line_list.addItem(label)
-            if i < len(val_results):
-                _, vr = val_results[i]
-                if not used:
-                    color = QColor("#888888")
-                elif override and not vr.is_valid:
-                    color = AMBER_COLOR
-                elif vr.is_valid:
-                    color = QColor("#2e7d32")
-                else:
-                    color = QColor("#c62828")
-                self.line_list.item(i).setForeground(color)
+            self.line_list.addItem(self._line_label(line))
+            self.line_list.item(i).setForeground(self._list_item_color(i))
 
         if lines:
             self.btn_lsa.setEnabled(True)
@@ -534,96 +518,90 @@ class GeoLevelDockWidget(QDockWidget):
         except AttributeError:
             line.start_point, line.end_point = line.end_point, line.start_point
             line.total_height_diff = -line.total_height_diff
-        used  = getattr(line, "is_used", True)
-        excl  = "" if used else " [EXCL]"
-        label = line.start_point + " -> " + line.end_point + "  [" + line.filename + "]" + excl
-        self.line_list.item(idx).setText(label)
+        list_item = self.line_list.item(idx)
+        if list_item:
+            list_item.setText(self._line_label(line))
         self.populate_line_details(line)
         self._refresh_val_table()
         self.log("Toggled direction: " + line.filename)
 
+    # ------------------------------------------------------------------ #
+    # Helpers — label text and list-item colour
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _line_label(line) -> str:
+        """Return the left-panel list label for a line, including state suffix."""
+        used     = getattr(line, "is_used", True)
+        override = getattr(line, "manager_override", False)
+        if not used:
+            suffix = " [EXCL]"
+        elif override:
+            suffix = " [MGR]"
+        else:
+            suffix = ""
+        return (line.start_point or "?") + " -> " + (line.end_point or "?") \
+               + "  [" + line.filename + "]" + suffix
+
+    def _list_item_color(self, idx) -> QColor:
+        """Return the correct list-item foreground colour for a line."""
+        if idx >= len(self._lines):
+            return QColor("#2e7d32")
+        line     = self._lines[idx]
+        used     = getattr(line, "is_used", True)
+        override = getattr(line, "manager_override", False)
+        if not used:
+            return QColor("#888888")
+        if override:
+            return AMBER_COLOR
+        # colour by validation result
+        if idx < len(self._val_results):
+            _, vr = self._val_results[idx]
+            return QColor("#2e7d32") if vr.is_valid else QColor("#c62828")
+        return QColor("#2e7d32")
+
+    # ------------------------------------------------------------------ #
+
     def _on_toggle_use(self):
+        """
+        3-way state cycle:
+          NORMAL (is_used=True,  manager_override=False)
+            → EXCLUDED (is_used=False, manager_override=False)
+            → OVERRIDE (is_used=True,  manager_override=True)
+            → NORMAL  …
+
+        The cycle always moves forward regardless of which tab triggered
+        the action — _current_idx is kept in sync by both selection handlers.
+        """
         idx = self._current_idx
         if idx < 0 or idx >= len(self._lines):
             return
         line = self._lines[idx]
-        line.is_used = not getattr(line, "is_used", True)
-        used  = line.is_used
-        excl  = "" if used else " [EXCL]"
-        label = line.start_point + " -> " + line.end_point + "  [" + line.filename + "]" + excl
-        item  = self.line_list.item(idx)
-        item.setText(label)
-        item.setForeground(QColor("#2e7d32" if used else "#888888"))
-        self._refresh_val_table()
-        state = "included" if used else "excluded"
-        self.log(line.filename + " marked as " + state)
-
-    def _on_val_table_context_menu(self, pos):
-        """Right-click context menu on the validation table."""
-        row = self.val_table.rowAt(pos.y())
-        if row < 0 or row >= len(self._lines):
-            return
-
-        line = self._lines[row]
-        is_valid    = True
-        if row < len(self._val_results):
-            _, vr = self._val_results[row]
-            is_valid = vr.is_valid
-
-        override = getattr(line, "manager_override", False)
-
-        menu = QMenu(self)
-
-        if not is_valid and not override:
-            act_override = QAction("Force Valid (Manager Override)", self)
-            act_override.setToolTip(
-                "Include this line in LSA calculations despite validation failure.\n"
-                "Use only when authorised by the responsible engineer or manager."
-            )
-            act_override.triggered.connect(lambda: self._apply_manager_override(row, True))
-            menu.addAction(act_override)
-        elif override:
-            act_remove = QAction("Remove Manager Override", self)
-            act_remove.triggered.connect(lambda: self._apply_manager_override(row, False))
-            menu.addAction(act_remove)
-
-        if not menu.isEmpty():
-            menu.exec_(self.val_table.viewport().mapToGlobal(pos))
-
-    def _apply_manager_override(self, idx, enable):
-        """Set or clear manager_override on a line and refresh the table."""
-        if idx < 0 or idx >= len(self._lines):
-            return
-        line = self._lines[idx]
-
-        if enable:
-            confirm = QMessageBox.question(
-                self,
-                "Manager Override",
-                "You are about to force-include an INVALID line in all LSA calculations.\n\n"
-                "File:   {}\n"
-                "Line:   {} → {}\n\n"
-                "This should only be done with authorisation from the responsible engineer "
-                "or manager. Continue?".format(
-                    os.path.basename(line.filename),
-                    line.start_point, line.end_point
-                ),
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if confirm != QMessageBox.Yes:
-                return
 
         from core_logic.config.models import LineStatus
-        line.manager_override = enable
-        if enable:
-            line.status = LineStatus.VALID_BY_MANAGER
+
+        is_used  = getattr(line, "is_used",          True)
+        override = getattr(line, "manager_override",  False)
+
+        if is_used and not override:
+            # NORMAL → EXCLUDED
+            line.is_used          = False
+            line.manager_override = False
+            state_str = "excluded"
+        elif not is_used:
+            # EXCLUDED → OVERRIDE
+            line.is_used          = True
+            line.manager_override = True
+            line.status           = LineStatus.VALID_BY_MANAGER
+            state_str = "Valid by Manager (override)"
         else:
-            # Restore the original invalid status from the ValidationResult
+            # OVERRIDE → NORMAL
+            line.is_used          = True
+            line.manager_override = False
+            # Restore the correct invalid status from ValidationResult
             if idx < len(self._val_results):
                 _, vr = self._val_results[idx]
                 if not vr.is_valid:
-                    # Re-derive status from the first error type recorded
                     if not vr.endpoint_valid:
                         line.status = LineStatus.INVALID_ENDPOINT
                     elif not vr.naming_valid:
@@ -633,22 +611,21 @@ class GeoLevelDockWidget(QDockWidget):
                     elif not vr.tolerance_valid:
                         line.status = LineStatus.EXCEEDED_TOLERANCE
                     else:
-                        line.status = LineStatus.INVALID_ENDPOINT  # fallback
+                        line.status = LineStatus.INVALID_ENDPOINT
+                else:
+                    line.status = LineStatus.VALID
+            else:
+                line.status = LineStatus.VALID
+            state_str = "included (normal)"
 
-        # Update left-panel list colour
-        used = getattr(line, "is_used", True)
         list_item = self.line_list.item(idx)
         if list_item:
-            if not used:
-                list_item.setForeground(QColor("#888888"))
-            elif enable:
-                list_item.setForeground(AMBER_COLOR)
-            else:
-                list_item.setForeground(QColor("#c62828"))
+            list_item.setText(self._line_label(line))
+            list_item.setForeground(self._list_item_color(idx))
 
         self._refresh_val_table()
-        action = "applied" if enable else "removed"
-        self.log("Manager override {} for: {}".format(action, line.filename))
+        self.log(line.filename + " → " + state_str)
+
 
     def _export_validation_to_excel(self):
         """Export the current validation table to a colour-coded .xlsx file."""
