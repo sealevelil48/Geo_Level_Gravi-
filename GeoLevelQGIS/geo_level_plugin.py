@@ -306,9 +306,14 @@ class GeoLevelPlugin:
         )
         if not path:
             return
+        # Resolve a valid output_dir to store in the project file so the
+        # load path never has to prompt the user for a directory.
+        output_dir = self._last_output_dir
+        if not output_dir or not os.path.isdir(output_dir):
+            output_dir = os.path.dirname(self._lines[0].filename) if self._lines else ""
         data = {
             "class": self._last_class,
-            "output_dir": self._last_output_dir,
+            "output_dir": output_dir,
             "files": [ln.filename for ln in self._lines],
         }
         with open(path, "w", encoding="utf-8") as f:
@@ -332,12 +337,25 @@ class GeoLevelPlugin:
         missing = [fp for fp in files if not os.path.exists(fp)]
         if missing:
             QMessageBox.warning(self.iface.mainWindow(), "Load Project",
-                                f"Missing files:\n" + "\n".join(missing))
+                                "The following DAT files could not be found and will be skipped:\n"
+                                + "\n".join(missing))
             files = [fp for fp in files if os.path.exists(fp)]
-        if files:
-            self._last_class = cls
-            self._last_output_dir = output_dir
-            self._process_files(files, cls, output_dir)
+        if not files:
+            QMessageBox.warning(self.iface.mainWindow(), "Load Project",
+                                "No loadable files found in this project.")
+            return
+
+        # If the saved output directory is gone, derive one from the first DAT
+        # file so _process_files never stalls on a directory picker dialog.
+        if not output_dir or not os.path.isdir(output_dir):
+            output_dir = os.path.dirname(files[0])
+
+        self._last_class = cls
+        self._last_output_dir = output_dir
+        # Clear existing lines so deduplication does not silently block re-load
+        self._lines = []
+        self._val_results = []
+        self._process_files(files, cls, output_dir)
 
     def _show_project_properties(self):
         points = set()
@@ -495,6 +513,23 @@ class GeoLevelPlugin:
                         QColor("#2e7d32") if passed else QColor("#c62828")
                     )
                     tbl.setItem(row, 6, status_item)
+
+                    # Reason column (col 7) — descriptive failure text
+                    if passed:
+                        reason_text = "Within H{} tolerance".format(int(cls[1]))
+                    else:
+                        achieved = res.get("achieved_class", 6)
+                        reason_text = (
+                            "Misclosure {:.3f} mm exceeds H{} tolerance {:.2f} mm "
+                            "(achieved class: H{})".format(
+                                abs(mis_mm), int(cls[1]), tol_mm, achieved
+                            )
+                        )
+                    reason_item = QTableWidgetItem(reason_text)
+                    reason_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                    if not passed:
+                        reason_item.setForeground(QColor("#c62828"))
+                    tbl.setItem(row, 7, reason_item)
 
                 self.dock.log("Detect Double-Runs: " + str(len(pairs)) + " pair(s) found.")
 

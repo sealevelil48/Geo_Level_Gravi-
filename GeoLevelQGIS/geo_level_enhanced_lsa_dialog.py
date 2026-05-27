@@ -68,9 +68,14 @@ class GeoLevelEnhancedLSADialog(QDialog):
         vbox_fp = QVBoxLayout(grp_fp)
 
         self.fp_table = QTableWidget(0, 2)
-        self.fp_table.setHorizontalHeaderLabels(["Point ID", "Height (m)"])
+        self.fp_table.setHorizontalHeaderLabels(["Point ID", "Known Height (m)"])
         self.fp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.fp_table.setMinimumHeight(160)
+        self.fp_table.setToolTip(
+            "Enter the Point ID and its KNOWN height.\n"
+            "Rows with an empty height field are skipped and treated as unknowns.\n"
+            "Only rows with an explicit height value are fixed."
+        )
         vbox_fp.addWidget(self.fp_table)
 
         btn_row = QHBoxLayout()
@@ -203,7 +208,9 @@ class GeoLevelEnhancedLSADialog(QDialog):
         row = self.fp_table.rowCount()
         self.fp_table.insertRow(row)
         self.fp_table.setItem(row, 0, QTableWidgetItem(""))
-        self.fp_table.setItem(row, 1, QTableWidgetItem("0.000"))
+        # Leave height blank — user must supply a real known value.
+        # A blank cell is skipped by _collect_fixed_points and treated as unknown.
+        self.fp_table.setItem(row, 1, QTableWidgetItem(""))
 
     def _del_fp_row(self):
         row = self.fp_table.currentRow()
@@ -211,42 +218,82 @@ class GeoLevelEnhancedLSADialog(QDialog):
             self.fp_table.removeRow(row)
 
     def _auto_select_fixed(self):
-        """Populate fixed-points table with all unique benchmark endpoints."""
-        endpoints = set()
+        """
+        Populate the fixed-points table with network leaf-node candidates.
+
+        A leaf node is a point that appears as a line endpoint exactly once
+        across the whole network — these are the true boundary benchmarks.
+        Junction points (degree ≥ 2) connect multiple lines and must be
+        treated as unknowns, not fixed.
+
+        Heights are left blank so the user must supply real known values.
+        A blank height cell is skipped by _collect_fixed_points and the
+        corresponding point is adjusted as an unknown.
+        """
+        from collections import Counter
+        degree = Counter()
         for line in self.lines:
             if line.start_point:
-                endpoints.add(line.start_point)
+                degree[line.start_point] += 1
             if line.end_point:
-                endpoints.add(line.end_point)
-        # Keep only points that appear as endpoints (not mid-network)
-        mid_points = set()
-        for line in self.lines:
-            for s in line.setups:
-                if s.from_point and s.from_point not in (line.start_point, line.end_point):
-                    mid_points.add(s.from_point)
-                if s.to_point and s.to_point not in (line.start_point, line.end_point):
-                    mid_points.add(s.to_point)
-        candidates = sorted(endpoints - mid_points)
+                degree[line.end_point] += 1
+
+        # Leaf nodes: appear exactly once (true network boundary points)
+        candidates = sorted(pid for pid, cnt in degree.items() if cnt == 1)
+
+        # Fully-connected loop with no leaves — fall back to all endpoints
+        if not candidates:
+            candidates = sorted(degree.keys())
+
         self.fp_table.setRowCount(0)
         for pid in candidates:
             row = self.fp_table.rowCount()
             self.fp_table.insertRow(row)
             self.fp_table.setItem(row, 0, QTableWidgetItem(pid))
-            self.fp_table.setItem(row, 1, QTableWidgetItem("0.000"))
+            # Blank height — must be filled in by the user before running
+            self.fp_table.setItem(row, 1, QTableWidgetItem(""))
 
     def _collect_fixed_points(self):
+        """
+        Read the Fixed Points table and return only rows that have a non-empty
+        height value explicitly entered by the user.
+
+        Rows with a blank height field are silently treated as unknown points
+        (they will be adjusted by the LSA engine).  This prevents the common
+        mistake of Auto-Select pre-filling the table with blank rows and the
+        user accidentally treating every endpoint as fixed — which would invert
+        the network architecture (67 fixed / 1 adjusted instead of 1 fixed / 67
+        adjusted).
+
+        A QMessageBox.information lists any skipped rows so the user knows
+        which points will be adjusted rather than held fixed.
+        """
         fixed = {}
+        skipped = []
         for row in range(self.fp_table.rowCount()):
             pid_item = self.fp_table.item(row, 0)
             h_item   = self.fp_table.item(row, 1)
-            if pid_item and h_item:
-                pid = pid_item.text().strip()
-                try:
-                    h = float(h_item.text().strip())
-                    if pid:
-                        fixed[pid] = h
-                except ValueError:
-                    pass
+            if not pid_item:
+                continue
+            pid = pid_item.text().strip()
+            if not pid:
+                continue
+            h_text = h_item.text().strip() if h_item else ""
+            if not h_text:
+                skipped.append(pid)
+                continue
+            try:
+                fixed[pid] = float(h_text)
+            except ValueError:
+                skipped.append(pid)
+
+        if skipped:
+            QMessageBox.information(
+                self, "Fixed Points — Incomplete Rows",
+                "The following points have no height value and will be treated as "
+                "unknowns (adjusted):\n\n" + "\n".join(skipped) + "\n\n"
+                "Enter a known height or remove these rows before running the adjustment."
+            )
         return fixed
 
     def _run_adjustment(self):

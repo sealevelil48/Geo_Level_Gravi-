@@ -48,7 +48,13 @@ class ValidationConfig:
     
     # Pattern for turning points (numeric only)
     turning_point_pattern: Pattern = field(default_factory=lambda: re.compile(r'^\d+$'))
-    
+
+    # Station-ID format: up to 4 digits + up to 4 alphanumeric/Hebrew chars, total ≤ 8
+    # Hebrew Unicode block: א–ת (U+05D0–U+05EA)
+    point_name_pattern: Pattern = field(default_factory=lambda: re.compile(
+        r'^(?=.{1,8}$)\d{0,4}[A-Za-zא-ת0-9]{0,4}$'
+    ))
+
     # Maximum allowed misclosure per km (in mm)
     max_misclosure_per_km: float = 3.0
     
@@ -108,6 +114,31 @@ settings = Settings()
 def get_settings() -> Settings:
     """Get the global settings instance."""
     return settings
+
+
+def validate_point_name(point_id: str) -> tuple:
+    """
+    Validate a station ID against the Israeli survey point-naming convention.
+
+    Rules (Directive ג2, 2021):
+    - Max 8 characters total.
+    - Up to 4 leading digits, followed by up to 4 alphanumeric or Hebrew characters.
+    - Hebrew block: א–ת (U+05D0–U+05EA).
+
+    Returns:
+        (is_valid: bool, reason: str)
+    """
+    if not point_id:
+        return False, "Point name is empty"
+    point_id = point_id.strip()
+    if len(point_id) > 8:
+        return False, f"'{point_id}' exceeds 8-character limit ({len(point_id)} chars)"
+    if not settings.validation.point_name_pattern.match(point_id):
+        return False, (
+            f"'{point_id}' does not match station-ID format "
+            "(up to 4 digits + up to 4 letters/digits, max 8 chars total)"
+        )
+    return True, "OK"
 
 
 def is_benchmark(point_id: str) -> bool:

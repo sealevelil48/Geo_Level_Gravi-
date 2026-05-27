@@ -192,6 +192,12 @@ class GeoLevelDockWidget(QDockWidget):
         btn_refresh = QPushButton("Refresh")
         btn_refresh.clicked.connect(self._refresh_val_table)
         btn_row.addWidget(btn_refresh)
+
+        btn_export_xl = QPushButton("Export to Excel")
+        btn_export_xl.setToolTip("Export validation table to .xlsx")
+        btn_export_xl.clicked.connect(self._export_validation_to_excel)
+        btn_row.addWidget(btn_export_xl)
+
         btn_row.addStretch()
         vbox.addLayout(btn_row)
 
@@ -248,10 +254,10 @@ class GeoLevelDockWidget(QDockWidget):
         # Sub-tab: Double-Runs
         dr_widget = QWidget()
         dr_vbox = QVBoxLayout(dr_widget)
-        self.double_run_table = QTableWidget(0, 7)
+        self.double_run_table = QTableWidget(0, 8)
         self.double_run_table.setHorizontalHeaderLabels([
             "Pair", "Forward File", "Return File",
-            "Mean dH (m)", "Misclosure (mm)", "Tolerance (mm)", "Status"
+            "Mean dH (m)", "Misclosure (mm)", "Tolerance (mm)", "Status", "Reason"
         ])
         self.double_run_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.double_run_table.horizontalHeader().setStretchLastSection(True)
@@ -527,3 +533,71 @@ class GeoLevelDockWidget(QDockWidget):
         self._refresh_val_table()
         state = "included" if used else "excluded"
         self.log(line.filename + " marked as " + state)
+
+    def _export_validation_to_excel(self):
+        """Export the current validation table to a colour-coded .xlsx file."""
+        if not self._lines:
+            from qgis.PyQt.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Export to Excel", "No validation data to export.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Validation Table",
+            "validation_results.xlsx",
+            "Excel Workbook (*.xlsx)"
+        )
+        if not path:
+            return
+
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment
+        except ImportError:
+            from qgis.PyQt.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self, "Export to Excel",
+                "The 'openpyxl' library is required for Excel export.\n"
+                "Install it with:  pip install openpyxl"
+            )
+            return
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Validation Results"
+
+        # Header row — dark navy background, white bold text
+        hdr_font = Font(bold=True, color="FFFFFF")
+        hdr_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+        for col_idx, col_name in enumerate(VAL_COLS, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=col_name)
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # Data rows — colour by status
+        green_fill = PatternFill(start_color="C8E6C9", end_color="C8E6C9", fill_type="solid")
+        red_fill   = PatternFill(start_color="FFCDD2", end_color="FFCDD2", fill_type="solid")
+        grey_fill  = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+
+        for row_idx in range(self.val_table.rowCount()):
+            status_item = self.val_table.item(row_idx, 6)
+            status_text = status_item.text() if status_item else ""
+            row_fill = (green_fill if status_text == "VALID"
+                        else grey_fill if status_text == "EXCLUDED"
+                        else red_fill)
+
+            for col_idx in range(self.val_table.columnCount()):
+                tbl_item = self.val_table.item(row_idx, col_idx)
+                value = tbl_item.text() if tbl_item else ""
+                cell = ws.cell(row=row_idx + 2, column=col_idx + 1, value=value)
+                cell.fill = row_fill
+                cell.alignment = Alignment(horizontal="center", vertical="center",
+                                           wrap_text=True)
+
+        # Auto-fit column widths (capped at 60)
+        for col_cells in ws.columns:
+            max_len = max((len(str(c.value or "")) for c in col_cells), default=10)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 60)
+
+        wb.save(path)
+        self.log("Validation table exported to: " + path)
