@@ -17,7 +17,7 @@ from qgis.PyQt.QtWidgets import (
     QListWidget, QTabWidget, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QTextEdit, QSplitter, QHeaderView,
     QAbstractItemView, QGroupBox, QComboBox, QFileDialog,
-    QMessageBox
+    QMessageBox, QMenu, QAction
 )
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QFont
@@ -215,6 +215,8 @@ class GeoLevelDockWidget(QDockWidget):
         self.val_table.setAlternatingRowColors(True)
         self.val_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.val_table.itemSelectionChanged.connect(self._on_val_table_selection_changed)
+        self.val_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.val_table.customContextMenuRequested.connect(self._on_val_table_context_menu)
         vbox.addWidget(self.val_table)
 
         # Per-line detail text
@@ -626,6 +628,132 @@ class GeoLevelDockWidget(QDockWidget):
         self._refresh_val_table()
         self.log(line.filename + " → " + state_str)
 
+    def _on_val_table_context_menu(self, pos):
+        """
+        Right-click context menu on the Validation table.
+
+        Offers:
+          • "Force Valid (Manager Override)"  — when row is INVALID and not yet overridden
+          • "Remove Manager Override"         — when row is already overridden
+          • "Exclude from Adjustment"         — when row is currently included (normal or override)
+          • "Re-include in Adjustment"        — when row is excluded
+
+        All actions write through to the same (is_used, manager_override, status) fields
+        used by the 3-way Toggle Use button, keeping both UI paths in sync.
+        """
+        row = self.val_table.rowAt(pos.y())
+        if row < 0 or row >= len(self._lines):
+            return
+
+        line     = self._lines[row]
+        is_used  = getattr(line, "is_used",          True)
+        override = getattr(line, "manager_override",  False)
+        is_valid = True
+        if row < len(self._val_results):
+            _, vr = self._val_results[row]
+            is_valid = vr.is_valid
+
+        menu = QMenu(self)
+
+        # ── Override actions ───────────────────────────────────────────
+        if not is_valid and not override and is_used:
+            act = QAction("Force Valid (Manager Override)", self)
+            act.setToolTip(
+                "Include this INVALID line in all LSA calculations.\n"
+                "Use only when authorised by the responsible engineer or manager."
+            )
+            act.triggered.connect(lambda: self._ctx_set_override(row, True))
+            menu.addAction(act)
+        elif override:
+            act = QAction("Remove Manager Override", self)
+            act.setToolTip("Revert to standard validation state.")
+            act.triggered.connect(lambda: self._ctx_set_override(row, False))
+            menu.addAction(act)
+
+        menu.addSeparator()
+
+        # ── Exclude / Re-include ───────────────────────────────────────
+        if is_used:
+            act2 = QAction("Exclude from Adjustment", self)
+            act2.triggered.connect(lambda: self._ctx_set_excluded(row, True))
+            menu.addAction(act2)
+        else:
+            act2 = QAction("Re-include in Adjustment", self)
+            act2.triggered.connect(lambda: self._ctx_set_excluded(row, False))
+            menu.addAction(act2)
+
+        menu.exec_(self.val_table.viewport().mapToGlobal(pos))
+
+    # -- context-menu helpers ------------------------------------------
+
+    def _ctx_set_override(self, idx, enable):
+        """Apply or remove the Manager Override directly (context-menu path)."""
+        if idx < 0 or idx >= len(self._lines):
+            return
+        line = self._lines[idx]
+
+        if enable:
+            confirm = QMessageBox.question(
+                self, "Manager Override",
+                "Force-include an INVALID line in all LSA calculations.\n\n"
+                "File:  {}\nLine:  {} → {}\n\n"
+                "Use only with authorisation from the responsible engineer.".format(
+                    os.path.basename(line.filename),
+                    line.start_point, line.end_point
+                ),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if confirm != QMessageBox.Yes:
+                return
+
+        from core_logic.config.models import LineStatus
+        line.is_used          = True
+        line.manager_override = enable
+        if enable:
+            line.status = LineStatus.VALID_BY_MANAGER
+        else:
+            # Restore correct invalid status from stored ValidationResult
+            if idx < len(self._val_results):
+                _, vr = self._val_results[idx]
+                if not vr.is_valid:
+                    if not vr.endpoint_valid:
+                        line.status = LineStatus.INVALID_ENDPOINT
+                    elif not vr.naming_valid:
+                        line.status = LineStatus.NAMING_ERROR
+                    elif not vr.data_complete:
+                        line.status = LineStatus.INCOMPLETE
+                    elif not vr.tolerance_valid:
+                        line.status = LineStatus.EXCEEDED_TOLERANCE
+                    else:
+                        line.status = LineStatus.INVALID_ENDPOINT
+                else:
+                    line.status = LineStatus.VALID
+            else:
+                line.status = LineStatus.VALID
+
+        list_item = self.line_list.item(idx)
+        if list_item:
+            list_item.setText(self._line_label(line))
+            list_item.setForeground(self._list_item_color(idx))
+
+        self._refresh_val_table()
+        action = "applied" if enable else "removed"
+        self.log("Manager override {} for: {}".format(action, line.filename))
+
+    def _ctx_set_excluded(self, idx, exclude):
+        """Exclude or re-include a line from the context menu."""
+        if idx < 0 or idx >= len(self._lines):
+            return
+        line = self._lines[idx]
+        line.is_used = not exclude
+        if exclude:
+            line.manager_override = False   # can't be overridden AND excluded
+        list_item = self.line_list.item(idx)
+        if list_item:
+            list_item.setText(self._line_label(line))
+            list_item.setForeground(self._list_item_color(idx))
+        self._refresh_val_table()
+        self.log(line.filename + (" → excluded" if exclude else " → re-included"))
 
     def _export_validation_to_excel(self):
         """Export the current validation table to a colour-coded .xlsx file."""
