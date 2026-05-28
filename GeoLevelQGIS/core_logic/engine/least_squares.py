@@ -133,14 +133,43 @@ class LeastSquaresAdjuster:
         # Initialize approximate heights
         if approximate_heights is None:
             approximate_heights = {}
-        
-        # Estimate approximate heights for unknowns
+
+        # Seed heights: start from all fixed benchmarks, propagate via BFS
+        # so that unknowns begin at a realistic elevation rather than 0.0.
+        # Nodes unreachable from any fixed point fall back to the mean of
+        # fixed heights (never a hard-coded zero).
         current_heights = dict(fixed_points)
+
+        # Build adjacency list (undirected) from observations
+        from collections import deque
+        adj: dict = {}
+        for obs in observations:
+            fp, tp = obs.from_point, obs.to_point
+            adj.setdefault(fp, []).append((tp,  obs.height_diff))
+            adj.setdefault(tp, []).append((fp, -obs.height_diff))
+
+        # BFS from every fixed benchmark to propagate approximate heights
+        queue: deque = deque(fixed_points.keys())
+        visited = set(fixed_points.keys())
+        while queue:
+            node = queue.popleft()
+            for neighbor, dh in adj.get(node, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    current_heights[neighbor] = current_heights[node] + dh
+                    queue.append(neighbor)
+
+        # Override with caller-supplied approximates if provided
         for pid in unknown_list:
             if pid in approximate_heights:
                 current_heights[pid] = approximate_heights[pid]
-            else:
-                current_heights[pid] = 0.0  # Will be updated iteratively
+
+        # Fallback for nodes completely disconnected from all fixed benchmarks
+        mean_fixed = (sum(fixed_points.values()) / len(fixed_points)
+                      if fixed_points else 0.0)
+        for pid in unknown_list:
+            if pid not in current_heights:
+                current_heights[pid] = mean_fixed
         
         # Iterative adjustment
         for iteration in range(1, self.max_iterations + 1):

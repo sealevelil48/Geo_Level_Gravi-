@@ -36,7 +36,7 @@ VAL_COLS = ["File", "Start", "End", "Setups", "Distance (m)", "dH (m)", "Status"
 
 # Amber colour used for Manager Override rows
 AMBER_COLOR = QColor("#FF8F00")          # text
-AMBER_BG    = QColor("#FFF8E1")          # row background (light amber tint)
+AMBER_BG    = QColor(255, 191, 0)        # row background (amber/orange per spec)
 
 
 class GeoLevelDockWidget(QDockWidget):

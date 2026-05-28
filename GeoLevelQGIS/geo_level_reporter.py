@@ -11,10 +11,10 @@ from datetime import datetime
 
 from qgis.PyQt.QtPrintSupport import QPrinter
 from qgis.PyQt.QtGui import (
-    QTextDocument, QTextCursor, QTextTableFormat,
+    QTextDocument, QTextCursor, QTextTableFormat, QTextLength,
     QTextCharFormat, QTextBlockFormat, QFont, QColor, QImage
 )
-from qgis.PyQt.QtCore import Qt, QSizeF
+from qgis.PyQt.QtCore import Qt, QSizeF, QUrl
 
 
 class GeoLevelReporter:
@@ -170,8 +170,7 @@ class GeoLevelReporter:
             scaled = img.scaledToHeight(80, Qt.SmoothTransformation)
             doc    = cursor.document()
             doc.addResource(QTextDocument.ImageResource,
-                            # Use a simple string key
-                            __import__('qgis').PyQt.QtCore.QUrl("logo://survey"),
+                            QUrl("logo://survey"),
                             scaled)
             img_fmt = QTextCharFormat()
             cursor.insertImage(scaled)
@@ -272,7 +271,7 @@ class GeoLevelReporter:
             values = [
                 str(pid),
                 f"{data.get('height', 0):.4f}",
-                "—" if is_fixed else f"{data.get('correction_mm', 0):.1f}",
+                f"{data.get('correction_mm', 0):.1f}" if is_fixed else "—",
                 f"{data.get('sigma_mm', 0):.2f}",
                 "Fixed" if is_fixed else "Adjusted",
             ]
@@ -358,6 +357,5 @@ class GeoLevelReporter:
         fmt.setBorder(0.5)
         fmt.setCellPadding(4)
         fmt.setCellSpacing(0)
-        fmt.setWidth(__import__('qgis').PyQt.QtGui.QTextLength(
-            __import__('qgis').PyQt.QtGui.QTextLength.PercentageLength, 100))
+        fmt.setWidth(QTextLength(QTextLength.PercentageLength, 100))
         return fmt
