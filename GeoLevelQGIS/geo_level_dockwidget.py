@@ -828,3 +828,32 @@ class GeoLevelDockWidget(QDockWidget):
 
         wb.save(path)
         self.log("Validation table exported to: " + path)
+
+    def clear_all(self):
+        """Reset the entire dock to an empty/startup state (New Project)."""
+        # Internal state
+        self._lines       = []
+        self._val_results = []
+        self._current_idx = -1
+
+        # Left panel
+        self.line_list.clear()
+        self.btn_toggle_dir.setEnabled(False)
+        self.btn_toggle_use.setEnabled(False)
+
+        # Tab 0 — Line Details
+        self.line_info_lbl.setText("No line selected")
+        self.setup_table.setRowCount(0)
+        self.btn_adjust_line.setEnabled(False)
+        self.btn_lsa.setEnabled(False)
+
+        # Tab 1 — Validation
+        self.val_table.setRowCount(0)
+        self.val_detail_text.clear()
+
+        # Tab 2 — Analysis
+        self.double_run_table.setRowCount(0)
+        self.loop_table.setRowCount(0)
+
+        # Tab 3 — Log
+        self.log_text.clear()

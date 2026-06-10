@@ -195,6 +195,8 @@ class GeoLevelPlugin:
 
         # ── Project sub-menu ──────────────────────────────────────────
         proj_menu = self._menu.addMenu("Project / פרויקט")
+        proj_menu.addAction("New Project / פרויקט חדש").triggered.connect(self._new_project)
+        proj_menu.addSeparator()
         proj_menu.addAction("Open / Load Files…").triggered.connect(self._open_files_dialog)
         proj_menu.addSeparator()
         proj_menu.addAction("Save Project…").triggered.connect(self._save_project)
@@ -493,6 +495,39 @@ class GeoLevelPlugin:
         self._lines = []
         self._val_results = []
         self._process_files(files, cls, output_dir)
+
+    def _new_project(self):
+        """Clear all loaded data and start a fresh session."""
+        reply = QMessageBox.question(
+            self.iface.mainWindow(),
+            "New Project / פרויקט חדש",
+            "Are you sure you want to start a new project?\n"
+            "All unsaved data and loaded files will be cleared.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Reset backend state
+        self._lines = []
+        self._val_results = []
+        self._last_output_dir = ""
+        self._last_class = "H3"
+
+        # Remove the QGIS map layer
+        if self._layer and self._layer.isValid():
+            QgsProject.instance().removeMapLayer(self._layer)
+        self._layer = None
+
+        # Wipe the dock UI
+        if self.dock:
+            self.dock.clear_all()
+
+        self.iface.messageBar().pushMessage(
+            "Geo Level Gravi", "New project started.",
+            level=Qgis.Success, duration=4
+        )
 
     def _show_project_properties(self):
         points = set()
