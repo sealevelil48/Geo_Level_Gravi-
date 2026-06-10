@@ -16,7 +16,7 @@ from ..config.models import (
     LevelingLine, ValidationResult, LineStatus, StationSetup
 )
 from ..config.settings import (
-    get_settings, is_benchmark, is_turning_point, calculate_tolerance
+    get_settings, is_benchmark, is_turning_point, calculate_tolerance, validate_point_name
 )
 from ..config.israel_survey_regulations import (
     get_class_parameters, calculate_new_tolerance, MeasurementType,
@@ -97,7 +97,15 @@ class LevelingValidator:
         if not line.end_point:
             result.add_error("No end point defined")
             return False
-        
+
+        # Per Directive ג2 (2021): numeric-only IDs up to 8 chars are valid station
+        # IDs ("numbers instead of letters"). Validate against the station-ID pattern
+        # first — if it passes, accept immediately without the old turning-point check.
+        name_valid, _ = validate_point_name(line.end_point)
+        if name_valid:
+            return True
+
+        # For IDs that fail the format check, fall back to legacy heuristics.
         if is_turning_point(line.end_point):
             result.add_error(
                 f"End point '{line.end_point}' is a turning point (numeric). "
@@ -105,7 +113,7 @@ class LevelingValidator:
             )
             line.status = LineStatus.INVALID_ENDPOINT
             return False
-        
+
         if not is_benchmark(line.end_point):
             result.add_warning(
                 f"End point '{line.end_point}' may not be a valid benchmark name"
