@@ -117,12 +117,28 @@ class GeoLevelLSAInputDialog(QDialog):
         candidates = sorted(pid for pid, cnt in degree.items() if cnt == 1)
         if not candidates:
             candidates = sorted(degree.keys())
+        # Pre-load DB manager once so each row doesn't re-instantiate
+        try:
+            from db_manager import get_db_manager
+            _db_mgr = get_db_manager()
+        except Exception:
+            _db_mgr = None
+
         self.fp_table.setRowCount(0)
         for pid in candidates:
             r = self.fp_table.rowCount()
             self.fp_table.insertRow(r)
             self.fp_table.setItem(r, 0, QTableWidgetItem(pid))
-            self.fp_table.setItem(r, 1, QTableWidgetItem(""))
+
+            height_text = ""
+            if _db_mgr is not None and _db_mgr.is_configured():
+                try:
+                    rec = _db_mgr.resolve_benchmark(pid)
+                    if rec is not None and rec.gova_ort is not None:
+                        height_text = f"{rec.gova_ort:.4f}"
+                except Exception:
+                    pass
+            self.fp_table.setItem(r, 1, QTableWidgetItem(height_text))
 
     def _on_ok(self):
         fixed = {}
@@ -223,6 +239,7 @@ class GeoLevelPlugin:
         sett_menu.addAction("Class Parameters…").triggered.connect(self._show_class_settings)
         sett_menu.addAction("Encoding…").triggered.connect(self._show_encoding_settings)
         sett_menu.addAction("Point Exclusion...").triggered.connect(self._show_point_exclusion)
+        sett_menu.addAction("Database Connection…").triggered.connect(self._show_db_settings)
 
         # ── Help sub-menu ─────────────────────────────────────────────
         help_menu = self._menu.addMenu("Help / עזרה")
@@ -235,6 +252,13 @@ class GeoLevelPlugin:
 
         # Create dock (hidden until first use)
         self._create_dock()
+
+        # Pre-load DB manager — auto-loads saved connection params from settings.json
+        try:
+            from db_manager import get_db_manager
+            get_db_manager()
+        except Exception:
+            pass
 
     def unload(self):
         self.iface.removePluginMenu("&Geo Level Gravi", self._toolbar_action)
@@ -515,6 +539,13 @@ class GeoLevelPlugin:
         self._last_output_dir = ""
         self._last_class = "H3"
 
+        # Clear DB session cache so proximity centroid resets for the new project
+        try:
+            from db_manager import get_db_manager
+            get_db_manager().clear_session_cache()
+        except Exception:
+            pass
+
         # Remove the QGIS map layer
         if self._layer and self._layer.isValid():
             QgsProject.instance().removeMapLayer(self._layer)
@@ -597,6 +628,12 @@ class GeoLevelPlugin:
             if not loops:
                 self.dock.log("Find Loops: no closed loops detected.")
             else:
+                try:
+                    from db_manager import get_db_manager
+                    _db_mgr = get_db_manager()
+                except Exception:
+                    _db_mgr = None
+
                 for i, loop in enumerate(loops, 1):
                     ok, mis_mm, tol_mm = loop.check_tolerance()
                     row = tbl.rowCount()
@@ -623,6 +660,31 @@ class GeoLevelPlugin:
                         QColor("#2e7d32") if ok else QColor("#c62828")
                     )
                     tbl.setItem(row, 5, status_item)
+
+                    # Column 6: DB Check — corrected misclosure against known heights
+                    db_check_text = "—"
+                    if _db_mgr is not None and _db_mgr.is_configured() and loop.points:
+                        start_pt = loop.points[0]
+                        end_pt   = loop.points[-1]
+                        if start_pt == end_pt:
+                            db_check_text = "—"  # closed loop, no endpoint correction needed
+                        else:
+                            try:
+                                rec_s = _db_mgr.resolve_benchmark(start_pt)
+                                rec_e = _db_mgr.resolve_benchmark(end_pt)
+                                if (rec_s and rec_e
+                                        and rec_s.gova_ort is not None
+                                        and rec_e.gova_ort is not None):
+                                    theoretical_dh = rec_e.gova_ort - rec_s.gova_ort
+                                    corrected_mm = (loop.misclosure - theoretical_dh) * 1000
+                                    db_check_text = "{:+.3f}".format(corrected_mm)
+                                else:
+                                    db_check_text = "No DB height"
+                            except Exception:
+                                db_check_text = "DB error"
+                    db_item = QTableWidgetItem(db_check_text)
+                    db_item.setTextAlignment(Qt.AlignCenter)
+                    tbl.setItem(row, 6, db_item)
 
                 self.dock.log("Find Loops: " + str(len(loops)) + " loop(s) found.")
 
@@ -653,6 +715,12 @@ class GeoLevelPlugin:
             if not pairs:
                 self.dock.log("Detect Double-Runs: no pairs found.")
             else:
+                try:
+                    from db_manager import get_db_manager
+                    _db_mgr = get_db_manager()
+                except Exception:
+                    _db_mgr = None
+
                 cls = self.dock.get_selected_class() if self.dock else self._last_class
                 analyzer = LoopAnalyzer(self._lines)
                 for fwd, ret in pairs:
@@ -702,6 +770,26 @@ class GeoLevelPlugin:
                     if not passed:
                         reason_item.setForeground(QColor("#c62828"))
                     tbl.setItem(row, 7, reason_item)
+
+                    # Column 8: DB Check — deviation of mean_dh from known height difference
+                    db_check_text = "—"
+                    if _db_mgr is not None and _db_mgr.is_configured():
+                        try:
+                            rec_s = _db_mgr.resolve_benchmark(fwd.start_point)
+                            rec_e = _db_mgr.resolve_benchmark(fwd.end_point)
+                            if (rec_s and rec_e
+                                    and rec_s.gova_ort is not None
+                                    and rec_e.gova_ort is not None):
+                                expected_dh = rec_e.gova_ort - rec_s.gova_ort
+                                error_mm = (res["mean_dh"] - expected_dh) * 1000
+                                db_check_text = "{:+.3f}".format(error_mm)
+                            else:
+                                db_check_text = "No DB height"
+                        except Exception:
+                            db_check_text = "DB error"
+                    db_item = QTableWidgetItem(db_check_text)
+                    db_item.setTextAlignment(Qt.AlignCenter)
+                    tbl.setItem(row, 8, db_item)
 
                 self.dock.log("Detect Double-Runs: " + str(len(pairs)) + " pair(s) found.")
 
@@ -971,6 +1059,15 @@ class GeoLevelPlugin:
     # ------------------------------------------------------------------
     # Settings menu actions
     # ------------------------------------------------------------------
+
+    def _show_db_settings(self):
+        try:
+            from geo_level_db_settings_dialog import GeoLevelDBSettingsDialog
+            GeoLevelDBSettingsDialog(self.iface.mainWindow()).exec_()
+        except Exception as exc:
+            QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
+                                     level=Qgis.Critical)
+            QMessageBox.critical(self.iface.mainWindow(), "DB Settings — Error", str(exc))
 
     def _show_class_settings(self):
         try:

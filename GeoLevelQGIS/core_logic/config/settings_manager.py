@@ -242,6 +242,45 @@ class SettingsManager:
             logger.error(f"Failed to save default class: {e}")
             return False
 
+    def get_db_connection(self) -> Dict[str, Any]:
+        """
+        Return the stored DB connection parameters dict.
+
+        Keys: host, port, dbname, user, table, authcfg.
+        Password is NEVER stored here — it lives in QgsAuthManager.
+
+        Returns:
+            dict with connection params, or {} if not configured.
+        """
+        return self._load_settings_file().get("db_connection", {})
+
+    def set_db_connection(self, host: str, port: int, dbname: str,
+                          user: str, table: str, authcfg: str) -> bool:
+        """
+        Persist non-sensitive DB connection params and authcfg ID to settings.json.
+        Password is NEVER written here.
+
+        Returns:
+            True on success, False on failure.
+        """
+        settings = self._load_settings_file()
+        settings["db_connection"] = {
+            "host":    host,
+            "port":    int(port),
+            "dbname":  dbname,
+            "user":    user,
+            "table":   table,
+            "authcfg": authcfg,
+        }
+        try:
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+            logger.info("DB connection params saved to %s", self.settings_file)
+            return True
+        except Exception as e:
+            logger.error("Failed to save DB connection params: %s", e)
+            return False
+
     def get_settings_info(self) -> Dict[str, Any]:
         """
         Get information about current settings.

@@ -91,9 +91,16 @@ class GeoLevelEnhancedLSADialog(QDialog):
         btn_auto = QPushButton("Auto-Select")
         btn_auto.setToolTip("Auto-detect benchmark endpoints from loaded lines")
         btn_auto.clicked.connect(self._auto_select_fixed)
+        btn_db = QPushButton("Fetch from DB")
+        btn_db.setToolTip(
+            "Look up heights for listed Point IDs in the national benchmark database.\n"
+            "Requires a configured DB connection (Settings → Database Connection…)."
+        )
+        btn_db.clicked.connect(self._fetch_from_db)
         btn_row.addWidget(btn_add_fp)
         btn_row.addWidget(btn_del_fp)
         btn_row.addWidget(btn_auto)
+        btn_row.addWidget(btn_db)
         vbox_fp.addLayout(btn_row)
         vbox.addWidget(grp_fp)
 
@@ -250,13 +257,88 @@ class GeoLevelEnhancedLSADialog(QDialog):
         if not candidates:
             candidates = sorted(degree.keys())
 
+        # Pre-load DB manager once for all candidate lookups
+        try:
+            from db_manager import get_db_manager
+            _db_mgr = get_db_manager()
+        except Exception:
+            _db_mgr = None
+
         self.fp_table.setRowCount(0)
         for pid in candidates:
             row = self.fp_table.rowCount()
             self.fp_table.insertRow(row)
             self.fp_table.setItem(row, 0, QTableWidgetItem(pid))
-            # Blank height — must be filled in by the user before running
-            self.fp_table.setItem(row, 1, QTableWidgetItem(""))
+
+            height_text = ""
+            if _db_mgr is not None and _db_mgr.is_configured():
+                try:
+                    rec = _db_mgr.resolve_benchmark(pid)
+                    if rec is not None and rec.gova_ort is not None:
+                        height_text = f"{rec.gova_ort:.4f}"
+                except Exception:
+                    pass
+            self.fp_table.setItem(row, 1, QTableWidgetItem(height_text))
+
+    def _fetch_from_db(self):
+        """
+        Iterate the Fixed Points table and fill missing heights from the DB.
+        Rows with a blank Point ID are skipped.
+        Heights that are already filled are NOT overwritten.
+        A summary dialog reports filled / not-found / NULL-height counts.
+        """
+        try:
+            from db_manager import get_db_manager
+            mgr = get_db_manager()
+        except Exception as exc:
+            QMessageBox.critical(self, "DB Error", f"Could not load DB manager: {exc}")
+            return
+
+        if not mgr.is_configured():
+            QMessageBox.information(
+                self, "DB Not Configured",
+                "Set up the database connection first via\n"
+                "Settings → Database Connection…"
+            )
+            return
+
+        filled, not_found, no_height, already_set = 0, [], [], 0
+
+        for row in range(self.fp_table.rowCount()):
+            pid_item = self.fp_table.item(row, 0)
+            if not pid_item or not pid_item.text().strip():
+                continue
+            pid = pid_item.text().strip()
+
+            # Don't overwrite an already-entered height
+            h_item = self.fp_table.item(row, 1)
+            if h_item and h_item.text().strip():
+                already_set += 1
+                continue
+
+            try:
+                rec = mgr.resolve_benchmark(pid)
+            except Exception:
+                not_found.append(pid)
+                continue
+
+            if rec is None:
+                not_found.append(pid)
+            elif rec.gova_ort is None:
+                no_height.append(pid)
+            else:
+                self.fp_table.setItem(row, 1, QTableWidgetItem(f"{rec.gova_ort:.4f}"))
+                filled += 1
+
+        parts = [f"Filled {filled} height(s) from DB."]
+        if already_set:
+            parts.append(f"Skipped {already_set} row(s) with existing heights.")
+        if not_found:
+            parts.append("Not found in DB:\n  " + ", ".join(not_found))
+        if no_height:
+            parts.append("Found but gova_ort is NULL:\n  " + ", ".join(no_height))
+
+        QMessageBox.information(self, "DB Fetch Complete", "\n".join(parts))
 
     def _collect_fixed_points(self):
         """

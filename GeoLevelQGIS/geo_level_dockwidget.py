@@ -261,10 +261,11 @@ class GeoLevelDockWidget(QDockWidget):
         # Sub-tab: Double-Runs
         dr_widget = QWidget()
         dr_vbox = QVBoxLayout(dr_widget)
-        self.double_run_table = QTableWidget(0, 8)
+        self.double_run_table = QTableWidget(0, 9)
         self.double_run_table.setHorizontalHeaderLabels([
             "Pair", "Forward File", "Return File",
-            "Mean dH (m)", "Misclosure (mm)", "Tolerance (mm)", "Status", "Reason"
+            "Mean dH (m)", "Misclosure (mm)", "Tolerance (mm)", "Status", "Reason",
+            "DB Check (mm)"
         ])
         self.double_run_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.double_run_table.horizontalHeader().setStretchLastSection(True)
@@ -276,10 +277,10 @@ class GeoLevelDockWidget(QDockWidget):
         # Sub-tab: Loops
         loop_widget = QWidget()
         loop_vbox = QVBoxLayout(loop_widget)
-        self.loop_table = QTableWidget(0, 6)
+        self.loop_table = QTableWidget(0, 7)
         self.loop_table.setHorizontalHeaderLabels([
             "Loop ID", "Path", "Distance (m)",
-            "Misclosure (mm)", "Tolerance (mm)", "Status"
+            "Misclosure (mm)", "Tolerance (mm)", "Status", "DB Check (mm)"
         ])
         self.loop_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.loop_table.horizontalHeader().setStretchLastSection(True)
