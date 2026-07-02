@@ -393,6 +393,19 @@ class GeoLevelPlugin:
         new_lines = result["lines"]
         self._lines.extend(new_lines)
 
+        # Seed the DB spatial centroid from the 'נקודות בקרה' control-points layer.
+        # This must run before any LSA/loops/double-runs dialog can fire, so the
+        # K-Means centroid is anchored to on-screen verified geometry, not the DB.
+        try:
+            from db_manager import get_db_manager
+            all_pts = list(
+                {ln.start_point for ln in self._lines if ln.start_point}
+                | {ln.end_point   for ln in self._lines if ln.end_point}
+            )
+            get_db_manager().seed_from_qgis_layer(all_pts)
+        except Exception:
+            pass
+
         # Re-validate the full combined set
         try:
             from core_logic.validators import BatchValidator
