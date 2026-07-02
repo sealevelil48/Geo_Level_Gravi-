@@ -91,6 +91,18 @@ class LevelingValidator:
     
     def _check_endpoint(self, line: LevelingLine, result: ValidationResult) -> bool:
         """Check if end point is a valid benchmark."""
+        # Surveyor error: start and end point are the same — a line cannot be its
+        # own return. Flagged as INVALID_ENDPOINT so Manager Override can still
+        # force it to VALID_BY_MANAGER if explicitly required.
+        if line.start_point and line.end_point and line.start_point == line.end_point:
+            result.add_error(
+                f"Surveyor Error: Start point and End point are identical "
+                f"({line.start_point}). A leveling line cannot start and end "
+                f"on the same benchmark."
+            )
+            line.status = LineStatus.INVALID_ENDPOINT
+            return False
+
         if not line.end_point:
             result.add_error("No end point defined")
             return False
