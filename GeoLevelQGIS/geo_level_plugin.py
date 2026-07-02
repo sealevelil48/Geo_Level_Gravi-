@@ -119,7 +119,7 @@ class GeoLevelLSAInputDialog(QDialog):
             candidates = sorted(degree.keys())
         # Pre-load DB manager once so each row doesn't re-instantiate
         try:
-            from db_manager import get_db_manager
+            from geolevel_db_manager import get_db_manager
             _db_mgr = get_db_manager()
         except Exception:
             _db_mgr = None
@@ -255,7 +255,7 @@ class GeoLevelPlugin:
 
         # Pre-load DB manager — auto-loads saved connection params from settings.json
         try:
-            from db_manager import get_db_manager
+            from geolevel_db_manager import get_db_manager
             get_db_manager()
         except Exception:
             pass
@@ -397,7 +397,7 @@ class GeoLevelPlugin:
         # This must run before any LSA/loops/double-runs dialog can fire, so the
         # K-Means centroid is anchored to on-screen verified geometry, not the DB.
         try:
-            from db_manager import get_db_manager
+            from geolevel_db_manager import get_db_manager
             all_pts = list(
                 {ln.start_point for ln in self._lines if ln.start_point}
                 | {ln.end_point   for ln in self._lines if ln.end_point}
@@ -554,7 +554,7 @@ class GeoLevelPlugin:
 
         # Clear DB session cache so proximity centroid resets for the new project
         try:
-            from db_manager import get_db_manager
+            from geolevel_db_manager import get_db_manager
             get_db_manager().clear_session_cache()
         except Exception:
             pass
@@ -642,7 +642,7 @@ class GeoLevelPlugin:
                 self.dock.log("Find Loops: no closed loops detected.")
             else:
                 try:
-                    from db_manager import get_db_manager
+                    from geolevel_db_manager import get_db_manager
                     _db_mgr = get_db_manager()
                 except Exception:
                     _db_mgr = None
@@ -729,7 +729,7 @@ class GeoLevelPlugin:
                 self.dock.log("Detect Double-Runs: no pairs found.")
             else:
                 try:
-                    from db_manager import get_db_manager
+                    from geolevel_db_manager import get_db_manager
                     _db_mgr = get_db_manager()
                 except Exception:
                     _db_mgr = None

@@ -259,7 +259,7 @@ class GeoLevelEnhancedLSADialog(QDialog):
 
         # Pre-load DB manager once for all candidate lookups
         try:
-            from db_manager import get_db_manager
+            from geolevel_db_manager import get_db_manager
             _db_mgr = get_db_manager()
         except Exception:
             _db_mgr = None
@@ -288,7 +288,7 @@ class GeoLevelEnhancedLSADialog(QDialog):
         A summary dialog reports filled / not-found / NULL-height counts.
         """
         try:
-            from db_manager import get_db_manager
+            from geolevel_db_manager import get_db_manager
             mgr = get_db_manager()
         except Exception as exc:
             QMessageBox.critical(self, "DB Error", f"Could not load DB manager: {exc}")

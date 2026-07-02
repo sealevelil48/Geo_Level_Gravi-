@@ -1,5 +1,5 @@
 """
-db_manager.py
+geolevel_db_manager.py
 Centralized PostgreSQL benchmark resolver for Geo Level Gravi.
 
 Single source of truth for fixed-point height and coordinate lookup across:

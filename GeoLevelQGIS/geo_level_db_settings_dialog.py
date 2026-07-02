@@ -192,7 +192,7 @@ class GeoLevelDBSettingsDialog(QDialog):
             return
 
         try:
-            from db_manager import get_db_manager
+            from geolevel_db_manager import get_db_manager
             mgr = get_db_manager()
             mgr.configure(**params)
             ok, msg = mgr.test_connection()
@@ -228,7 +228,7 @@ class GeoLevelDBSettingsDialog(QDialog):
                 table=params["table"],
                 authcfg=params["authcfg"],
             )
-            from db_manager import get_db_manager
+            from geolevel_db_manager import get_db_manager
             get_db_manager().configure(**params)
         except Exception as exc:
             self._set_status(False, f"Failed to save: {exc}")
