@@ -19,6 +19,7 @@ Coordinate convention (Survey of Israel DB):
 """
 
 import math
+import re
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
@@ -46,9 +47,10 @@ class BenchmarkRecord:
 
 
 # ---------------------------------------------------------------------------
-# SQL template — 6 name-format variants, all case/space insensitive
+# SQL templates
 # ---------------------------------------------------------------------------
 
+# Per-point query — 6 name-format variants, all case/space insensitive
 _SQL_TEMPLATE = """
 SELECT
     ot_nekuda,
@@ -73,6 +75,21 @@ WHERE
      UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || ot_nekuda_kfula))        = UPPER(TRIM(%s)))
 """
 
+# Batch query — fetches (x, y) for ALL DAT point names in one round-trip.
+# Used by the global-pool centroid fallback when layer seeding yields 0 points.
+# Each %s is bound to a Python list of uppercase point-name strings via psycopg2.
+_SQL_BATCH_COORDS = """
+SELECT x, y
+FROM {table}
+WHERE x IS NOT NULL AND y IS NOT NULL
+  AND (
+    UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || '/' || ot_nekuda)) = ANY(%s)
+ OR UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || ot_nekuda))        = ANY(%s)
+ OR UPPER(TRIM(ot_nekuda || CAST(mispar_nekuda AS TEXT)))        = ANY(%s)
+ OR UPPER(TRIM(name))                                            = ANY(%s)
+  )
+"""
+
 # Name of the QGIS control-points layer used to seed the project centroid
 _SEED_LAYER_NAME = "נקודות בקרה"
 
@@ -86,13 +103,14 @@ class BenchmarkDBManager:
     Manages PostgreSQL connectivity and point resolution with session caching
     and spatial disambiguation.
 
-    Centroid strategy:
-      1. seed_from_qgis_layer() pre-populates _resolved_coords from the map canvas
-         before any DB query fires.
-      2. _get_project_centroid() uses scipy K-Means k=2 on those coordinates:
-         splits into two clusters, returns the centroid of the larger (project)
-         cluster, discarding rogue far-away duplicates.
-      3. _resolve_by_proximity() picks the DB candidate nearest that centroid.
+    Centroid strategy (in priority order):
+      1. seed_from_qgis_layer() pre-populates _resolved_coords from the verified
+         map canvas geometry before any DB query fires.
+      2. If seeding yields 0 points, _build_global_pool_centroid() fires ONE batch
+         SQL query for ALL DAT point names and runs K-Means k=2 on the combined
+         spatial candidates to find the true project cluster.
+      3. If the global pool also fails (no DB coords), fall back to the candidates
+         of the single ambiguous point being resolved (last resort).
 
     Thread-safety: intended for single-threaded QGIS main thread use only.
     """
@@ -102,6 +120,10 @@ class BenchmarkDBManager:
         self._cache: Dict[str, Optional[BenchmarkRecord]] = {}
         # Maps resolved point names → (Easting, Northing) for centroid calculation
         self._resolved_coords: Dict[str, Tuple[float, float]] = {}
+        # Stored by seed_from_qgis_layer for use by the global pool fallback
+        self._all_dat_point_names: List[str] = []
+        # Cached result of _build_global_pool_centroid (built at most once per session)
+        self._global_pool_centroid: Optional[Tuple[float, float]] = None
 
     # ------------------------------------------------------------------ #
     # Configuration
@@ -126,10 +148,41 @@ class BenchmarkDBManager:
         return bool(self._params.get("table") and self._params.get("authcfg"))
 
     def clear_session_cache(self) -> None:
-        """Reset lookup cache and accumulated project coordinates. Call on New Project."""
+        """Reset all session state. Call on New Project."""
         self._cache.clear()
         self._resolved_coords.clear()
+        self._all_dat_point_names = []
+        self._global_pool_centroid = None
         logger.debug("DB session cache cleared")
+
+    # ------------------------------------------------------------------ #
+    # Name normalisation helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _normalise_name(name: str) -> str:
+        """Strip ALL non-alphanumeric characters and uppercase.
+
+        Handles every known separator variant:
+          '3349/MPI' → '3349MPI'
+          'MPI-3349' → 'MPI3349'
+          '3349 MPI' → '3349MPI'
+          '3349_MPI' → '3349MPI'
+          '3349.MPI' → '3349MPI'
+        """
+        return re.sub(r'[^A-Z0-9]', '', name.strip().upper())
+
+    @staticmethod
+    def _pick_name_fields(field_names: List[str]) -> List[str]:
+        """Return ALL layer fields likely to contain a point name/ID, in priority order.
+
+        Returns a list so the seeder can try every candidate and union the matches,
+        rather than committing to a single field that might be wrong.
+        """
+        preferred = [f for f in ("name", "point_id", "id") if f in field_names]
+        extras = [f for f in field_names
+                  if ("name" in f or "id" in f) and f not in preferred]
+        return preferred + extras
 
     # ------------------------------------------------------------------ #
     # Layer seeding — must be called before any resolve_benchmark() call
@@ -139,12 +192,13 @@ class BenchmarkDBManager:
         """
         Pre-populate _resolved_coords from the 'נקודות בקרה' QGIS layer.
 
-        Iterates features in the control-points layer; for every feature whose
-        name/ID attribute matches one of the supplied point names, stores its
-        (Easting, Northing) geometry in _resolved_coords.
+        Stores all provided point names for use by the global-pool fallback.
+        Iterates all name-like fields in the layer features; for every feature
+        whose value normalise-matches any DAT point name, stores its canvas
+        (Easting, Northing) into _resolved_coords.
 
-        This establishes the project centroid from on-screen, visually-verified
-        geometry BEFORE any DB query fires, preventing false centroids.
+        Emits a WARNING if 0 points are seeded, listing the exact names searched
+        and fields tried, so the mismatch can be debugged from the QGIS log.
 
         Args:
             point_names: All unique start_point / end_point values from loaded lines.
@@ -152,13 +206,18 @@ class BenchmarkDBManager:
         Returns:
             Number of points successfully seeded.
         """
+        # Always store for global-pool fallback, even if seeding fails
+        self._all_dat_point_names = [n for n in point_names if n]
+
         seeded = 0
+        norm_names = {self._normalise_name(n) for n in self._all_dat_point_names}
+        logger.debug("seed_from_qgis_layer: %d unique DAT names, norm_names sample=%s",
+                     len(norm_names), sorted(norm_names)[:10])
+
         try:
             from qgis.core import QgsProject
 
-            # Build a normalised lookup set from caller's point names
-            norm_names = {self._normalise_name(n) for n in point_names if n}
-
+            # Find the control-points layer by exact name
             layer = None
             for lyr in QgsProject.instance().mapLayers().values():
                 if lyr.name() == _SEED_LAYER_NAME:
@@ -166,29 +225,61 @@ class BenchmarkDBManager:
                     break
 
             if layer is None:
-                logger.debug("seed_from_qgis_layer: layer '%s' not found in project",
-                             _SEED_LAYER_NAME)
+                logger.warning(
+                    "seed_from_qgis_layer: layer '%s' NOT FOUND in project. "
+                    "Centroid will fall back to global DB pool K-Means.",
+                    _SEED_LAYER_NAME
+                )
                 return 0
 
-            # Identify which attribute field to match point names against
-            field_names = [f.name().lower() for f in layer.fields()]
-            match_field = self._pick_name_field(field_names)
-            if match_field is None:
-                logger.warning("seed_from_qgis_layer: no name/id field found in '%s'",
-                               _SEED_LAYER_NAME)
+            # Collect ALL candidate name fields (not just the first one)
+            raw_field_names = [f.name() for f in layer.fields()]
+            lower_field_names = [f.lower() for f in raw_field_names]
+            candidate_fields_lower = self._pick_name_fields(lower_field_names)
+
+            if not candidate_fields_lower:
+                logger.warning(
+                    "seed_from_qgis_layer: no name/id fields found in layer '%s'. "
+                    "Available fields: %s",
+                    _SEED_LAYER_NAME, raw_field_names
+                )
                 return 0
 
-            actual_field = layer.fields()[field_names.index(match_field)].name()
+            # Map lowercase field names back to actual (case-preserved) field names
+            lower_to_actual = dict(zip(lower_field_names, raw_field_names))
+            candidate_fields_actual = [lower_to_actual[f] for f in candidate_fields_lower
+                                       if f in lower_to_actual]
+
+            logger.info(
+                "seed_from_qgis_layer: layer '%s' found (%d features). "
+                "Trying fields: %s",
+                _SEED_LAYER_NAME, layer.featureCount(), candidate_fields_actual
+            )
+
+            already_seeded: set = set()  # avoid double-counting same feature
 
             for feature in layer.getFeatures():
-                try:
-                    raw_val = feature[actual_field]
+                feat_id = feature.id()
+                if feat_id in already_seeded:
+                    continue
+
+                matched_key = None
+                for field in candidate_fields_actual:
+                    try:
+                        raw_val = feature[field]
+                    except Exception:
+                        continue
                     if raw_val is None:
                         continue
                     norm_val = self._normalise_name(str(raw_val))
-                    if norm_val not in norm_names:
-                        continue
+                    if norm_val in norm_names:
+                        matched_key = str(raw_val).strip().upper()
+                        break
 
+                if matched_key is None:
+                    continue
+
+                try:
                     geom = feature.geometry()
                     if geom is None or geom.isEmpty():
                         continue
@@ -200,38 +291,97 @@ class BenchmarkDBManager:
                     if easting == 0.0 and northing == 0.0:
                         continue
 
-                    # Store under the original (non-normalised) key as upper-stripped
-                    key = str(raw_val).strip().upper()
-                    self._resolved_coords[key] = (easting, northing)
+                    self._resolved_coords[matched_key] = (easting, northing)
+                    already_seeded.add(feat_id)
                     seeded += 1
-                    logger.debug("Seeded '%s' from layer: E=%.1f N=%.1f", key, easting, northing)
+                    logger.debug("Seeded '%s' from layer: E=%.1f N=%.1f",
+                                 matched_key, easting, northing)
 
                 except Exception as feat_exc:
-                    logger.debug("seed_from_qgis_layer: skipping feature — %s", feat_exc)
-                    continue
+                    logger.debug("seed_from_qgis_layer: skipping feature %d — %s",
+                                 feat_id, feat_exc)
 
         except Exception as exc:
-            logger.warning("seed_from_qgis_layer failed: %s", exc)
+            logger.warning("seed_from_qgis_layer failed with exception: %s", exc)
 
-        if seeded:
-            logger.info("Seeded %d point(s) from '%s' into DB centroid", seeded, _SEED_LAYER_NAME)
+        if seeded > 0:
+            logger.info("Seeded %d point(s) from '%s' into DB centroid",
+                        seeded, _SEED_LAYER_NAME)
+        else:
+            logger.warning(
+                "seed_from_qgis_layer: 0 points seeded from '%s'. "
+                "norm_names searched (first 20): %s. "
+                "Falling back to global DB pool centroid.",
+                _SEED_LAYER_NAME, sorted(norm_names)[:20]
+            )
+
         return seeded
 
-    @staticmethod
-    def _normalise_name(name: str) -> str:
-        """Uppercase, strip whitespace and slashes for loose name matching."""
-        return name.strip().upper().replace("/", "").replace("-", "").replace(" ", "")
+    # ------------------------------------------------------------------ #
+    # Global pool centroid — single batch query for all DAT points
+    # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _pick_name_field(field_names: List[str]) -> Optional[str]:
-        """Return the best field name to use for point-name matching."""
-        for preferred in ("name", "point_id", "id"):
-            if preferred in field_names:
-                return preferred
-        for fn in field_names:
-            if "name" in fn or "id" in fn:
-                return fn
-        return None
+    def _build_global_pool_centroid(self) -> Tuple[float, float]:
+        """
+        Build a robust project centroid from ALL DAT point names using one
+        batch SQL query, then apply K-Means k=2 to discard rogue duplicates.
+
+        Result is cached — at most one DB round-trip per session.
+        """
+        if self._global_pool_centroid is not None:
+            return self._global_pool_centroid
+
+        table = self._params.get("table", "")
+        if not table or not self._all_dat_point_names:
+            self._global_pool_centroid = (0.0, 0.0)
+            return self._global_pool_centroid
+
+        # Build the list of all normalised DAT names for the ANY(%s) binding
+        norm_keys = list({n.strip().upper() for n in self._all_dat_point_names if n})
+
+        logger.info(
+            "Global pool: batch query for %d unique DAT names in table '%s'",
+            len(norm_keys), table
+        )
+
+        sql = _SQL_BATCH_COORDS.format(table=table)
+        # All four %s in the batch query get the same list
+        params = (norm_keys, norm_keys, norm_keys, norm_keys)
+
+        try:
+            conn = self._get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("Global pool batch query failed: %s", exc)
+            self._global_pool_centroid = (0.0, 0.0)
+            return self._global_pool_centroid
+
+        # Apply coordinate swap: DB x = Northing, DB y = Easting
+        coords = []
+        for db_x, db_y in rows:
+            if db_x is None or db_y is None:
+                continue
+            easting  = float(db_y)   # DB y → Easting
+            northing = float(db_x)   # DB x → Northing
+            if easting != 0.0 or northing != 0.0:
+                coords.append((easting, northing))
+
+        logger.info("Global pool: got %d spatial candidates from DB", len(coords))
+
+        if not coords:
+            logger.warning("Global pool: 0 candidates with coordinates — "
+                           "cannot establish project centroid from DB")
+            self._global_pool_centroid = (0.0, 0.0)
+            return self._global_pool_centroid
+
+        centroid = self._kmeans_centroid(coords)
+        self._global_pool_centroid = centroid
+        return centroid
 
     # ------------------------------------------------------------------ #
     # Connection (password retrieved from QgsAuthManager — never stored)
@@ -340,9 +490,7 @@ class BenchmarkDBManager:
             return rec
 
         # Multiple candidates — resolve by spatial proximity to project centroid
-        logger.info(
-            "Resolving '%s' by proximity: %d candidates found", key, len(candidates)
-        )
+        logger.info("Resolving '%s' by proximity: %d candidates found", key, len(candidates))
         rec = self._resolve_by_proximity(candidates, key)
         self._cache[key] = rec
         return rec
@@ -430,49 +578,61 @@ class BenchmarkDBManager:
 
     def _get_project_centroid(self, fallback: List[BenchmarkRecord]) -> Tuple[float, float]:
         """
-        Compute the project centroid using K-Means k=2 on all seeded coordinates.
+        Compute the project centroid, using the best available source:
 
-        Strategy:
-          - If fewer than 3 known points: plain mean (not enough data for clustering).
-          - If 3 or more: run scipy kmeans2 with k=2, return centroid of the LARGER
-            cluster. This discards the smaller outlier group (e.g. a rogue duplicate
-            in a different region of Israel that accidentally entered _resolved_coords).
-          - Falls back to plain mean if scipy is unavailable.
-
-        Coordinates are whitened (divided by per-axis std-dev) before clustering so
-        Easting and Northing axes contribute equally to the distance metric.
+        Priority:
+          1. _resolved_coords (from layer seeding or prior unambiguous lookups)
+             → K-Means k=2 if ≥3 points, else plain mean
+          2. Global pool centroid (one batch DB query for all DAT point names)
+             → K-Means k=2 on ALL spatial candidates, discards rogue cluster
+          3. Candidates of the current single ambiguous point (last resort)
         """
-        coords = list(self._resolved_coords.values())  # [(Easting, Northing), ...]
+        coords = list(self._resolved_coords.values())
 
         if not coords:
-            # No layer seeding occurred — bootstrap from candidate set itself
+            # Layer seeding failed — try global pool (single batch DB query)
+            if self._all_dat_point_names:
+                cx, cy = self._build_global_pool_centroid()
+                if cx != 0.0 or cy != 0.0:
+                    return cx, cy
+            # Last resort: use only the candidates of this single ambiguous point
             valid = [(r.x, r.y) for r in fallback if r.x is not None and r.y is not None]
             coords = valid if valid else []
 
         if not coords:
             return 0.0, 0.0
 
+        return self._kmeans_centroid(coords)
+
+    def _kmeans_centroid(self, coords: List[Tuple[float, float]]) -> Tuple[float, float]:
+        """
+        Compute K-Means k=2 centroid on a list of (Easting, Northing) pairs.
+
+        Returns the centroid of the LARGER cluster, discarding the smaller
+        outlier group (e.g. rogue same-name duplicates in other regions).
+
+        Falls back to plain mean when:
+          - fewer than 3 points (not enough for k=2)
+          - scipy is unavailable
+
+        Axes are whitened before clustering so Easting and Northing contribute
+        equally to the distance metric.
+        """
         if len(coords) < 3:
-            # Too few points for k=2 clustering — use plain mean
             return (sum(c[0] for c in coords) / len(coords),
                     sum(c[1] for c in coords) / len(coords))
 
-        # ── K-Means k=2: split into two clusters, pick the larger one ──────────
         try:
             import numpy as np
             from scipy.cluster.vq import kmeans2
 
             arr = np.array(coords, dtype=float)
-
-            # Whiten: normalise each axis by its std-dev so neither E nor N
-            # dominates the distance metric
             std = arr.std(axis=0)
-            std[std == 0] = 1.0      # guard against degenerate (all same value)
+            std[std == 0] = 1.0      # guard: degenerate axis (all values identical)
             whitened = arr / std
 
             centroids_w, labels = kmeans2(whitened, 2, iter=20, minit='points')
 
-            # Identify the larger cluster
             count0 = int((labels == 0).sum())
             count1 = int((labels == 1).sum())
             winner_label = 0 if count0 >= count1 else 1
@@ -481,16 +641,16 @@ class BenchmarkDBManager:
             cx = float(centroids_w[winner_label][0] * std[0])
             cy = float(centroids_w[winner_label][1] * std[1])
 
-            logger.debug(
-                "K-Means centroid (k=2, cluster %d, size %d/%d): E=%.1f N=%.1f",
-                winner_label, max(count0, count1), len(coords), cx, cy
+            logger.info(
+                "K-Means centroid (k=2, larger cluster=%d, size=%d/%d total=%d): "
+                "E=%.1f N=%.1f",
+                winner_label, max(count0, count1), min(count0, count1),
+                len(coords), cx, cy
             )
             return cx, cy
 
         except Exception as exc:
-            logger.warning(
-                "scipy kmeans2 unavailable (%s) — falling back to plain mean", exc
-            )
+            logger.warning("scipy kmeans2 failed (%s) — falling back to plain mean", exc)
             return (sum(c[0] for c in coords) / len(coords),
                     sum(c[1] for c in coords) / len(coords))
 
