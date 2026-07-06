@@ -107,8 +107,9 @@ class BenchmarkDBManager:
       1. seed_from_qgis_layer() pre-populates _resolved_coords from the verified
          map canvas geometry before any DB query fires.
       2. If seeding yields 0 points, _build_global_pool_centroid() fires ONE batch
-         SQL query for ALL DAT point names and runs K-Means k=2 on the combined
-         spatial candidates to find the true project cluster.
+         SQL query for ALL DAT point names, applies Spatial Median outlier rejection
+         (inner-75% percentile), then runs K-Means k=1 on the filtered core points
+         to find the true project centroid ('center of area' method).
       3. If the global pool also fails (no DB coords), fall back to the candidates
          of the single ambiguous point being resolved (last resort).
 
@@ -379,7 +380,7 @@ class BenchmarkDBManager:
             self._global_pool_centroid = (0.0, 0.0)
             return self._global_pool_centroid
 
-        centroid = self._kmeans_centroid(coords)
+        centroid = self._kmeans1_centroid(coords)
         self._global_pool_centroid = centroid
         return centroid
 
@@ -602,57 +603,141 @@ class BenchmarkDBManager:
         if not coords:
             return 0.0, 0.0
 
-        return self._kmeans_centroid(coords)
+        return self._kmeans1_centroid(coords)
 
-    def _kmeans_centroid(self, coords: List[Tuple[float, float]]) -> Tuple[float, float]:
+    def _spatial_median_filter(
+        self, coords: List[Tuple[float, float]]
+    ) -> List[Tuple[float, float]]:
         """
-        Compute K-Means k=2 centroid on a list of (Easting, Northing) pairs.
+        Step 2 of the Spatial Median + k=1 pipeline.
 
-        Returns the centroid of the LARGER cluster, discarding the smaller
-        outlier group (e.g. rogue same-name duplicates in other regions).
+        Rejects outliers by:
+          1. Computing the spatial median (numpy median on each axis independently —
+             immune to extreme spatial outliers).
+          2. Computing the Euclidean distance of every coordinate to that median.
+          3. Keeping only points whose distance is <= the 75th-percentile distance
+             (inner 75 % of the distribution). This isolates the dense 'center area'
+             and discards rogue same-name duplicates from other cities/regions.
+
+        Returns the filtered list. If filtering would leave fewer than 2 points, the
+        original list is returned unchanged (degenerate dataset — cannot be trimmed).
+        """
+        import numpy as np
+
+        if len(coords) < 4:
+            logger.info(
+                "Spatial median filter: only %d point(s) — skipping outlier rejection",
+                len(coords),
+            )
+            return coords
+
+        arr = np.array(coords, dtype=float)
+
+        # Spatial median: median on each axis independently
+        med_e = float(np.median(arr[:, 0]))
+        med_n = float(np.median(arr[:, 1]))
+        logger.info(
+            "Spatial median: E=%.1f  N=%.1f  (computed from %d candidates)",
+            med_e, med_n, len(coords),
+        )
+
+        # Euclidean distances to the median
+        dists = np.sqrt((arr[:, 0] - med_e) ** 2 + (arr[:, 1] - med_n) ** 2)
+
+        # 75th-percentile cutoff — keeps the inner dense cluster
+        p75 = float(np.percentile(dists, 75))
+        logger.info(
+            "Distance distribution: min=%.1f  median=%.1f  p75=%.1f  max=%.1f",
+            float(dists.min()), float(np.median(dists)), p75, float(dists.max()),
+        )
+
+        mask = dists <= p75
+        filtered = arr[mask].tolist()
+        n_dropped = int((~mask).sum())
+
+        if len(filtered) < 2:
+            logger.warning(
+                "Spatial median filter: would retain only %d point(s) after "
+                "p75 cut — returning all %d points unfiltered",
+                len(filtered), len(coords),
+            )
+            return coords
+
+        logger.info(
+            "Spatial median filter: retained %d / %d points "
+            "(dropped %d outlier(s) beyond p75=%.1f m)",
+            len(filtered), len(coords), n_dropped, p75,
+        )
+        return [(float(r[0]), float(r[1])) for r in filtered]
+
+    def _kmeans1_centroid(self, coords: List[Tuple[float, float]]) -> Tuple[float, float]:
+        """
+        Steps 2–3 of the Spatial Median + k=1 pipeline.
+
+        1. Calls _spatial_median_filter() to reject outliers (inner-75% retention).
+        2. Whitens the filtered coordinates with scipy.cluster.vq.whiten so Easting
+           and Northing contribute equally to the distance metric.
+        3. Runs scipy.cluster.vq.kmeans(whitened, 1) — strictly k=1 as specified.
+        4. De-whitens to restore true ITM 2005 scale.
 
         Falls back to plain mean when:
-          - fewer than 3 points (not enough for k=2)
+          - fewer than 2 points after filtering
           - scipy is unavailable
 
-        Axes are whitened before clustering so Easting and Northing contribute
-        equally to the distance metric.
+        Returns:
+            (Easting, Northing) of the k=1 centroid in ITM 2005 metres.
         """
-        if len(coords) < 3:
-            return (sum(c[0] for c in coords) / len(coords),
-                    sum(c[1] for c in coords) / len(coords))
+        if not coords:
+            return 0.0, 0.0
+
+        if len(coords) == 1:
+            return coords[0]
+
+        # Step 2: outlier rejection via spatial median filter
+        core = self._spatial_median_filter(coords)
 
         try:
             import numpy as np
-            from scipy.cluster.vq import kmeans2
+            from scipy.cluster.vq import whiten, kmeans
 
-            arr = np.array(coords, dtype=float)
+            arr = np.array(core, dtype=float)
+
+            # Guard: degenerate axis (all values identical) → whiten divides by 0
             std = arr.std(axis=0)
-            std[std == 0] = 1.0      # guard: degenerate axis (all values identical)
-            whitened = arr / std
+            if std[0] == 0.0 or std[1] == 0.0:
+                cx = float(arr[:, 0].mean())
+                cy = float(arr[:, 1].mean())
+                logger.info(
+                    "k=1 centroid (degenerate axis, plain mean, %d core points): "
+                    "E=%.1f  N=%.1f",
+                    len(core), cx, cy,
+                )
+                return cx, cy
 
-            centroids_w, labels = kmeans2(whitened, 2, iter=20, minit='points')
+            # Step 3: whiten → kmeans k=1 → de-whiten
+            whitened = whiten(arr)          # divides each column by its std
+            centroid_w, distortion = kmeans(whitened, 1)
 
-            count0 = int((labels == 0).sum())
-            count1 = int((labels == 1).sum())
-            winner_label = 0 if count0 >= count1 else 1
-
-            # De-whiten: multiply back by std to return to original ITM 2005 scale
-            cx = float(centroids_w[winner_label][0] * std[0])
-            cy = float(centroids_w[winner_label][1] * std[1])
+            cx = float(centroid_w[0][0] * std[0])
+            cy = float(centroid_w[0][1] * std[1])
 
             logger.info(
-                "K-Means centroid (k=2, larger cluster=%d, size=%d/%d total=%d): "
-                "E=%.1f N=%.1f",
-                winner_label, max(count0, count1), min(count0, count1),
-                len(coords), cx, cy
+                "k=1 centroid (Spatial Median + K-Means k=1, "
+                "%d core / %d total candidates, distortion=%.2f): "
+                "E=%.1f  N=%.1f",
+                len(core), len(coords), float(distortion), cx, cy,
             )
             return cx, cy
 
         except Exception as exc:
-            logger.warning("scipy kmeans2 failed (%s) — falling back to plain mean", exc)
-            return (sum(c[0] for c in coords) / len(coords),
-                    sum(c[1] for c in coords) / len(coords))
+            logger.warning(
+                "scipy kmeans k=1 failed (%s) — falling back to plain mean "
+                "of %d core points",
+                exc, len(core),
+            )
+            cx = sum(c[0] for c in core) / len(core)
+            cy = sum(c[1] for c in core) / len(core)
+            return cx, cy
 
 
 # ---------------------------------------------------------------------------
