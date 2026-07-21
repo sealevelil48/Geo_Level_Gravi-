@@ -26,6 +26,49 @@ from typing import Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# QGIS log bridge — routes INFO/WARNING from this module to the QGIS Log
+# Messages panel so engineers can read spatial-median and centroid messages
+# without opening a terminal.  Installed lazily on first import inside QGIS;
+# silently skipped when the module is used outside QGIS (tests, CLI).
+# ---------------------------------------------------------------------------
+
+class _QgsLogHandler(logging.Handler):
+    """
+    Forwards Python logging records to QgsMessageLog.
+
+    Level mapping:
+        WARNING / ERROR / CRITICAL  →  Qgis.Warning
+        INFO                        →  Qgis.Info
+        DEBUG                       →  silently dropped (too noisy for panel)
+    """
+    TAG = "Geo Level Gravi"
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            from qgis.core import QgsMessageLog, Qgis
+            msg = self.format(record)
+            if record.levelno >= logging.WARNING:
+                level = Qgis.Warning
+            else:
+                level = Qgis.Info
+            QgsMessageLog.logMessage(msg, self.TAG, level)
+        except Exception:
+            pass  # never crash the plugin just because logging failed
+
+
+def _install_qgs_log_handler() -> None:
+    """Attach the QGIS log handler to this module's logger (idempotent)."""
+    if any(isinstance(h, _QgsLogHandler) for h in logger.handlers):
+        return
+    handler = _QgsLogHandler()
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(funcName)s: %(message)s"))
+    logger.addHandler(handler)
+
+
+_install_qgs_log_handler()
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -257,6 +300,19 @@ class BenchmarkDBManager:
                 _SEED_LAYER_NAME, layer.featureCount(), candidate_fields_actual
             )
 
+            # Detect split-column fields present in this layer
+            all_raw_lower = set(lower_field_names)
+            has_mispar    = "mispar_nekuda"        in all_raw_lower
+            has_ot        = "ot_nekuda"            in all_raw_lower
+            has_mispar_k  = "mispar_nekuda_kfula"  in all_raw_lower
+            has_ot_k      = "ot_nekuda_kfula"      in all_raw_lower
+
+            if has_mispar and has_ot:
+                logger.info(
+                    "seed_from_qgis_layer: split-column fields detected "
+                    "(mispar_nekuda + ot_nekuda) — will concatenate for matching"
+                )
+
             already_seeded: set = set()  # avoid double-counting same feature
 
             for feature in layer.getFeatures():
@@ -265,6 +321,8 @@ class BenchmarkDBManager:
                     continue
 
                 matched_key = None
+
+                # --- Strategy A: single-field match (name, point_id, etc.) ---
                 for field in candidate_fields_actual:
                     try:
                         raw_val = feature[field]
@@ -276,6 +334,50 @@ class BenchmarkDBManager:
                     if norm_val in norm_names:
                         matched_key = str(raw_val).strip().upper()
                         break
+
+                # --- Strategy B: split-column concatenation ---
+                # Handles DB layers where benchmark name is stored in two
+                # columns: mispar_nekuda (number) and ot_nekuda (letter code).
+                # Tries all four canonical join forms:
+                #   "3349MPI", "3349/MPI", "MPI3349", "MPI/3349"
+                if matched_key is None and has_mispar and has_ot:
+                    try:
+                        m_val = feature["mispar_nekuda"]
+                        o_val = feature["ot_nekuda"]
+                        if m_val is not None and o_val is not None:
+                            m_str = str(m_val).strip()
+                            o_str = str(o_val).strip()
+                            for candidate in (
+                                m_str + o_str,
+                                m_str + "/" + o_str,
+                                o_str + m_str,
+                                o_str + "/" + m_str,
+                            ):
+                                if self._normalise_name(candidate) in norm_names:
+                                    matched_key = candidate.upper()
+                                    break
+                    except Exception:
+                        pass
+
+                # --- Strategy C: _kfula split-column concatenation ---
+                if matched_key is None and has_mispar_k and has_ot_k:
+                    try:
+                        mk_val = feature["mispar_nekuda_kfula"]
+                        ok_val = feature["ot_nekuda_kfula"]
+                        if mk_val is not None and ok_val is not None:
+                            mk_str = str(mk_val).strip()
+                            ok_str = str(ok_val).strip()
+                            for candidate in (
+                                mk_str + ok_str,
+                                mk_str + "/" + ok_str,
+                                ok_str + mk_str,
+                                ok_str + "/" + mk_str,
+                            ):
+                                if self._normalise_name(candidate) in norm_names:
+                                    matched_key = candidate.upper()
+                                    break
+                    except Exception:
+                        pass
 
                 if matched_key is None:
                     continue

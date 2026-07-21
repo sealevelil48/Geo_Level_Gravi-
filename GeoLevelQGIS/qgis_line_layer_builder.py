@@ -176,45 +176,58 @@ class QGISLineLayerBuilder:
             start_rec = db_manager.resolve_benchmark(start_id)
             end_rec   = db_manager.resolve_benchmark(end_id)
 
-            if start_rec is None:
+            # Extract coordinates (BenchmarkRecord.x = Easting, .y = Northing)
+            def _coords(rec, label):
+                """Return (E, N) or None if unavailable."""
+                if rec is None:
+                    logger.warning(
+                        "Row %d: resolve_benchmark('%s') returned None "
+                        "(not in DB) — will attempt coordinate inheritance",
+                        idx, label,
+                    )
+                    return None
+                if rec.x is None or rec.y is None:
+                    logger.warning(
+                        "Row %d: benchmark '%s' resolved but has no coordinates "
+                        "(x=%s, y=%s) — will attempt coordinate inheritance",
+                        idx, label, rec.x, rec.y,
+                    )
+                    return None
+                return (rec.x, rec.y)
+
+            start_xy = _coords(start_rec, start_id)
+            end_xy   = _coords(end_rec,   end_id)
+
+            if start_xy is None and end_xy is None:
+                # Both endpoints unresolvable — no safe location to anchor to
                 logger.warning(
-                    "Row %d: resolve_benchmark('%s') returned None "
-                    "(not found in DB) — skipping line feature",
-                    idx, start_id,
+                    "Row %d: both '%s' and '%s' unresolvable — skipping feature",
+                    idx, start_id, end_id,
                 )
                 n_skipped += 1
                 continue
 
-            if end_rec is None:
+            # Inherit: if one endpoint is an intermediate/new point (e.g. PKT1)
+            # with no DB coordinates, collapse it to the known neighbour so the
+            # visual line stays within the project area instead of flying to Egypt.
+            if start_xy is None:
                 logger.warning(
-                    "Row %d: resolve_benchmark('%s') returned None "
-                    "(not found in DB) — skipping line feature",
-                    idx, end_id,
+                    "Row %d: '%s' has no coords — inheriting from known end '%s' "
+                    "(E=%.1f N=%.1f); line will render as zero-length point marker",
+                    idx, start_id, end_id, end_xy[0], end_xy[1],
                 )
-                n_skipped += 1
-                continue
-
-            if start_rec.x is None or start_rec.y is None:
+                start_xy = end_xy
+            elif end_xy is None:
                 logger.warning(
-                    "Row %d: benchmark '%s' resolved but has no coordinates "
-                    "(x=%s, y=%s) — skipping line feature",
-                    idx, start_id, start_rec.x, start_rec.y,
+                    "Row %d: '%s' has no coords — inheriting from known start '%s' "
+                    "(E=%.1f N=%.1f); line will render as zero-length point marker",
+                    idx, end_id, start_id, start_xy[0], start_xy[1],
                 )
-                n_skipped += 1
-                continue
-
-            if end_rec.x is None or end_rec.y is None:
-                logger.warning(
-                    "Row %d: benchmark '%s' resolved but has no coordinates "
-                    "(x=%s, y=%s) — skipping line feature",
-                    idx, end_id, end_rec.x, end_rec.y,
-                )
-                n_skipped += 1
-                continue
+                end_xy = start_xy
 
             # BenchmarkRecord.x = Easting, .y = Northing (EPSG:2039)
-            start_pt = QgsPointXY(start_rec.x, start_rec.y)
-            end_pt   = QgsPointXY(end_rec.x,   end_rec.y)
+            start_pt = QgsPointXY(start_xy[0], start_xy[1])
+            end_pt   = QgsPointXY(end_xy[0],   end_xy[1])
             geom     = QgsGeometry.fromPolylineXY([start_pt, end_pt])
 
             # Safe numeric extraction — no pandas, plain Python
@@ -237,8 +250,8 @@ class QGISLineLayerBuilder:
             logger.debug(
                 "Row %d: '%s' (E=%.1f N=%.1f) → '%s' (E=%.1f N=%.1f)",
                 idx,
-                start_id, start_rec.x, start_rec.y,
-                end_id,   end_rec.x,   end_rec.y,
+                start_id, start_xy[0], start_xy[1],
+                end_id,   end_xy[0],   end_xy[1],
             )
 
         provider.addFeatures(features)
