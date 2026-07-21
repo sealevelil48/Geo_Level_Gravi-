@@ -87,11 +87,25 @@ def process_geodetic_data(
     # ------------------------------------------------------------------ #
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    output_files = export_network_to_geojson(
-        lines,
-        output_dir,
-        project_name="geo_level_result",
-    )
+    try:
+        output_files = export_network_to_geojson(
+            lines,
+            output_dir,
+            project_name="geo_level_result",
+        )
+    except PermissionError as exc:
+        log.error(
+            "GeoJSON export blocked — file is locked or permissions denied "
+            "(%s). The QGIS line layer will be built directly from DB "
+            "coordinates without a GeoJSON fallback.", exc
+        )
+        output_files = {"lines_geojson": "", "line_style": "", "point_style": ""}
+    except OSError as exc:
+        log.error(
+            "GeoJSON export failed with IO error (%s). "
+            "Continuing without GeoJSON output.", exc
+        )
+        output_files = {"lines_geojson": "", "line_style": "", "point_style": ""}
 
     # ------------------------------------------------------------------ #
     # 4. Export REZ summary file (same as standalone CLI "export" command)

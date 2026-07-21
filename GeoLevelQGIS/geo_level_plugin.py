@@ -506,9 +506,18 @@ class GeoLevelPlugin:
                 "GeoLevelPlugin", level=Qgis.Warning,
             )
 
-        # Fallback: load the GeoJSON written by the exporter
+        # Fallback: load the GeoJSON written by the exporter.
+        # Skip gracefully if the export was blocked by a PermissionError
+        # (geojson_path will be "" in that case).
         if layer is None:
-            self._load_layer(geojson_path, qml_path)
+            if geojson_path:
+                self._load_layer(geojson_path, qml_path)
+            else:
+                QgsMessageLog.logMessage(
+                    "GeoJSON path is empty (export was blocked) and DB layer "
+                    "could not be built — no line layer added to project.",
+                    "GeoLevelPlugin", level=Qgis.Warning,
+                )
             return
 
         QgsProject.instance().addMapLayer(layer)
