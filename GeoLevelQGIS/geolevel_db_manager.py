@@ -93,7 +93,10 @@ class BenchmarkRecord:
 # SQL templates
 # ---------------------------------------------------------------------------
 
-# Per-point query — 6 name-format variants, all case/space insensitive
+# Per-point query — 6 name-format variants, all case/space insensitive.
+# Coordinates come from the PostGIS geometry column (geom_full, EPSG:2039)
+# via ST_X / ST_Y so we always get true ITM 2005 metres regardless of whether
+# the raw x/y columns contain WGS84 degrees or ITM metres.
 _SQL_TEMPLATE = """
 SELECT
     ot_nekuda,
@@ -104,8 +107,8 @@ SELECT
     taarih_gova_ort,
     ot_nekuda_kfula,
     mispar_nekuda_kfula,
-    x,
-    y
+    ST_X(geom_full) AS x,
+    ST_Y(geom_full) AS y
 FROM {table}
 WHERE
     UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || '/' || ot_nekuda)) = UPPER(TRIM(%s))
@@ -118,13 +121,13 @@ WHERE
      UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || ot_nekuda_kfula))        = UPPER(TRIM(%s)))
 """
 
-# Batch query — fetches (x, y) for ALL DAT point names in one round-trip.
-# Used by the global-pool centroid fallback when layer seeding yields 0 points.
-# Each %s is bound to a Python list of uppercase point-name strings via psycopg2.
+# Batch query — fetches ITM 2005 coordinates for ALL DAT point names in one
+# round-trip. Uses ST_X/ST_Y(geom_full) so coordinates are always EPSG:2039
+# metres regardless of the raw x/y column values in the table.
 _SQL_BATCH_COORDS = """
-SELECT x, y
+SELECT ST_X(geom_full) AS x, ST_Y(geom_full) AS y
 FROM {table}
-WHERE x IS NOT NULL AND y IS NOT NULL
+WHERE geom_full IS NOT NULL
   AND (
     UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || '/' || ot_nekuda)) = ANY(%s)
  OR UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || ot_nekuda))        = ANY(%s)
@@ -464,13 +467,13 @@ class BenchmarkDBManager:
             self._global_pool_centroid = (0.0, 0.0)
             return self._global_pool_centroid
 
-        # Apply coordinate swap: DB x = Northing, DB y = Easting
+        # ST_X(geom_full) → Easting, ST_Y(geom_full) → Northing (EPSG:2039)
         coords = []
         for db_x, db_y in rows:
             if db_x is None or db_y is None:
                 continue
-            easting  = float(db_y)   # DB y → Easting
-            northing = float(db_x)   # DB x → Northing
+            easting  = float(db_x)   # ST_X → Easting
+            northing = float(db_y)   # ST_Y → Northing
             if easting != 0.0 or northing != 0.0:
                 coords.append((easting, northing))
 
@@ -630,13 +633,11 @@ class BenchmarkDBManager:
              ot_nekuda_kfula, mispar_nekuda_kfula,
              db_x, db_y) = row
 
-            # *** COORDINATE SWAP ***
-            # In the Survey of Israel DB:
-            #   column x → Northing (ITM Y-axis)
-            #   column y → Easting  (ITM X-axis)
-            # BenchmarkRecord.x stores Easting, .y stores Northing (standard GIS).
-            easting  = float(db_y) if db_y is not None else None
-            northing = float(db_x) if db_x is not None else None
+            # ST_X(geom_full) → Easting  (EPSG:2039 X-axis, ITM)
+            # ST_Y(geom_full) → Northing (EPSG:2039 Y-axis, ITM)
+            # No column swap needed — PostGIS ST_X/ST_Y respect the CRS axes.
+            easting  = float(db_x) if db_x is not None else None
+            northing = float(db_y) if db_y is not None else None
 
             results.append(BenchmarkRecord(
                 ot_nekuda=ot_nekuda or "",

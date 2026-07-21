@@ -414,7 +414,7 @@ class GeoLevelPlugin:
         except Exception:
             self._val_results = result.get("val_results", [])
 
-        self._load_layer(result["lines_geojson"], result["line_style"])
+        self._load_line_layer(result["lines_geojson"], result["line_style"], new_lines)
         self._show_dock()
         self.dock.load_lines(self._lines, self._val_results)
 
@@ -439,6 +439,81 @@ class GeoLevelPlugin:
             layer.loadNamedStyle(qml_path)
         QgsProject.instance().addMapLayer(layer)
         self._layer = layer
+
+    def _load_line_layer(self, geojson_path: str, qml_path: str,
+                         lines) -> None:
+        """
+        Add a line layer to the QGIS project.
+
+        Preferred path: QGISLineLayerBuilder — resolves each benchmark
+        via BenchmarkDBManager (ST_X/ST_Y geometry, Spatial Median + k=1
+        centroid) so coordinates are guaranteed EPSG:2039 ITM 2005 metres.
+
+        Fallback path: GeoJSON OGR layer (schematic coordinates) used when:
+          - DB is not configured
+          - Builder raises an exception
+          - Builder returns None or a layer with 0 features
+        """
+        layer = None
+
+        try:
+            from geolevel_db_manager import get_db_manager
+            from qgis_line_layer_builder import QGISLineLayerBuilder
+
+            db_mgr = get_db_manager()
+            if db_mgr.is_configured():
+                # Convert LevelingLine objects to the List[dict] the builder expects
+                rows = [
+                    {
+                        "start_point":      ln.filename and ln.start_point or ln.start_point,
+                        "end_point":        ln.end_point,
+                        "filename":         ln.filename,
+                        "total_distance":   getattr(ln, "total_distance", None),
+                        "total_height_diff": getattr(ln, "total_height_diff", None),
+                        "status":           ln.status.value
+                                            if hasattr(ln.status, "value")
+                                            else str(ln.status),
+                    }
+                    for ln in lines
+                    if ln.start_point and ln.end_point
+                ]
+
+                builder = QGISLineLayerBuilder(layer_name="Geodetic Results")
+                built = builder.process_line_features(rows, crs="EPSG:2039")
+
+                if built is not None and built.isValid() and built.featureCount() > 0:
+                    QgsMessageLog.logMessage(
+                        f"QGISLineLayerBuilder: added {built.featureCount()} "
+                        f"feature(s) (DB-resolved EPSG:2039 coordinates)",
+                        "GeoLevelPlugin", level=Qgis.Info,
+                    )
+                    layer = built
+                else:
+                    QgsMessageLog.logMessage(
+                        "QGISLineLayerBuilder returned empty layer — "
+                        "falling back to GeoJSON renderer",
+                        "GeoLevelPlugin", level=Qgis.Warning,
+                    )
+            else:
+                QgsMessageLog.logMessage(
+                    "DB not configured — using GeoJSON renderer for line layer",
+                    "GeoLevelPlugin", level=Qgis.Info,
+                )
+
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"QGISLineLayerBuilder failed ({exc}) — falling back to GeoJSON",
+                "GeoLevelPlugin", level=Qgis.Warning,
+            )
+
+        # Fallback: load the GeoJSON written by the exporter
+        if layer is None:
+            self._load_layer(geojson_path, qml_path)
+            return
+
+        QgsProject.instance().addMapLayer(layer)
+        self._layer = layer
+        self._prepare_layer_signals(layer)
 
     # ------------------------------------------------------------------
     # Dock ↔ map sync
