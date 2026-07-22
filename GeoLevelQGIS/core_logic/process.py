@@ -17,6 +17,101 @@ from typing import List, Dict
 log = logging.getLogger("GeoLevelGravi")
 
 
+def _build_coord_manager(lines, db_manager):
+    """
+    Query real ITM coordinates for every unique point in `lines` via the DB
+    manager, transform EPSG:2039 → EPSG:4326, and return a pre-populated
+    CoordinateManager ready to pass to GeoJSONExporter.
+
+    Falls back gracefully (returns empty CoordinateManager) when:
+      - DB manager is not configured
+      - PyQGIS is unavailable (standalone / unit-test context)
+      - A point is not found in the DB
+
+    CRS note: EPSG:2039 (ITM 2005) → EPSG:4326 (WGS84).
+    Boss's WKT2 confirms the exact Inverse TM parameters
+    (false easting 219529.584 m, false northing 626907.39 m, scale 1.0000067,
+    origin 31.7343936°N / 35.2045169°E). QGIS resolves these from the EPSG
+    code automatically — no need to embed the WKT2 string in code.
+    """
+    from core_logic.gis.geojson_export import CoordinateManager
+
+    cm = CoordinateManager()
+
+    if not db_manager.is_configured():
+        log.warning(
+            "_build_coord_manager: DB not configured — "
+            "GeoJSON will use schematic coords"
+        )
+        return cm
+
+    try:
+        from qgis.core import (
+            QgsCoordinateReferenceSystem,
+            QgsCoordinateTransform,
+            QgsPointXY,
+            QgsProject,
+        )
+    except ImportError:
+        log.warning(
+            "_build_coord_manager: PyQGIS not available — "
+            "GeoJSON will use schematic coords"
+        )
+        return cm
+
+    # Collect unique point IDs across all lines
+    unique_ids = set()
+    for line in lines:
+        if line.start_point:
+            unique_ids.add(line.start_point)
+        if line.end_point:
+            unique_ids.add(line.end_point)
+
+    if not unique_ids:
+        return cm
+
+    # Seed centroid pool so resolve_benchmark() can disambiguate geographically
+    db_manager.seed_from_qgis_layer(list(unique_ids))
+
+    # EPSG:2039 (ITM 2005) → EPSG:4326 (WGS84)
+    crs_itm   = QgsCoordinateReferenceSystem("EPSG:2039")
+    crs_wgs   = QgsCoordinateReferenceSystem("EPSG:4326")
+    transform = QgsCoordinateTransform(crs_itm, crs_wgs, QgsProject.instance())
+
+    n_ok   = 0
+    n_miss = 0
+
+    for pid in unique_ids:
+        record = db_manager.resolve_benchmark(pid)
+        if record is None or record.x is None or record.y is None:
+            log.warning("_build_coord_manager: no coordinates for point '%s'", pid)
+            n_miss += 1
+            continue
+
+        try:
+            # record.x = Easting (ITM), record.y = Northing (ITM)
+            pt_itm = QgsPointXY(float(record.x), float(record.y))
+            pt_wgs = transform.transform(pt_itm)
+            # EPSG:4326: QgsPointXY.x() → Longitude, .y() → Latitude
+            lon    = round(pt_wgs.x(), 8)
+            lat    = round(pt_wgs.y(), 8)
+            height = float(record.gova_ort) if record.gova_ort is not None else 0.0
+            cm.add_point(pid, lon, lat, height)
+            n_ok += 1
+        except Exception as exc:
+            log.warning(
+                "_build_coord_manager: transform failed for '%s': %s", pid, exc
+            )
+            n_miss += 1
+
+    log.info(
+        "_build_coord_manager: resolved %d / %d points to WGS84 "
+        "(%d not in DB / no geometry)",
+        n_ok, len(unique_ids), n_miss,
+    )
+    return cm
+
+
 def process_geodetic_data(
     file_paths: List[str],
     leveling_class: str,
@@ -87,11 +182,15 @@ def process_geodetic_data(
     # ------------------------------------------------------------------ #
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    from geolevel_db_manager import get_db_manager
+    coord_manager = _build_coord_manager(lines, get_db_manager())
+
     try:
         output_files = export_network_to_geojson(
             lines,
             output_dir,
             project_name="geo_level_result",
+            coord_manager=coord_manager,
         )
     except PermissionError as exc:
         log.error(

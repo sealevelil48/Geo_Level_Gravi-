@@ -351,24 +351,28 @@ class QGISStyleGenerator:
             f.write(qml_content)
 
 
-def export_network_to_geojson(lines: List[LevelingLine], 
+def export_network_to_geojson(lines: List[LevelingLine],
                                output_folder: str,
-                               project_name: str = "leveling_network") -> Dict[str, str]:
+                               project_name: str = "leveling_network",
+                               coord_manager=None) -> Dict[str, str]:
     """
     Convenience function to export a complete network to GeoJSON files.
-    
+
     Args:
         lines: List of LevelingLine objects
         output_folder: Output folder path
         project_name: Base name for output files
-        
+        coord_manager: Optional pre-populated CoordinateManager with real
+                       WGS84 coordinates. When None, schematic coords are
+                       generated automatically.
+
     Returns:
         Dictionary of output file paths
     """
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    exporter = GeoJSONExporter()
+
+    exporter = GeoJSONExporter(coord_manager=coord_manager)
     
     # Export lines and points
     lines_file = output_path / f"{project_name}_lines.geojson"

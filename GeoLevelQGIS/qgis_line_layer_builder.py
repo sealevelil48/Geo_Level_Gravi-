@@ -8,11 +8,15 @@ geolevel_db_manager.resolve_benchmark(), which applies:
   - _normalise_name()       — strips punctuation, uppercases (fixes 3349MPI vs 3349/MPI)
   - _resolve_by_proximity() — Spatial Median + K-Means k=1 centroid (fixes geographic dupes)
 
+Unknown points (e.g. PKT1, PKT2) that are not in the DB are handled via a
+topological estimation pass: their position is inferred from the measured
+total_distance of connected lines and the known coordinates of their neighbours.
+
 No pandas dependency — input is a plain Python List[dict].
 """
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +27,12 @@ class QGISLineLayerBuilder:
 
     All coordinate resolution is delegated to BenchmarkDBManager.
     No spatial_cache dict. No local name matching. No pandas.
+
+    Three-pass pipeline:
+      Pass 1 — Base Resolution   : resolve all point IDs via DB manager.
+      Pass 2 — Topo Estimation   : estimate unknown (PKT) points from their
+                                   known neighbours and measured distances.
+      Pass 3 — Feature Construction: build QgsFeature objects from resolved_coords.
 
     Input: List[dict] — each dict is one leveling line.
 
@@ -36,7 +46,7 @@ class QGISLineLayerBuilder:
     Usage:
         from qgis_line_layer_builder import QGISLineLayerBuilder
         lines = [
-            {"start_point": "3349/MPI", "end_point": "3350/MPI",
+            {"start_point": "3349/MPI", "end_point": "PKT1",
              "filename": "run1.DAT", "total_distance": 1.5,
              "total_height_diff": 0.012, "status": "VALID"},
         ]
@@ -67,8 +77,9 @@ class QGISLineLayerBuilder:
           1. Collect all unique point IDs and call seed_from_qgis_layer() so
              the manager can build its global centroid pool in one batch query.
           2. Create a memory LineString layer with the target CRS.
-          3. For each dict, resolve start/end coordinates via
-             resolve_benchmark() and build QgsFeature geometry.
+          3. Pass 1 — resolve all IDs via DB manager into resolved_coords.
+          4. Pass 2 — topologically estimate any IDs that returned None.
+          5. Pass 3 — build QgsFeature objects from resolved_coords.
 
         Returns:
             QgsVectorLayer on success, None if QGIS API is unavailable or
@@ -103,10 +114,7 @@ class QGISLineLayerBuilder:
             )
 
         # ------------------------------------------------------------------ #
-        # Step 1 — Global seeding                                              #
-        # Collect every unique identifier in the list and hand them to         #
-        # seed_from_qgis_layer() so the manager can build its centroid pool.   #
-        # This fires at most ONE batch SQL query (cached after first call).     #
+        # Global seeding — fire ONE batch SQL query for the centroid pool      #
         # ------------------------------------------------------------------ #
         raw_ids: List[str] = []
         for row in lines:
@@ -129,7 +137,7 @@ class QGISLineLayerBuilder:
         )
 
         # ------------------------------------------------------------------ #
-        # Step 2 — Create memory layer                                         #
+        # Create memory layer                                                  #
         # ------------------------------------------------------------------ #
         uri = f"LineString?crs={crs}"
         layer = QgsVectorLayer(uri, self.layer_name, "memory")
@@ -156,11 +164,94 @@ class QGISLineLayerBuilder:
         )
 
         # ------------------------------------------------------------------ #
-        # Step 3 — Resolve coordinates and build QgsFeature objects            #
+        # Pass 1 — Base Resolution                                             #
+        # Try to resolve every unique point ID via the DB manager.             #
+        # resolved_coords: pid -> (Easting, Northing) in EPSG:2039             #
         # ------------------------------------------------------------------ #
-        features = []
-        n_resolved = 0
-        n_skipped  = 0
+        resolved_coords: Dict[str, Tuple[float, float]] = {}
+        unknown_ids: List[str] = []
+
+        for pid in unique_ids:
+            rec = db_manager.resolve_benchmark(pid)
+            if rec is not None and rec.x is not None and rec.y is not None:
+                resolved_coords[pid] = (float(rec.x), float(rec.y))
+            else:
+                unknown_ids.append(pid)
+
+        logger.info(
+            "QGISLineLayerBuilder: Pass 1 — resolved %d / %d points; "
+            "%d unknown (will attempt topological estimation): %s",
+            len(resolved_coords), len(unique_ids), len(unknown_ids),
+            unknown_ids or "none",
+        )
+
+        # ------------------------------------------------------------------ #
+        # Pass 2 — Topological Estimation for unknown points (PKT etc.)        #
+        #                                                                      #
+        # For each unknown point ID, find every line that connects to it and   #
+        # collect the coordinates of its known neighbours.                     #
+        #                                                                      #
+        # Two-neighbour case (most common):                                    #
+        #   Estimated position = arithmetic mean of all known-neighbour coords  #
+        #   → places the PKT midway between its flanking benchmarks            #
+        #                                                                      #
+        # One-neighbour case (end-of-run):                                     #
+        #   Apply a visual offset of total_distance metres along the +X axis   #
+        #   so the line is drawn with non-zero length                          #
+        # ------------------------------------------------------------------ #
+        for unknown_id in unknown_ids:
+            neighbour_xys: List[Tuple[float, float]] = []
+            single_distance: Optional[float] = None
+
+            for row in lines:
+                s_id = str(row.get("start_point") or "").strip()
+                e_id = str(row.get("end_point")   or "").strip()
+
+                if s_id == unknown_id and e_id in resolved_coords:
+                    neighbour_xys.append(resolved_coords[e_id])
+                    single_distance = single_distance or row.get("total_distance")
+                elif e_id == unknown_id and s_id in resolved_coords:
+                    neighbour_xys.append(resolved_coords[s_id])
+                    single_distance = single_distance or row.get("total_distance")
+
+            if not neighbour_xys:
+                logger.warning(
+                    "QGISLineLayerBuilder: Pass 2 — '%s' has no known neighbours; "
+                    "cannot estimate position — this point will be skipped in Pass 3",
+                    unknown_id,
+                )
+                continue
+
+            if len(neighbour_xys) >= 2:
+                # Mean of all known neighbours
+                est_e = sum(xy[0] for xy in neighbour_xys) / len(neighbour_xys)
+                est_n = sum(xy[1] for xy in neighbour_xys) / len(neighbour_xys)
+                logger.info(
+                    "QGISLineLayerBuilder: Pass 2 — '%s' estimated from %d neighbours "
+                    "(mean centroid): E=%.1f N=%.1f",
+                    unknown_id, len(neighbour_xys), est_e, est_n,
+                )
+            else:
+                # Single neighbour — apply offset by measured distance along +X
+                known_e, known_n = neighbour_xys[0]
+                offset = float(single_distance) if single_distance else 100.0
+                est_e = known_e + offset
+                est_n = known_n
+                logger.info(
+                    "QGISLineLayerBuilder: Pass 2 — '%s' estimated from single "
+                    "neighbour with +X offset (dist=%.1f m): E=%.1f N=%.1f",
+                    unknown_id, offset, est_e, est_n,
+                )
+
+            resolved_coords[unknown_id] = (est_e, est_n)
+
+        # ------------------------------------------------------------------ #
+        # Pass 3 — Feature Construction                                        #
+        # Look up every start/end from resolved_coords (both DB and estimated).#
+        # ------------------------------------------------------------------ #
+        features  = []
+        n_built   = 0
+        n_skipped = 0
 
         for idx, row in enumerate(lines):
             start_id = str(row.get("start_point") or "").strip()
@@ -173,33 +264,10 @@ class QGISLineLayerBuilder:
                 n_skipped += 1
                 continue
 
-            start_rec = db_manager.resolve_benchmark(start_id)
-            end_rec   = db_manager.resolve_benchmark(end_id)
-
-            # Extract coordinates (BenchmarkRecord.x = Easting, .y = Northing)
-            def _coords(rec, label):
-                """Return (E, N) or None if unavailable."""
-                if rec is None:
-                    logger.warning(
-                        "Row %d: resolve_benchmark('%s') returned None "
-                        "(not in DB) — will attempt coordinate inheritance",
-                        idx, label,
-                    )
-                    return None
-                if rec.x is None or rec.y is None:
-                    logger.warning(
-                        "Row %d: benchmark '%s' resolved but has no coordinates "
-                        "(x=%s, y=%s) — will attempt coordinate inheritance",
-                        idx, label, rec.x, rec.y,
-                    )
-                    return None
-                return (rec.x, rec.y)
-
-            start_xy = _coords(start_rec, start_id)
-            end_xy   = _coords(end_rec,   end_id)
+            start_xy = resolved_coords.get(start_id)
+            end_xy   = resolved_coords.get(end_id)
 
             if start_xy is None and end_xy is None:
-                # Both endpoints unresolvable — no safe location to anchor to
                 logger.warning(
                     "Row %d: both '%s' and '%s' unresolvable — skipping feature",
                     idx, start_id, end_id,
@@ -207,32 +275,28 @@ class QGISLineLayerBuilder:
                 n_skipped += 1
                 continue
 
-            # Inherit: if one endpoint is an intermediate/new point (e.g. PKT1)
-            # with no DB coordinates, collapse it to the known neighbour so the
-            # visual line stays within the project area instead of flying to Egypt.
+            # Last-resort collapse: one endpoint still unknown after Pass 2
             if start_xy is None:
                 logger.warning(
-                    "Row %d: '%s' has no coords — inheriting from known end '%s' "
-                    "(E=%.1f N=%.1f); line will render as zero-length point marker",
+                    "Row %d: '%s' still unresolved after estimation — "
+                    "collapsing to known end '%s' (E=%.1f N=%.1f)",
                     idx, start_id, end_id, end_xy[0], end_xy[1],
                 )
                 start_xy = end_xy
             elif end_xy is None:
                 logger.warning(
-                    "Row %d: '%s' has no coords — inheriting from known start '%s' "
-                    "(E=%.1f N=%.1f); line will render as zero-length point marker",
+                    "Row %d: '%s' still unresolved after estimation — "
+                    "collapsing to known start '%s' (E=%.1f N=%.1f)",
                     idx, end_id, start_id, start_xy[0], start_xy[1],
                 )
                 end_xy = start_xy
 
-            # BenchmarkRecord.x = Easting, .y = Northing (EPSG:2039)
             start_pt = QgsPointXY(start_xy[0], start_xy[1])
             end_pt   = QgsPointXY(end_xy[0],   end_xy[1])
             geom     = QgsGeometry.fromPolylineXY([start_pt, end_pt])
 
-            # Safe numeric extraction — no pandas, plain Python
-            raw_dist   = row.get("total_distance")
-            raw_hdiff  = row.get("total_height_diff")
+            raw_dist  = row.get("total_distance")
+            raw_hdiff = row.get("total_height_diff")
 
             feat = QgsFeature()
             feat.setGeometry(geom)
@@ -245,7 +309,7 @@ class QGISLineLayerBuilder:
                 str(row.get("status") or ""),
             ])
             features.append(feat)
-            n_resolved += 1
+            n_built += 1
 
             logger.debug(
                 "Row %d: '%s' (E=%.1f N=%.1f) → '%s' (E=%.1f N=%.1f)",
@@ -260,6 +324,6 @@ class QGISLineLayerBuilder:
         logger.info(
             "QGISLineLayerBuilder: layer '%s' complete — "
             "%d feature(s) built, %d row(s) skipped",
-            self.layer_name, n_resolved, n_skipped,
+            self.layer_name, n_built, n_skipped,
         )
         return layer
