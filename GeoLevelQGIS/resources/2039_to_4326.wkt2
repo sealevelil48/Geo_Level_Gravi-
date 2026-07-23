@@ -1,5 +1,4 @@
 COORDINATEOPERATION["EPSG:2039 to EPSG:4326 Pipeline",
-    ID["EPSG", 1073],
     SOURCECRS[
         PROJCRS["Israel 1993 / Israeli TM Grid",
             BASEGEOGCRS["Israel 1993",
