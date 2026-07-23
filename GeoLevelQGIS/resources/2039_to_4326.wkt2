@@ -1,0 +1,89 @@
+COORDINATEOPERATION["EPSG:2039 to EPSG:4326 Pipeline",
+    ID["EPSG", 1073],
+    SOURCECRS[
+        PROJCRS["Israel 1993 / Israeli TM Grid",
+            BASEGEOGCRS["Israel 1993",
+                DATUM["Israel 1993",
+                    ELLIPSOID["GRS 1980", 6378137.0, 298.257222101, LENGTHUNIT["metre", 1.0], ID["EPSG", 7019]],
+                    ID["EPSG", 6141]
+                ],
+                PRIMEM["Greenwich", 0.0, ANGLEUNIT["degree", 0.0174532925199433], ID["EPSG", 8901]],
+                ID["EPSG", 4141]
+            ],
+            CONVERSION["Israeli TM",
+                METHOD["Transverse Mercator", ID["EPSG", 9807]],
+                PARAMETER["Latitude of natural origin", 31.7343936111111, ANGLEUNIT["degree", 0.0174532925199433], ID["EPSG", 8801]],
+                PARAMETER["Longitude of natural origin", 35.2045169444444, ANGLEUNIT["degree", 0.0174532925199433], ID["EPSG", 8802]],
+                PARAMETER["Scale factor at natural origin", 1.0000067, SCALEUNIT["unity", 1.0], ID["EPSG", 8805]],
+                PARAMETER["False easting", 219529.584, LENGTHUNIT["metre", 1.0], ID["EPSG", 8806]],
+                PARAMETER["False northing", 626907.39, LENGTHUNIT["metre", 1.0], ID["EPSG", 8807]],
+                ID["EPSG", 16008]
+            ],
+            CS[Cartesian, 2],
+                AXIS["easting (X)", east, ORDER[1], LENGTHUNIT["metre", 1.0]],
+                AXIS["northing (Y)", north, ORDER[2], LENGTHUNIT["metre", 1.0]],
+            ID["EPSG", 2039]
+        ]
+    ],
+    TARGETCRS[
+        GEOGCRS["WGS 84",
+            DATUM["World Geodetic System 1984",
+                ELLIPSOID["WGS 84", 6378137.0, 298.257223563, LENGTHUNIT["metre", 1.0], ID["EPSG", 7030]],
+                ID["EPSG", 6326]
+            ],
+            PRIMEM["Greenwich", 0.0, ANGLEUNIT["degree", 0.0174532925199433], ID["EPSG", 8901]],
+            CS[ellipsoidal, 2],
+                AXIS["geodetic latitude (Lat)", north, ORDER[1], ANGLEUNIT["degree", 0.0174532925199433]],
+                AXIS["geodetic longitude (Lon)", east, ORDER[2], ANGLEUNIT["degree", 0.0174532925199433]],
+            ID["EPSG", 4326]
+        ]
+    ],
+    METHOD["Coordinate Pipeline", ID["EPSG", 1027]],
+
+    /* Step 1: Inverse Transverse Mercator (Projected ITM -> Geodetic Israel 1993 / GRS80) */
+    STEP[
+        CONVERSION["Inverse Israeli TM",
+            METHOD["Inverse Transverse Mercator", ID["EPSG", 9807]],
+            PARAMETER["Latitude of natural origin", 31.7343936111111, ANGLEUNIT["degree", 0.0174532925199433], ID["EPSG", 8801]],
+            PARAMETER["Longitude of natural origin", 35.2045169444444, ANGLEUNIT["degree", 0.0174532925199433], ID["EPSG", 8802]],
+            PARAMETER["Scale factor at natural origin", 1.0000067, SCALEUNIT["unity", 1.0], ID["EPSG", 8805]],
+            PARAMETER["False easting", 219529.584, LENGTHUNIT["metre", 1.0], ID["EPSG", 8806]],
+            PARAMETER["False northing", 626907.39, LENGTHUNIT["metre", 1.0], ID["EPSG", 8807]]
+        ]
+    ],
+
+    /* Step 2: 7-Parameter Bursa-Wolf Transformation (Israel 1993 / GRS80 -> WGS 84) */
+    STEP[
+        TRANSFORMATION["Israel 1993 to WGS 84 Transformation",
+            ID["EPSG", 1073],
+            SOURCECRS[
+                GEOGCRS["Israel 1993",
+                    DATUM["Israel 1993",
+                        ELLIPSOID["GRS 1980", 6378137.0, 298.257222101, LENGTHUNIT["metre", 1.0], ID["EPSG", 7019]],
+                        ID["EPSG", 6141]
+                    ],
+                    PRIMEM["Greenwich", 0.0, ANGLEUNIT["degree", 0.0174532925199433], ID["EPSG", 8901]],
+                    ID["EPSG", 4141]
+                ]
+            ],
+            TARGETCRS[
+                GEOGCRS["WGS 84",
+                    DATUM["World Geodetic System 1984",
+                        ELLIPSOID["WGS 84", 6378137.0, 298.257223563, LENGTHUNIT["metre", 1.0], ID["EPSG", 7030]],
+                        ID["EPSG", 6326]
+                    ],
+                    PRIMEM["Greenwich", 0.0, ANGLEUNIT["degree", 0.0174532925199433], ID["EPSG", 8901]],
+                    ID["EPSG", 4326]
+                ]
+            ],
+            METHOD["Coordinate Frame Rotation (geog2D domain)", ID["EPSG", 9607]],
+            PARAMETER["X-axis translation", -48.0, LENGTHUNIT["metre", 1.0], ID["EPSG", 8605]],
+            PARAMETER["Y-axis translation", 55.0, LENGTHUNIT["metre", 1.0], ID["EPSG", 8606]],
+            PARAMETER["Z-axis translation", 52.0, LENGTHUNIT["metre", 1.0], ID["EPSG", 8607]],
+            PARAMETER["X-axis rotation", 0.0, ANGLEUNIT["arc-second", 0.00000484813681109536], ID["EPSG", 8608]],
+            PARAMETER["Y-axis rotation", 0.0, ANGLEUNIT["arc-second", 0.00000484813681109536], ID["EPSG", 8609]],
+            PARAMETER["Z-axis rotation", 0.0, ANGLEUNIT["arc-second", 0.00000484813681109536], ID["EPSG", 8610]],
+            PARAMETER["Scale difference", 0.0, SCALEUNIT["parts per million", 0.000001], ID["EPSG", 8611]]
+        ]
+    ]
+]

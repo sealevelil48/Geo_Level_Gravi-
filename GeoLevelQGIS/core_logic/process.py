@@ -29,10 +29,13 @@ def _build_coord_manager(lines, db_manager):
       - A point is not found in the DB
 
     CRS note: EPSG:2039 (ITM 2005) → EPSG:4326 (WGS84).
-    Boss's WKT2 confirms the exact Inverse TM parameters
-    (false easting 219529.584 m, false northing 626907.39 m, scale 1.0000067,
-    origin 31.7343936°N / 35.2045169°E). QGIS resolves these from the EPSG
-    code automatically — no need to embed the WKT2 string in code.
+    The transform uses the 2-step pipeline from resources/2039_to_4326.wkt2:
+      Step 1 — Inverse Transverse Mercator (ITM → Israel 1993 geographic)
+      Step 2 — 7-parameter Bursa-Wolf shift (Israel 1993 → WGS 84)
+               X=-48 m, Y=+55 m, Z=+52 m  (EPSG:1073)
+    The WKT2 string is loaded and applied via transform.setCoordinateOperation()
+    so PROJ executes this exact pipeline regardless of QGIS project datum settings.
+    Falls back to the default QGIS EPSG:2039→4326 transform if the file is missing.
     """
     from core_logic.gis.geojson_export import CoordinateManager
 
@@ -74,9 +77,28 @@ def _build_coord_manager(lines, db_manager):
     db_manager.seed_from_qgis_layer(list(unique_ids))
 
     # EPSG:2039 (ITM 2005) → EPSG:4326 (WGS84)
+    # Use the boss-approved 2-step WKT2 pipeline (Inverse TM + Bursa-Wolf 7-param).
+    # setCoordinateOperation() pins PROJ to this exact pipeline, bypassing any
+    # automatic datum-transform selection QGIS might otherwise apply.
     crs_itm   = QgsCoordinateReferenceSystem("EPSG:2039")
     crs_wgs   = QgsCoordinateReferenceSystem("EPSG:4326")
     transform = QgsCoordinateTransform(crs_itm, crs_wgs, QgsProject.instance())
+
+    _wkt2_path = Path(__file__).parent.parent / "resources" / "2039_to_4326.wkt2"
+    try:
+        _wkt2 = _wkt2_path.read_text(encoding="utf-8")
+        transform.setCoordinateOperation(_wkt2)
+        log.info(
+            "_build_coord_manager: loaded WKT2 pipeline from %s "
+            "(Inverse ITM + Bursa-Wolf 7-param EPSG:1073)",
+            _wkt2_path.name,
+        )
+    except Exception as _wkt2_err:
+        log.warning(
+            "_build_coord_manager: could not load WKT2 file (%s) — "
+            "falling back to default QGIS EPSG:2039→4326 transform",
+            _wkt2_err,
+        )
 
     n_ok   = 0
     n_miss = 0
