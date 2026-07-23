@@ -343,7 +343,7 @@ class QGISLineLayerBuilder:
                 str(row.get("filename") or ""),
                 float(raw_dist)  if raw_dist  is not None else None,
                 float(raw_hdiff) if raw_hdiff is not None else None,
-                str(row.get("status") or ""),
+                str(row.get("status") or "").upper(),
             ])
             features.append(feat)
             n_built += 1

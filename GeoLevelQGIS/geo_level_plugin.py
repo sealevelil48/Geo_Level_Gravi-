@@ -54,15 +54,15 @@ def _apply_line_renderer(layer):
 
         r_valid = QgsRuleBasedRenderer.Rule(_line_sym("#4CAF50", 1.2))
         r_valid.setFilterExpression(
-            "lower(\"status\") = 'valid' OR lower(\"status\") = 'ok'"
+            "upper(\"status\") IN ('VALID', 'OK', 'TRUE', '1')"
         )
         r_valid.setLabel("Valid")
 
         r_mgr = QgsRuleBasedRenderer.Rule(_line_sym("#FFC107", 1.4))
         r_mgr.setFilterExpression(
-            "lower(\"status\") LIKE '%valid_by_manager%' OR "
-            "lower(\"status\") LIKE '%mgr%' OR "
-            "lower(\"status\") LIKE '%override%'"
+            "upper(\"status\") IN ("
+            "'VALID_BY_MANAGER', 'VALID BY MANAGER', "
+            "'MGR', 'OVERRIDE', 'OVERRIDE BY MANAGER', 'VALID BY MGR')"
         )
         r_mgr.setLabel("Valid by Manager")
 
@@ -677,11 +677,17 @@ class GeoLevelPlugin:
         if status_idx < 0 or filename_idx < 0:
             return
 
+        # Always write uppercase so the IN() filter in _apply_line_renderer
+        # matches without relying on lower()/upper() at render time.
+        # new_status from LineStatus.value is e.g. "valid_by_manager" (lower);
+        # we normalise to uppercase here for unambiguous filter matching.
+        status_value = new_status.upper()
+
         self._layer.startEditing()
         changed = 0
         for feat in self._layer.getFeatures():
             if str(feat[filename_idx]) == filename:
-                self._layer.changeAttributeValue(feat.id(), status_idx, new_status)
+                self._layer.changeAttributeValue(feat.id(), status_idx, status_value)
                 changed += 1
         self._layer.commitChanges()
 
