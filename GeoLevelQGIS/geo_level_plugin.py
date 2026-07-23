@@ -291,6 +291,7 @@ class GeoLevelPlugin:
         self.dock.double_runs_requested.connect(self._detect_double_runs)
         self.dock.loops_requested.connect(self._detect_loops)
         self.dock.enhanced_lsa_requested.connect(self._run_enhanced_lsa)
+        self.dock.override_changed.connect(self._on_override_changed)
 
     def _show_dock(self):
         if self.dock:
@@ -535,6 +536,36 @@ class GeoLevelPlugin:
         self.dock.populate_line_details(selected_line)
         self.dock.update_validation_tab(selected_line)
         self._zoom_to_line_feature(idx)
+
+    def _on_override_changed(self, filename: str, new_status: str):
+        """Update the 'status' attribute on the matching line feature in the
+        active QGIS layer and immediately repaint the canvas so colour changes
+        (valid=green / invalid=red / VALID_BY_MANAGER=amber) are reflected
+        without requiring a full pipeline re-run."""
+        if not self._layer or not self._layer.isValid():
+            return
+
+        status_idx = self._layer.fields().indexOf("status")
+        filename_idx = self._layer.fields().indexOf("filename")
+        if status_idx < 0 or filename_idx < 0:
+            return
+
+        self._layer.startEditing()
+        changed = 0
+        for feat in self._layer.getFeatures():
+            if str(feat[filename_idx]) == filename:
+                self._layer.changeAttributeValue(feat.id(), status_idx, new_status)
+                changed += 1
+        self._layer.commitChanges()
+
+        if changed:
+            self._layer.triggerRepaint()
+            self.iface.mapCanvas().refresh()
+            QgsMessageLog.logMessage(
+                f"Override repaint: '{filename}' → status='{new_status}' "
+                f"({changed} feature(s) updated)",
+                "GeoLevelGravi", Qgis.Info,
+            )
 
     def _zoom_to_line_feature(self, idx: int):
         if not self._layer or not self._layer.isValid():

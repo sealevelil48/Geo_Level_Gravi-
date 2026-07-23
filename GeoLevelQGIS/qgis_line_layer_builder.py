@@ -186,35 +186,44 @@ class QGISLineLayerBuilder:
         )
 
         # ------------------------------------------------------------------ #
-        # Pass 2 — Topological Estimation for unknown points (PKT etc.)        #
+        # Pass 2 — Distance-Weighted Topological Estimation (PKT etc.)        #
         #                                                                      #
-        # For each unknown point ID, find every line that connects to it and   #
-        # collect the coordinates of its known neighbours.                     #
-        #                                                                      #
-        # Two-neighbour case (most common):                                    #
-        #   Estimated position = arithmetic mean of all known-neighbour coords  #
-        #   → places the PKT midway between its flanking benchmarks            #
-        #                                                                      #
-        # One-neighbour case (end-of-run):                                     #
-        #   Apply a visual offset of total_distance metres along the +X axis   #
-        #   so the line is drawn with non-zero length                          #
+        # Collect neighbours and their measured distances, then choose:        #
+        #   1 neighbour  → +X offset by total_distance                        #
+        #   2 neighbours → linear interpolation along the chord at ratio       #
+        #                  r = d1/(d1+d2)                                     #
+        #   3+ neighbours → Inverse Distance Weighting (IDW, weight=1/d)      #
         # ------------------------------------------------------------------ #
         for unknown_id in unknown_ids:
-            neighbour_xys: List[Tuple[float, float]] = []
-            single_distance: Optional[float] = None
+            # neighbour_data: list of ((E, N), avg_distance)
+            neighbour_data: List[Tuple[Tuple[float, float], float]] = []
+
+            # Accumulate per-neighbour distances (same neighbour may appear
+            # in multiple rows — average them for a cleaner estimate)
+            dist_accumulator: Dict[str, List[float]] = {}
+            coord_for: Dict[str, Tuple[float, float]] = {}
 
             for row in lines:
                 s_id = str(row.get("start_point") or "").strip()
                 e_id = str(row.get("end_point")   or "").strip()
+                raw_d = row.get("total_distance")
+                d = float(raw_d) if raw_d is not None else None
 
                 if s_id == unknown_id and e_id in resolved_coords:
-                    neighbour_xys.append(resolved_coords[e_id])
-                    single_distance = single_distance or row.get("total_distance")
+                    coord_for[e_id] = resolved_coords[e_id]
+                    if d is not None:
+                        dist_accumulator.setdefault(e_id, []).append(d)
                 elif e_id == unknown_id and s_id in resolved_coords:
-                    neighbour_xys.append(resolved_coords[s_id])
-                    single_distance = single_distance or row.get("total_distance")
+                    coord_for[s_id] = resolved_coords[s_id]
+                    if d is not None:
+                        dist_accumulator.setdefault(s_id, []).append(d)
 
-            if not neighbour_xys:
+            for nbr_id, xy in coord_for.items():
+                dvals = dist_accumulator.get(nbr_id, [])
+                avg_d = sum(dvals) / len(dvals) if dvals else 100.0
+                neighbour_data.append((xy, avg_d))
+
+            if not neighbour_data:
                 logger.warning(
                     "QGISLineLayerBuilder: Pass 2 — '%s' has no known neighbours; "
                     "cannot estimate position — this point will be skipped in Pass 3",
@@ -222,21 +231,46 @@ class QGISLineLayerBuilder:
                 )
                 continue
 
-            if len(neighbour_xys) >= 2:
-                # Mean of all known neighbours
-                est_e = sum(xy[0] for xy in neighbour_xys) / len(neighbour_xys)
-                est_n = sum(xy[1] for xy in neighbour_xys) / len(neighbour_xys)
-                logger.info(
-                    "QGISLineLayerBuilder: Pass 2 — '%s' estimated from %d neighbours "
-                    "(mean centroid): E=%.1f N=%.1f",
-                    unknown_id, len(neighbour_xys), est_e, est_n,
-                )
-            else:
-                # Single neighbour — apply offset by measured distance along +X
-                known_e, known_n = neighbour_xys[0]
-                offset = float(single_distance) if single_distance else 100.0
+            n = len(neighbour_data)
+
+            if n == 1:
+                # End-of-run: +X offset by measured distance
+                (known_e, known_n), offset = neighbour_data[0]
                 est_e = known_e + offset
                 est_n = known_n
+                logger.info(
+                    "QGISLineLayerBuilder: Pass 2 — '%s' single-neighbour +X offset "
+                    "(dist=%.1f m): E=%.1f N=%.1f",
+                    unknown_id, offset, est_e, est_n,
+                )
+
+            elif n == 2:
+                # Two known benchmarks: linear interpolation at distance ratio
+                (x1, y1), d1 = neighbour_data[0]
+                (x2, y2), d2 = neighbour_data[1]
+                r = d1 / (d1 + d2) if (d1 + d2) > 0 else 0.5
+                est_e = x1 + r * (x2 - x1)
+                est_n = y1 + r * (y2 - y1)
+                logger.info(
+                    "QGISLineLayerBuilder: Pass 2 — '%s' linear interp "
+                    "r=%.4f (d1=%.1f d2=%.1f): E=%.1f N=%.1f",
+                    unknown_id, r, d1, d2, est_e, est_n,
+                )
+
+            else:
+                # 3+ neighbours: Inverse Distance Weighting (IDW, w = 1/d)
+                total_w = sum(1.0 / d for _, d in neighbour_data if d > 0)
+                if total_w == 0:
+                    est_e = sum(xy[0] for xy, _ in neighbour_data) / n
+                    est_n = sum(xy[1] for xy, _ in neighbour_data) / n
+                else:
+                    est_e = sum((xy[0] / d) for xy, d in neighbour_data if d > 0) / total_w
+                    est_n = sum((xy[1] / d) for xy, d in neighbour_data if d > 0) / total_w
+                logger.info(
+                    "QGISLineLayerBuilder: Pass 2 — '%s' IDW from %d neighbours: "
+                    "E=%.1f N=%.1f",
+                    unknown_id, n, est_e, est_n,
+                )
                 logger.info(
                     "QGISLineLayerBuilder: Pass 2 — '%s' estimated from single "
                     "neighbour with +X offset (dist=%.1f m): E=%.1f N=%.1f",

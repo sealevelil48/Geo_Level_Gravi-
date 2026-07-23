@@ -83,25 +83,107 @@ def _build_coord_manager(lines, db_manager):
     crs_wgs   = QgsCoordinateReferenceSystem("EPSG:4326")
     transform = QgsCoordinateTransform(crs_itm, crs_wgs, QgsCoordinateTransformContext())
 
-    n_ok   = 0
-    n_miss = 0
+    # ------------------------------------------------------------------ #
+    # Pass 1 — DB resolution: ITM coords for known benchmarks             #
+    # itm_coords[pid] = (easting, northing, height, is_estimated)         #
+    # ------------------------------------------------------------------ #
+    itm_coords = {}   # pid -> (E, N, height, is_estimated)
+    unknown_ids = []
 
     for pid in unique_ids:
         record = db_manager.resolve_benchmark(pid)
-        if record is None or record.x is None or record.y is None:
-            log.warning("_build_coord_manager: no coordinates for point '%s'", pid)
-            n_miss += 1
+        if record is not None and record.x is not None and record.y is not None:
+            height = float(record.gova_ort) if record.gova_ort is not None else 0.0
+            itm_coords[pid] = (float(record.x), float(record.y), height, False)
+        else:
+            unknown_ids.append(pid)
+
+    log.info(
+        "_build_coord_manager: Pass 1 — resolved %d / %d from DB; "
+        "%d unknown (PKT estimation): %s",
+        len(itm_coords), len(unique_ids), len(unknown_ids),
+        unknown_ids or "none",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Pass 2 — Distance-weighted topological estimation for PKT points    #
+    #                                                                      #
+    # Uses the same IDW / linear-interp / +X logic as QGISLineLayerBuilder#
+    # so GeoJSON point markers match the layer builder's line endpoints.  #
+    # ------------------------------------------------------------------ #
+    for unknown_id in unknown_ids:
+        dist_accumulator = {}
+        coord_for = {}
+
+        for line in lines:
+            s_id = str(line.start_point or "").strip()
+            e_id = str(line.end_point   or "").strip()
+            raw_d = getattr(line, "total_distance", None)
+            d = float(raw_d) if raw_d is not None else None
+
+            if s_id == unknown_id and e_id in itm_coords:
+                coord_for[e_id] = itm_coords[e_id][:2]
+                if d is not None:
+                    dist_accumulator.setdefault(e_id, []).append(d)
+            elif e_id == unknown_id and s_id in itm_coords:
+                coord_for[s_id] = itm_coords[s_id][:2]
+                if d is not None:
+                    dist_accumulator.setdefault(s_id, []).append(d)
+
+        neighbour_data = []
+        for nbr_id, xy in coord_for.items():
+            dvals = dist_accumulator.get(nbr_id, [])
+            avg_d = sum(dvals) / len(dvals) if dvals else 100.0
+            neighbour_data.append((xy, avg_d))
+
+        if not neighbour_data:
+            log.warning(
+                "_build_coord_manager: Pass 2 — '%s' has no known neighbours, "
+                "cannot estimate — skipping GeoJSON point",
+                unknown_id,
+            )
             continue
 
+        n = len(neighbour_data)
+        if n == 1:
+            (ke, kn), offset = neighbour_data[0]
+            est_e, est_n = ke + offset, kn
+        elif n == 2:
+            (x1, y1), d1 = neighbour_data[0]
+            (x2, y2), d2 = neighbour_data[1]
+            r = d1 / (d1 + d2) if (d1 + d2) > 0 else 0.5
+            est_e = x1 + r * (x2 - x1)
+            est_n = y1 + r * (y2 - y1)
+        else:
+            total_w = sum(1.0 / d for _, d in neighbour_data if d > 0)
+            if total_w == 0:
+                est_e = sum(xy[0] for xy, _ in neighbour_data) / n
+                est_n = sum(xy[1] for xy, _ in neighbour_data) / n
+            else:
+                est_e = sum(xy[0] / d for xy, d in neighbour_data if d > 0) / total_w
+                est_n = sum(xy[1] / d for xy, d in neighbour_data if d > 0) / total_w
+
+        itm_coords[unknown_id] = (est_e, est_n, 0.0, True)
+        log.info(
+            "_build_coord_manager: Pass 2 — '%s' estimated "
+            "(n=%d neighbours): E=%.1f N=%.1f",
+            unknown_id, n, est_e, est_n,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Transform all ITM coords to WGS84 and load into CoordinateManager  #
+    # Estimated (PKT) points are tagged so QML can render them distinctly #
+    # ------------------------------------------------------------------ #
+    n_ok = n_miss = 0
+    for pid, (east, north, height, is_estimated) in itm_coords.items():
         try:
-            # record.x = Easting (ITM), record.y = Northing (ITM)
-            pt_itm = QgsPointXY(float(record.x), float(record.y))
-            pt_wgs = transform.transform(pt_itm)
-            # EPSG:4326: QgsPointXY.x() → Longitude, .y() → Latitude
-            lon    = round(pt_wgs.x(), 8)
-            lat    = round(pt_wgs.y(), 8)
-            height = float(record.gova_ort) if record.gova_ort is not None else 0.0
+            pt_wgs = transform.transform(QgsPointXY(east, north))
+            lon = round(pt_wgs.x(), 8)
+            lat = round(pt_wgs.y(), 8)
             cm.add_point(pid, lon, lat, height)
+            # Tag estimated points so downstream QML can color them distinctly
+            if is_estimated:
+                cm.coordinates[pid] = (lon, lat, height, "PKT")
             n_ok += 1
         except Exception as exc:
             log.warning(
@@ -110,9 +192,12 @@ def _build_coord_manager(lines, db_manager):
             n_miss += 1
 
     log.info(
-        "_build_coord_manager: resolved %d / %d points to WGS84 "
-        "(%d not in DB / no geometry)",
-        n_ok, len(unique_ids), n_miss,
+        "_build_coord_manager: %d point(s) transformed to WGS84 "
+        "(%d DB, %d estimated, %d failed)",
+        n_ok,
+        n_ok - len([v for v in itm_coords.values() if v[3]]),
+        len([v for v in itm_coords.values() if v[3]]),
+        n_miss,
     )
     return cm
 

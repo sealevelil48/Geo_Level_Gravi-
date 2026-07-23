@@ -49,6 +49,7 @@ class GeoLevelDockWidget(QDockWidget):
     double_runs_requested = pyqtSignal()
     loops_requested       = pyqtSignal()
     enhanced_lsa_requested = pyqtSignal()
+    override_changed      = pyqtSignal(str, str)  # (filename, new_status_value)
 
     def __init__(self, parent=None):
         super().__init__("Geo Level Gravi", parent)
@@ -740,6 +741,7 @@ class GeoLevelDockWidget(QDockWidget):
         self._refresh_val_table()
         action = "applied" if enable else "removed"
         self.log("Manager override {} for: {}".format(action, line.filename))
+        self.override_changed.emit(line.filename, line.status.value)
 
     def _ctx_set_excluded(self, idx, exclude):
         """Exclude or re-include a line from the context menu."""
