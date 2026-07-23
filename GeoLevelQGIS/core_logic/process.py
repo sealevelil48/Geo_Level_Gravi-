@@ -52,6 +52,7 @@ def _build_coord_manager(lines, db_manager):
         from qgis.core import (
             QgsCoordinateReferenceSystem,
             QgsCoordinateTransform,
+            QgsCoordinateTransformContext,
             QgsPointXY,
         )
     except ImportError:
@@ -81,7 +82,7 @@ def _build_coord_manager(lines, db_manager):
     # automatic datum-transform selection QGIS might otherwise apply.
     crs_itm   = QgsCoordinateReferenceSystem("EPSG:2039")
     crs_wgs   = QgsCoordinateReferenceSystem("EPSG:4326")
-    transform = QgsCoordinateTransform(crs_itm, crs_wgs)
+    transform = QgsCoordinateTransform(crs_itm, crs_wgs, QgsCoordinateTransformContext())
 
     _wkt2_path = Path(__file__).parent.parent / "resources" / "2039_to_4326.wkt2"
     try:
