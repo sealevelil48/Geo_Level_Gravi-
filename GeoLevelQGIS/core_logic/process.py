@@ -144,10 +144,14 @@ def _build_coord_manager(lines, db_manager):
             )
             continue
 
+        import math as _math
         n = len(neighbour_data)
         if n == 1:
+            # Offset by d·cos(45°) / d·sin(45°) — renders at the exact
+            # measured distance along a diagonal rather than a flat +X shift.
             (ke, kn), offset = neighbour_data[0]
-            est_e, est_n = ke + offset, kn
+            est_e = ke + offset * _math.cos(_math.radians(45))
+            est_n = kn + offset * _math.sin(_math.radians(45))
         elif n == 2:
             (x1, y1), d1 = neighbour_data[0]
             (x2, y2), d2 = neighbour_data[1]

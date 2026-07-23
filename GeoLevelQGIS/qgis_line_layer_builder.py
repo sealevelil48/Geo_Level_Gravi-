@@ -234,12 +234,15 @@ class QGISLineLayerBuilder:
             n = len(neighbour_data)
 
             if n == 1:
-                # End-of-run: +X offset by measured distance
+                # End-of-run: offset by d·cos(45°) / d·sin(45°) so the point
+                # renders at the exact measured distance along a clean diagonal
+                # vector rather than collapsing onto the known point.
+                import math as _math
                 (known_e, known_n), offset = neighbour_data[0]
-                est_e = known_e + offset
-                est_n = known_n
+                est_e = known_e + offset * _math.cos(_math.radians(45))
+                est_n = known_n + offset * _math.sin(_math.radians(45))
                 logger.info(
-                    "QGISLineLayerBuilder: Pass 2 — '%s' single-neighbour +X offset "
+                    "QGISLineLayerBuilder: Pass 2 — '%s' single-neighbour 45° offset "
                     "(dist=%.1f m): E=%.1f N=%.1f",
                     unknown_id, offset, est_e, est_n,
                 )
