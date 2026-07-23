@@ -292,13 +292,13 @@ def process_geodetic_data(
             "(%s). The QGIS line layer will be built directly from DB "
             "coordinates without a GeoJSON fallback.", exc
         )
-        output_files = {"lines_geojson": "", "line_style": "", "point_style": ""}
+        output_files = {"lines_geojson": "", "points_geojson": "", "line_style": "", "point_style": ""}
     except OSError as exc:
         log.error(
             "GeoJSON export failed with IO error (%s). "
             "Continuing without GeoJSON output.", exc
         )
-        output_files = {"lines_geojson": "", "line_style": "", "point_style": ""}
+        output_files = {"lines_geojson": "", "points_geojson": "", "line_style": "", "point_style": ""}
 
     # ------------------------------------------------------------------ #
     # 4. Export REZ summary file (same as standalone CLI "export" command)
@@ -313,10 +313,11 @@ def process_geodetic_data(
         rez_path = None
 
     return {
-        "lines_geojson": output_files["lines_geojson"],
-        "line_style":    output_files["line_style"],
-        "point_style":   output_files["point_style"],
-        "rez_path":      rez_path,
+        "lines_geojson":  output_files["lines_geojson"],
+        "points_geojson": output_files.get("points_geojson", ""),
+        "line_style":     output_files["line_style"],
+        "point_style":    output_files["point_style"],
+        "rez_path":       rez_path,
         "summary": {
             "total":    len(lines),
             "valid":    valid_count,

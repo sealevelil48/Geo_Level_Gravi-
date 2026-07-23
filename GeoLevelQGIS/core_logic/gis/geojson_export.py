@@ -444,22 +444,39 @@ def export_network_to_geojson(lines: List[LevelingLine],
     output_path.mkdir(parents=True, exist_ok=True)
 
     exporter = GeoJSONExporter(coord_manager=coord_manager)
-    
-    # Export lines and points
+
+    # Export lines (mixed FeatureCollection — lines + points bundled)
     lines_file = output_path / f"{project_name}_lines.geojson"
-    exporter.export_lines(lines, str(lines_file))
-    
+    geojson_data = exporter.export_lines(lines, str(lines_file))
+
+    # Export points as a separate GeoJSON so the plugin can load them as an
+    # independent layer on the QGIS map canvas with their own symbology.
+    points_file = output_path / f"{project_name}_points.geojson"
+    point_features = [
+        f for f in geojson_data.get("features", [])
+        if f.get("geometry", {}).get("type") == "Point"
+    ]
+    points_geojson = {
+        "type": "FeatureCollection",
+        "name": "Leveling Points",
+        "crs": geojson_data.get("crs", {}),
+        "features": point_features,
+    }
+    with open(str(points_file), "w", encoding="utf-8") as _f:
+        json.dump(points_geojson, _f, indent=2, ensure_ascii=False)
+
     # Generate QGIS styles
     line_style = output_path / f"{project_name}_lines.qml"
     point_style = output_path / f"{project_name}_points.qml"
-    
+
     QGISStyleGenerator.generate_line_style(str(line_style))
     QGISStyleGenerator.generate_point_style(str(point_style))
-    
+
     return {
-        'lines_geojson': str(lines_file),
-        'line_style': str(line_style),
-        'point_style': str(point_style)
+        'lines_geojson':  str(lines_file),
+        'points_geojson': str(points_file),
+        'line_style':     str(line_style),
+        'point_style':    str(point_style),
     }
 
 

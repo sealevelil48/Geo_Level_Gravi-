@@ -28,6 +28,112 @@ if _PLUGIN_DIR not in sys.path:
 _PROJECTS_DIR = os.path.join(_PLUGIN_DIR, "projects")
 
 
+def _apply_line_renderer(layer):
+    """Apply a live QgsRuleBasedRenderer to a line layer.
+
+    Rules (first match wins):
+      valid            → green  #4CAF50, 1.2 mm
+      valid_by_manager → amber  #FFC107, 1.4 mm
+      ELSE             → red    #F44336, 1.2 mm
+    """
+    try:
+        from qgis.core import (
+            QgsRuleBasedRenderer, QgsSymbol, QgsLineSymbol,
+        )
+        from qgis.PyQt.QtGui import QColor
+
+        def _line_sym(hex_color, width_mm):
+            sym = QgsLineSymbol.createSimple({
+                "color": hex_color,
+                "width": str(width_mm),
+                "capstyle": "round",
+            })
+            return sym
+
+        root = QgsRuleBasedRenderer.Rule(None)
+
+        r_valid = QgsRuleBasedRenderer.Rule(_line_sym("#4CAF50", 1.2))
+        r_valid.setFilterExpression(
+            "lower(\"status\") = 'valid' OR lower(\"status\") = 'ok'"
+        )
+        r_valid.setLabel("Valid")
+
+        r_mgr = QgsRuleBasedRenderer.Rule(_line_sym("#FFC107", 1.4))
+        r_mgr.setFilterExpression(
+            "lower(\"status\") LIKE '%valid_by_manager%' OR "
+            "lower(\"status\") LIKE '%mgr%' OR "
+            "lower(\"status\") LIKE '%override%'"
+        )
+        r_mgr.setLabel("Valid by Manager")
+
+        r_invalid = QgsRuleBasedRenderer.Rule(_line_sym("#F44336", 1.2))
+        r_invalid.setFilterExpression("ELSE")
+        r_invalid.setLabel("Invalid")
+
+        root.appendChild(r_valid)
+        root.appendChild(r_mgr)
+        root.appendChild(r_invalid)
+
+        renderer = QgsRuleBasedRenderer(root)
+        layer.setRenderer(renderer)
+        layer.triggerRepaint()
+    except Exception as _e:
+        QgsMessageLog.logMessage(
+            f"_apply_line_renderer: {_e}", "GeoLevelPlugin", level=Qgis.Warning
+        )
+
+
+def _apply_point_renderer(layer):
+    """Apply a live QgsRuleBasedRenderer to a point layer.
+
+    Rules (first match wins):
+      status='PKT' / is_benchmark=0 / name contains PKT/ASH
+                        → yellow diamond, 4.5 mm
+      ELSE (official benchmarks)
+                        → blue triangle,  3.0 mm
+    """
+    try:
+        from qgis.core import (
+            QgsRuleBasedRenderer, QgsMarkerSymbol,
+        )
+        from qgis.PyQt.QtGui import QColor
+
+        def _marker(hex_color, size_mm, shape):
+            sym = QgsMarkerSymbol.createSimple({
+                "color": hex_color,
+                "size":  str(size_mm),
+                "name":  shape,
+                "outline_color": "#444444",
+                "outline_width": "0.3",
+            })
+            return sym
+
+        root = QgsRuleBasedRenderer.Rule(None)
+
+        r_pkt = QgsRuleBasedRenderer.Rule(_marker("#FFEB3B", 4.5, "diamond"))
+        r_pkt.setFilterExpression(
+            "\"status\" = 'PKT' OR "
+            "\"is_benchmark\" = 0 OR \"is_benchmark\" = '0' OR "
+            "\"point_id\" LIKE '%PKT%' OR \"point_id\" LIKE '%ASH%'"
+        )
+        r_pkt.setLabel("Estimated field point")
+
+        r_bm = QgsRuleBasedRenderer.Rule(_marker("#2196F3", 3.0, "triangle"))
+        r_bm.setFilterExpression("ELSE")
+        r_bm.setLabel("Benchmark / Turning Point")
+
+        root.appendChild(r_pkt)
+        root.appendChild(r_bm)
+
+        renderer = QgsRuleBasedRenderer(root)
+        layer.setRenderer(renderer)
+        layer.triggerRepaint()
+    except Exception as _e:
+        QgsMessageLog.logMessage(
+            f"_apply_point_renderer: {_e}", "GeoLevelPlugin", level=Qgis.Warning
+        )
+
+
 class GeoLevelLSAInputDialog(QDialog):
     """
     Fixed-points input dialog for the standard LSA Network Adjustment.
@@ -416,6 +522,7 @@ class GeoLevelPlugin:
             self._val_results = result.get("val_results", [])
 
         self._load_line_layer(result["lines_geojson"], result["line_style"], new_lines)
+        self._load_point_layer(result.get("points_geojson", ""), result.get("point_style", ""))
         self._show_dock()
         self.dock.load_lines(self._lines, self._val_results)
 
@@ -436,8 +543,7 @@ class GeoLevelPlugin:
             QgsMessageLog.logMessage(f"Failed to load layer: {geojson_path}",
                                      "GeoLevelPlugin", level=Qgis.Warning)
             return
-        if os.path.exists(qml_path):
-            layer.loadNamedStyle(qml_path)
+        _apply_line_renderer(layer)   # live renderer overrides any QML
         QgsProject.instance().addMapLayer(layer)
         self._layer = layer
 
@@ -521,9 +627,30 @@ class GeoLevelPlugin:
                 )
             return
 
+        _apply_line_renderer(layer)
         QgsProject.instance().addMapLayer(layer)
         self._layer = layer
         self._prepare_layer_signals(layer)
+
+    def _load_point_layer(self, points_geojson_path: str, qml_path: str) -> None:
+        """Load the points GeoJSON as a separate map layer with live symbology."""
+        if not points_geojson_path or not os.path.exists(points_geojson_path):
+            return
+
+        layer = QgsVectorLayer(points_geojson_path, "Geodetic Points", "ogr")
+        if not layer.isValid():
+            QgsMessageLog.logMessage(
+                f"Failed to load points layer: {points_geojson_path}",
+                "GeoLevelPlugin", level=Qgis.Warning,
+            )
+            return
+
+        _apply_point_renderer(layer)
+        QgsProject.instance().addMapLayer(layer)
+        QgsMessageLog.logMessage(
+            f"Points layer loaded: {layer.featureCount()} feature(s)",
+            "GeoLevelPlugin", level=Qgis.Info,
+        )
 
     # ------------------------------------------------------------------
     # Dock ↔ map sync
