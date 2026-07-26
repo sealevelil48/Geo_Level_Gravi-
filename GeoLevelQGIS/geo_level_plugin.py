@@ -83,6 +83,55 @@ def _apply_line_renderer(layer):
         )
 
 
+def _apply_point_labels(layer) -> None:
+    """Enable QgsPalLayerSettings text labeling on a point layer.
+
+    Reads the label text from 'point_id' (the field written by GeoJSONExporter).
+    9 pt bold black with a 1 px white halo so names are legible on any basemap.
+    Safe no-op when PyQGIS labeling API is unavailable.
+    """
+    try:
+        from qgis.core import (
+            QgsPalLayerSettings, QgsTextFormat, QgsTextBuffer,
+            QgsVectorLayerSimpleLabeling,
+        )
+        from qgis.PyQt.QtGui import QColor, QFont
+
+        field_names = [f.name() for f in layer.fields()]
+        label_field = next(
+            (fn for fn in ("point_id", "name", "id") if fn in field_names), None
+        )
+        if label_field is None:
+            return
+
+        buf = QgsTextBuffer()
+        buf.setEnabled(True)
+        buf.setSize(1.0)
+        buf.setSizeUnit(QgsTextBuffer.MM)
+        buf.setColor(QColor("white"))
+
+        fmt = QgsTextFormat()
+        font = QFont("Arial", 9)
+        font.setBold(True)
+        fmt.setFont(font)
+        fmt.setSize(9)
+        fmt.setColor(QColor("black"))
+        fmt.setBuffer(buf)
+
+        pal = QgsPalLayerSettings()
+        pal.fieldName = label_field
+        pal.setFormat(fmt)
+        pal.placement = QgsPalLayerSettings.OrderedPositionsAroundPoint
+
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+        layer.setLabelsEnabled(True)
+        layer.triggerRepaint()
+    except Exception as _e:
+        QgsMessageLog.logMessage(
+            f"_apply_point_labels: {_e}", "GeoLevelPlugin", level=Qgis.Warning
+        )
+
+
 def _apply_point_renderer(layer):
     """Apply a live QgsRuleBasedRenderer to a point layer.
 
@@ -652,6 +701,7 @@ class GeoLevelPlugin:
             return
 
         _apply_point_renderer(layer)
+        _apply_point_labels(layer)
         QgsProject.instance().addMapLayer(layer)
         QgsMessageLog.logMessage(
             f"Points layer loaded: {layer.featureCount()} feature(s)",

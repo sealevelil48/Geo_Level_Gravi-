@@ -629,6 +629,7 @@ class GeoLevelDockWidget(QDockWidget):
 
         self._refresh_val_table()
         self.log(line.filename + " → " + state_str)
+        self.override_changed.emit(line.filename, line.status.value)
 
     def _on_val_table_context_menu(self, pos):
         """
