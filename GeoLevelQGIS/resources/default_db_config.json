@@ -4,7 +4,7 @@
         "port": 5432,
         "dbname": "survey_db",
         "user": "cp_read",
-        "password": "cp_read",
+        "password": "__set_via_QgsAuthManager__",
         "table": "benchmarks",
         "authcfg": ""
     }
