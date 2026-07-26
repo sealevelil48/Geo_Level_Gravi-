@@ -39,6 +39,7 @@ class SettingsManager:
         self.settings_file = settings_file or SETTINGS_FILE
         self.settings_dir = self.settings_file.parent
         self._ensure_settings_dir()
+        self._seed_from_default_config()
 
     def _ensure_settings_dir(self):
         """Create settings directory if it doesn't exist."""
@@ -47,6 +48,45 @@ class SettingsManager:
             logger.info(f"Settings directory verified: {self.settings_dir}")
         except Exception as e:
             logger.error(f"Failed to create settings directory: {e}")
+
+    def _seed_from_default_config(self) -> None:
+        """Auto-seed DB credentials from the packaged default_db_config.json.
+
+        Only runs when no host has been stored yet in the local profile, so an
+        engineer who has already configured a real server is never overwritten.
+        Password is intentionally ignored — it must be set via QgsAuthManager.
+        """
+        existing = self.get_db_connection()
+        if existing.get("host"):
+            return  # already configured — nothing to do
+
+        # Resolve path relative to this file: .../core_logic/config/ → .../resources/
+        default_cfg_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "resources"
+            / "default_db_config.json"
+        )
+        if not default_cfg_path.exists():
+            return
+
+        try:
+            with open(default_cfg_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            db = data.get("db_connection", {})
+            self.set_db_connection(
+                host=db.get("host", "localhost"),
+                port=int(db.get("port", 5432)),
+                dbname=db.get("dbname", "survey_db"),
+                user=db.get("user", "cp_read"),
+                table=db.get("table", "benchmarks"),
+                authcfg=db.get("authcfg", ""),
+            )
+            print(
+                f"[SettingsManager] Auto-seeded database credentials from "
+                f"{default_cfg_path.name}"
+            )
+        except Exception as exc:
+            logger.warning("Failed to auto-seed DB config: %s", exc)
 
     def save_class_parameters(self, class_params_dict: Dict[str, Dict[str, Any]]) -> bool:
         """
