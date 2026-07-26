@@ -601,6 +601,19 @@ class BenchmarkDBManager:
         self._cache[key] = rec
         return rec
 
+    def get_candidates(self, point_name: str) -> List[BenchmarkRecord]:
+        """Return all raw DB candidates for *point_name* without spatial disambiguation.
+
+        Unlike resolve_benchmark(), this method never auto-selects by proximity
+        and never writes to the cache.  It is used by the pre-calculation point
+        verification dialog so the engineer can choose the correct spatial
+        duplicate manually.
+        """
+        if not self.is_configured():
+            return []
+        key = point_name.strip().upper()
+        return self._query_candidates(key)
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #

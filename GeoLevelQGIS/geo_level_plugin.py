@@ -500,6 +500,12 @@ class GeoLevelPlugin:
         new_lines = result["lines"]
         self._lines.extend(new_lines)
 
+        # Pre-calculation point verification: catch ASCII/Hebrew mismatches and
+        # spatial duplicates before any layer or LSA calculation runs.
+        if not self._check_point_resolution(new_lines):
+            self._lines = self._lines[:-len(new_lines)]
+            return
+
         # Seed the DB spatial centroid from the 'נקודות בקרה' control-points layer.
         # This must run before any LSA/loops/double-runs dialog can fire, so the
         # K-Means centroid is anchored to on-screen verified geometry, not the DB.
@@ -1065,6 +1071,86 @@ class GeoLevelPlugin:
             if self.dock:
                 self.dock.log("Double-Runs ERROR: " + str(exc))
             QMessageBox.critical(self.iface.mainWindow(), "Double-Runs -- Error", str(exc))
+
+    def _check_point_resolution(self, new_lines: list) -> bool:
+        """Verify ambiguous or unresolved field point IDs before loading.
+
+        Queries the DB for each unique point ID in *new_lines*.  Points that
+        return exactly one candidate with a direct name match are auto-approved
+        and pre-populated in the DB manager cache.  Points that return 0 or 2+
+        candidates — or that required Hebrew transliteration expansion to find
+        anything — are presented to the engineer in GeoLevelPointResolutionDialog.
+
+        Returns True when loading should proceed, False when the user cancelled.
+        DB not configured → returns True immediately (no-op, existing behaviour).
+        """
+        try:
+            from geolevel_db_manager import get_db_manager
+            db_mgr = get_db_manager()
+            if not db_mgr.is_configured():
+                return True
+
+            from core_logic.engine.point_normalizer import PointNormalizer
+
+            unique_pids = sorted(
+                {ln.start_point for ln in new_lines if ln.start_point}
+                | {ln.end_point for ln in new_lines if ln.end_point}
+            )
+
+            needs_dialog: list = []          # pids requiring user confirmation
+            candidate_map: dict = {}         # pid → List[BenchmarkRecord]
+
+            for pid in unique_pids:
+                direct_hits = db_mgr.get_candidates(pid)
+
+                if len(direct_hits) == 1:
+                    # Unambiguous direct match — pre-populate cache and skip dialog.
+                    db_mgr._cache[pid.strip().upper()] = direct_hits[0]
+                    continue
+
+                if len(direct_hits) >= 2:
+                    # Spatial duplicate — engineer must choose.
+                    needs_dialog.append(pid)
+                    candidate_map[pid] = direct_hits
+                    continue
+
+                # Zero direct hits — try Hebrew transliteration expansion.
+                expanded_hits: list = []
+                for candidate_name in PointNormalizer.generate_search_candidates(pid):
+                    if candidate_name == pid or candidate_name == pid.strip().upper():
+                        continue  # already tried
+                    hits = db_mgr.get_candidates(candidate_name)
+                    for rec in hits:
+                        if rec not in expanded_hits:
+                            expanded_hits.append(rec)
+
+                needs_dialog.append(pid)
+                candidate_map[pid] = expanded_hits  # may still be empty
+
+            if not needs_dialog:
+                return True
+
+            from geo_level_point_resolution_dialog import GeoLevelPointResolutionDialog
+            dlg = GeoLevelPointResolutionDialog(
+                needs_dialog, candidate_map, parent=self.iface.mainWindow()
+            )
+            if not dlg.exec_():
+                return False
+
+            resolved = dlg.get_resolved()
+            for pid, rec in resolved.items():
+                if rec is not None:
+                    db_mgr._cache[pid.strip().upper()] = rec
+
+            return True
+
+        except Exception as exc:
+            import traceback
+            QgsMessageLog.logMessage(
+                "Point resolution check failed: " + traceback.format_exc(),
+                "GeoLevel", level=Qgis.Warning,
+            )
+            return True  # non-fatal — fall through to normal load
 
     def _run_lsa(self):
         if not self._lines:
