@@ -701,8 +701,11 @@ class GeoLevelPlugin:
             return
 
         _apply_point_renderer(layer)
-        _apply_point_labels(layer)
         QgsProject.instance().addMapLayer(layer)
+        # Labels must be applied after the layer is registered in the project
+        # so the QGIS label engine can resolve the layer reference correctly.
+        _apply_point_labels(layer)
+        self.iface.mapCanvas().refresh()
         QgsMessageLog.logMessage(
             f"Points layer loaded: {layer.featureCount()} feature(s)",
             "GeoLevelPlugin", level=Qgis.Info,
@@ -748,10 +751,12 @@ class GeoLevelPlugin:
         self._layer.commitChanges()
 
         if changed:
-            self._layer.triggerRepaint()
+            # Re-apply renderer so rule filters re-evaluate against the newly
+            # committed attribute value — triggerRepaint alone can miss this.
+            _apply_line_renderer(self._layer)
             self.iface.mapCanvas().refresh()
             QgsMessageLog.logMessage(
-                f"Override repaint: '{filename}' → status='{new_status}' "
+                f"Override repaint: '{filename}' → status='{status_value}' "
                 f"({changed} feature(s) updated)",
                 "GeoLevelGravi", Qgis.Info,
             )

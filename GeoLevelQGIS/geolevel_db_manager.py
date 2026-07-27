@@ -111,14 +111,14 @@ SELECT
     ST_Y(geom_full) AS y
 FROM {table}
 WHERE
-    UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || '/' || ot_nekuda)) = UPPER(TRIM(%s))
- OR UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || ot_nekuda))        = UPPER(TRIM(%s))
- OR UPPER(TRIM(ot_nekuda || CAST(mispar_nekuda AS TEXT)))        = UPPER(TRIM(%s))
- OR UPPER(TRIM(name))                                            = UPPER(TRIM(%s))
- OR (ot_nekuda_kfula IS NOT NULL AND mispar_nekuda_kfula IS NOT NULL AND
-     UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || '/' || ot_nekuda_kfula)) = UPPER(TRIM(%s)))
- OR (ot_nekuda_kfula IS NOT NULL AND mispar_nekuda_kfula IS NOT NULL AND
-     UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || ot_nekuda_kfula))        = UPPER(TRIM(%s)))
+    UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || '/' || COALESCE(CAST(ot_nekuda AS TEXT), ''))) = UPPER(TRIM(%s))
+ OR UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || COALESCE(CAST(ot_nekuda AS TEXT), '')))        = UPPER(TRIM(%s))
+ OR UPPER(TRIM(COALESCE(CAST(ot_nekuda AS TEXT), '') || CAST(mispar_nekuda AS TEXT)))        = UPPER(TRIM(%s))
+ OR UPPER(TRIM(name))                                                                        = UPPER(TRIM(%s))
+ OR (mispar_nekuda_kfula IS NOT NULL AND
+     UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || '/' || COALESCE(CAST(ot_nekuda_kfula AS TEXT), ''))) = UPPER(TRIM(%s)))
+ OR (mispar_nekuda_kfula IS NOT NULL AND
+     UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || COALESCE(CAST(ot_nekuda_kfula AS TEXT), '')))        = UPPER(TRIM(%s)))
 """
 
 # Batch query — fetches ITM 2005 coordinates for ALL DAT point names in one
