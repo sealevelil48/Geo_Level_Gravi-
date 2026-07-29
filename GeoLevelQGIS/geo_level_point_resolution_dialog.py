@@ -138,7 +138,11 @@ class GeoLevelPointResolutionDialog(QDialog):
         n_str = f"{rec.y:.0f}" if rec.y is not None else "?"
         h_str = f"{rec.gova_ort:.3f} m" if rec.gova_ort is not None else "no height"
         cls_str = rec.shem_darga_gova or "—"
-        return f"{rec.name}   |   E {e_str}  N {n_str}  |  H {h_str}  ({cls_str})"
+        city_str = getattr(rec, "kfar_aher_name", None) or "—"
+        return (
+            f"{rec.name}   |   E {e_str}  N {n_str}  |  H {h_str}"
+            f"  ({cls_str})  |  {city_str}"
+        )
 
     # ------------------------------------------------------------------
     # Public result accessor

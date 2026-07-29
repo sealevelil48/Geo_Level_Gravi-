@@ -131,6 +131,7 @@ def _apply_point_labels(layer) -> None:
         pal.fieldName = label_field
         pal.setFormat(fmt)
         pal.placement = QgsPalLayerSettings.OrderedPositionsAroundPoint
+        pal.displayAll = True   # disable collision avoidance — always draw all labels
 
         layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
         layer.setLabelsEnabled(True)
@@ -923,8 +924,9 @@ class GeoLevelPlugin:
             cls = self.dock.get_selected_class() if self.dock else self._last_class
             bv = BatchValidator(leveling_class=int(cls[1]))
             self._val_results = bv.validate_batch(self._lines)
-            # Refresh dock list colours
+            # Refresh dock list colours and sync map layer statuses
             self.dock.load_lines(self._lines, self._val_results)
+            self._sync_map_statuses()
             summary = bv.get_summary([vr for _, vr in self._val_results])
             val_msg = (
                 "Validation complete: "

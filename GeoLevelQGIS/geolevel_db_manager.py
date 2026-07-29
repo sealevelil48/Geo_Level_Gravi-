@@ -87,6 +87,7 @@ class BenchmarkRecord:
     mispar_nekuda_kfula: Optional[int]  # Alternate number
     x: Optional[float]                  # Easting  (ITM 2005, EPSG:2039) — standard GIS x
     y: Optional[float]                  # Northing (ITM 2005, EPSG:2039) — standard GIS y
+    kfar_aher_name: Optional[str] = None  # City / locality name from kfar_aher table
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +109,8 @@ SELECT
     ot_nekuda_kfula,
     mispar_nekuda_kfula,
     ST_X(geom_full) AS x,
-    ST_Y(geom_full) AS y
+    ST_Y(geom_full) AS y,
+    kfar_aher_name
 FROM {table}
 WHERE
     UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || '/' || COALESCE(CAST(ot_nekuda AS TEXT), ''))) = UPPER(TRIM(%s))
@@ -661,7 +663,7 @@ class BenchmarkDBManager:
             (ot_nekuda, mispar_nekuda, name,
              gova_ort, shem_darga_gova, taarih_gova_ort,
              ot_nekuda_kfula, mispar_nekuda_kfula,
-             db_x, db_y) = row
+             db_x, db_y, kfar_aher_name) = row
 
             # ST_X(geom_full) → Easting  (EPSG:2039 X-axis, ITM)
             # ST_Y(geom_full) → Northing (EPSG:2039 Y-axis, ITM)
@@ -681,6 +683,7 @@ class BenchmarkDBManager:
                                      if mispar_nekuda_kfula is not None else None),
                 x=easting,
                 y=northing,
+                kfar_aher_name=kfar_aher_name or None,
             ))
         return results
 
