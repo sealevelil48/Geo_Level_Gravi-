@@ -591,6 +591,18 @@ class GeoLevelPlugin:
             # user with nothing.
             pass
         new_lines = result["lines"]
+
+        # Apply the Hebrew/verified name remap to the fresh new_lines so the
+        # correct DB names are used for GeoJSON export, symbology, and LSA.
+        pid_remap = getattr(self, "_pending_pid_remap", {})
+        if pid_remap:
+            for ln in new_lines:
+                if ln.start_point in pid_remap:
+                    ln.start_point = pid_remap[ln.start_point]
+                if ln.end_point in pid_remap:
+                    ln.end_point = pid_remap[ln.end_point]
+            self._pending_pid_remap = {}   # consume — one-shot per load
+
         self._lines.extend(new_lines)
 
         # Seed the DB spatial centroid from the 'נקודות בקרה' control-points layer.
@@ -1172,61 +1184,44 @@ class GeoLevelPlugin:
     def _sync_map_statuses(self) -> None:
         """Push current in-memory line statuses into the active QGIS line layer.
 
-        Matches layer features to in-memory lines by three strategies in priority
-        order so that renamed/moved files still match:
-          1. start_point + end_point pair (most robust)
-          2. filename attribute (fast path when available)
+        Matches strictly by 'filename' attribute for guaranteed 1-to-1 accuracy.
+        The filename is the natural unique key written by both the GeoJSON exporter
+        and QGISLineLayerBuilder, so it is present on every layer feature.
         Runs after every load and re-validation so the renderer always reflects
         the dock's validation table.
         """
         if not self._layer or not self._layer.isValid():
             return
 
-        fields        = self._layer.fields()
-        status_idx    = fields.indexOf("status")
-        filename_idx  = fields.indexOf("filename")
-        start_idx     = fields.indexOf("start_point")
-        end_idx       = fields.indexOf("end_point")
+        fields       = self._layer.fields()
+        status_idx   = fields.indexOf("status")
+        filename_idx = fields.indexOf("filename")
 
-        if status_idx < 0:
+        if status_idx < 0 or filename_idx < 0:
             return
 
-        # Build fast lookup tables from in-memory lines
-        endpoint_map: dict = {}   # (start_point, end_point) → status string
-        filename_map: dict = {}   # filename → status string
-        for ln in self._lines:
-            status_str = (
+        # filename → uppercase status value string (used by ILIKE rules)
+        filename_map: dict = {
+            ln.filename: (
                 ln.status.value.upper()
                 if hasattr(ln.status, "value")
                 else str(ln.status).upper()
             )
-            if ln.start_point and ln.end_point:
-                endpoint_map[(ln.start_point, ln.end_point)] = status_str
-            if ln.filename:
-                filename_map[ln.filename] = status_str
-
-        if not endpoint_map and not filename_map:
+            for ln in self._lines
+            if ln.filename
+        }
+        if not filename_map:
             return
 
         self._layer.startEditing()
         for feat in self._layer.getFeatures():
-            status_str = None
-
-            # Strategy 1: match by start_point + end_point
-            if start_idx >= 0 and end_idx >= 0:
-                key = (str(feat[start_idx]), str(feat[end_idx]))
-                status_str = endpoint_map.get(key)
-
-            # Strategy 2: fall back to filename match
-            if status_str is None and filename_idx >= 0:
-                status_str = filename_map.get(str(feat[filename_idx]))
-
+            fname = str(feat[filename_idx])
+            status_str = filename_map.get(fname)
             if status_str is not None:
                 self._layer.changeAttributeValue(feat.id(), status_idx, status_str)
-
         self._layer.commitChanges()
 
-        # Rebuild the renderer so rule filters re-evaluate against fresh values
+        # Rebuild the renderer so ILIKE rules re-evaluate against fresh values
         _apply_line_renderer(self._layer)
         self.iface.mapCanvas().refresh()
 
@@ -1282,9 +1277,31 @@ class GeoLevelPlugin:
                 return False
 
             resolved = dlg.get_resolved()
+            pid_remap: dict = {}   # ASCII field pid → verified DB name
             for pid, rec in resolved.items():
-                if rec is not None:
-                    db_mgr._cache[pid.strip().upper()] = rec
+                if rec is None:
+                    continue
+                verified_name = rec.name.strip()
+                cache_key = pid.strip().upper()
+                db_mgr._cache[cache_key] = rec
+                # Also cache under the verified DB name so the re-run lookup hits
+                db_mgr._cache[verified_name.upper()] = rec
+                # Only record a rename when the DB name differs from the field ID
+                if verified_name and verified_name != pid:
+                    pid_remap[pid] = verified_name
+
+            # Rename start_point / end_point on new_lines so the re-run uses the
+            # correct (possibly Hebrew) names for GeoJSON export and symbology.
+            if pid_remap:
+                for ln in new_lines:
+                    if ln.start_point in pid_remap:
+                        ln.start_point = pid_remap[ln.start_point]
+                    if ln.end_point in pid_remap:
+                        ln.end_point = pid_remap[ln.end_point]
+
+            # Persist the remap so _process_files can apply it to the fresh
+            # new_lines produced by the post-resolution re-run as well.
+            self._pending_pid_remap = pid_remap
 
             return True
 
