@@ -132,6 +132,11 @@ def _apply_point_labels(layer) -> None:
         pal.setFormat(fmt)
         pal.placement = QgsPalLayerSettings.OrderedPositionsAroundPoint
         pal.displayAll = True   # disable collision avoidance — always draw all labels
+        try:
+            # AllowOverlapIfRequired added in QGIS 3.26; guard for older versions.
+            pal.setOverlapHandling(QgsPalLayerSettings.AllowOverlapIfRequired)
+        except AttributeError:
+            pass
 
         layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
         layer.setLabelsEnabled(True)
@@ -564,6 +569,29 @@ class GeoLevelPlugin:
         if not self._check_point_resolution(new_lines):
             self._lines = self._lines[:-len(new_lines)]
             return
+
+        # Re-run the full geodetic pipeline now that db_mgr._cache contains the
+        # verified/resolved coordinates for every point.  The first run above
+        # had an empty cache, so its GeoJSON used estimated/missing positions.
+        # This second run picks up the confirmed DB coordinates and regenerates
+        # both lines_geojson and points_geojson with the correct geometry.
+        self._lines = self._lines[:-len(new_lines)]   # remove the pre-resolution lines
+        try:
+            result = process_geodetic_data(
+                file_paths=new_paths,
+                leveling_class=leveling_class,
+                output_dir=output_dir,
+            )
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                "Re-run after point resolution failed: " + traceback.format_exc(),
+                "GeoLevelPlugin", level=Qgis.Warning,
+            )
+            # Fall back to the pre-resolution result rather than leaving the
+            # user with nothing.
+            pass
+        new_lines = result["lines"]
+        self._lines.extend(new_lines)
 
         # Seed the DB spatial centroid from the 'נקודות בקרה' control-points layer.
         # This must run before any LSA/loops/double-runs dialog can fire, so the
@@ -1144,38 +1172,61 @@ class GeoLevelPlugin:
     def _sync_map_statuses(self) -> None:
         """Push current in-memory line statuses into the active QGIS line layer.
 
-        Runs after every load and re-validation so the rule-based renderer
-        always paints colours that match the dock's validation table — even
-        when the layer was built before validation completed.
+        Matches layer features to in-memory lines by three strategies in priority
+        order so that renamed/moved files still match:
+          1. start_point + end_point pair (most robust)
+          2. filename attribute (fast path when available)
+        Runs after every load and re-validation so the renderer always reflects
+        the dock's validation table.
         """
         if not self._layer or not self._layer.isValid():
             return
-        status_idx   = self._layer.fields().indexOf("status")
-        filename_idx = self._layer.fields().indexOf("filename")
-        if status_idx < 0 or filename_idx < 0:
+
+        fields        = self._layer.fields()
+        status_idx    = fields.indexOf("status")
+        filename_idx  = fields.indexOf("filename")
+        start_idx     = fields.indexOf("start_point")
+        end_idx       = fields.indexOf("end_point")
+
+        if status_idx < 0:
             return
 
-        # Build a filename → uppercase status string lookup from memory
-        status_map = {
-            ln.filename: (
+        # Build fast lookup tables from in-memory lines
+        endpoint_map: dict = {}   # (start_point, end_point) → status string
+        filename_map: dict = {}   # filename → status string
+        for ln in self._lines:
+            status_str = (
                 ln.status.value.upper()
                 if hasattr(ln.status, "value")
                 else str(ln.status).upper()
             )
-            for ln in self._lines
-            if ln.filename
-        }
-        if not status_map:
+            if ln.start_point and ln.end_point:
+                endpoint_map[(ln.start_point, ln.end_point)] = status_str
+            if ln.filename:
+                filename_map[ln.filename] = status_str
+
+        if not endpoint_map and not filename_map:
             return
 
         self._layer.startEditing()
         for feat in self._layer.getFeatures():
-            fname = str(feat[filename_idx])
-            if fname in status_map:
-                self._layer.changeAttributeValue(
-                    feat.id(), status_idx, status_map[fname]
-                )
+            status_str = None
+
+            # Strategy 1: match by start_point + end_point
+            if start_idx >= 0 and end_idx >= 0:
+                key = (str(feat[start_idx]), str(feat[end_idx]))
+                status_str = endpoint_map.get(key)
+
+            # Strategy 2: fall back to filename match
+            if status_str is None and filename_idx >= 0:
+                status_str = filename_map.get(str(feat[filename_idx]))
+
+            if status_str is not None:
+                self._layer.changeAttributeValue(feat.id(), status_idx, status_str)
+
         self._layer.commitChanges()
+
+        # Rebuild the renderer so rule filters re-evaluate against fresh values
         _apply_line_renderer(self._layer)
         self.iface.mapCanvas().refresh()
 
