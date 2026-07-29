@@ -602,17 +602,34 @@ class BenchmarkDBManager:
         return rec
 
     def get_candidates(self, point_name: str) -> List[BenchmarkRecord]:
-        """Return all raw DB candidates for *point_name* without spatial disambiguation.
+        """Return all DB candidates for *point_name* across ASCII and Hebrew variants.
+
+        Runs PointNormalizer.generate_search_candidates() to expand the raw
+        field ID into every plausible ASCII and Hebrew form, then queries the
+        DB for each candidate and deduplicates results by (name, x, y).
 
         Unlike resolve_benchmark(), this method never auto-selects by proximity
         and never writes to the cache.  It is used by the pre-calculation point
-        verification dialog so the engineer can choose the correct spatial
-        duplicate manually.
+        verification dialog so the engineer can choose the correct match.
         """
         if not self.is_configured():
             return []
-        key = point_name.strip().upper()
-        return self._query_candidates(key)
+
+        try:
+            from core_logic.engine.point_normalizer import PointNormalizer
+            search_names = PointNormalizer.generate_search_candidates(point_name)
+        except Exception:
+            search_names = [point_name.strip().upper()]
+
+        all_hits: List[BenchmarkRecord] = []
+        seen: set = set()
+        for name in search_names:
+            for rec in self._query_candidates(name.strip().upper()):
+                key = f"{rec.name}\x00{rec.x}\x00{rec.y}"
+                if key not in seen:
+                    seen.add(key)
+                    all_hits.append(rec)
+        return all_hits
 
     # ------------------------------------------------------------------ #
     # Internal helpers

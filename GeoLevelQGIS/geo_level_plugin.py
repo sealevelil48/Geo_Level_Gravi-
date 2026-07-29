@@ -31,10 +31,15 @@ _PROJECTS_DIR = os.path.join(_PLUGIN_DIR, "projects")
 def _apply_line_renderer(layer):
     """Apply a live QgsRuleBasedRenderer to a line layer.
 
-    Rules (first match wins):
-      valid            → green  #4CAF50, 1.2 mm
-      valid_by_manager → amber  #FFC107, 1.4 mm
-      ELSE             → red    #F44336, 1.2 mm
+    Rule order (first match wins — order is critical):
+      1. valid_by_manager → amber  #FFC107, 1.4 mm   (must come before valid)
+      2. invalid / error  → red    #F44336, 1.2 mm
+      3. ELSE (valid)     → green  #4CAF50, 1.2 mm
+
+    'valid_by_manager' contains the substring 'valid', so manager must be
+    checked first to prevent it being coloured green by rule 3.
+    ILIKE is used for case-insensitive substring matching so both
+    'VALID_BY_MANAGER' (uppercase from builder) and any legacy variants match.
     """
     try:
         from qgis.core import (
@@ -52,27 +57,30 @@ def _apply_line_renderer(layer):
 
         root = QgsRuleBasedRenderer.Rule(None)
 
-        r_valid = QgsRuleBasedRenderer.Rule(_line_sym("#4CAF50", 1.2))
-        r_valid.setFilterExpression(
-            "upper(\"status\") IN ('VALID', 'OK', 'TRUE', '1')"
-        )
-        r_valid.setLabel("Valid")
-
+        # Rule 1 — Manager override (amber) — MUST be first
         r_mgr = QgsRuleBasedRenderer.Rule(_line_sym("#FFC107", 1.4))
         r_mgr.setFilterExpression(
-            "upper(\"status\") IN ("
-            "'VALID_BY_MANAGER', 'VALID BY MANAGER', "
-            "'MGR', 'OVERRIDE', 'OVERRIDE BY MANAGER', 'VALID BY MGR')"
+            "\"status\" ILIKE '%manager%' OR \"status\" ILIKE '%mgr%'"
         )
         r_mgr.setLabel("Valid by Manager")
 
+        # Rule 2 — Invalid (red)
         r_invalid = QgsRuleBasedRenderer.Rule(_line_sym("#F44336", 1.2))
-        r_invalid.setFilterExpression("ELSE")
+        r_invalid.setFilterExpression(
+            "\"status\" ILIKE '%invalid%' OR \"status\" ILIKE '%fail%' "
+            "OR \"status\" ILIKE '%error%' OR \"status\" ILIKE '%exceed%' "
+            "OR \"status\" ILIKE '%incomplete%' OR \"status\" ILIKE '%naming%'"
+        )
         r_invalid.setLabel("Invalid")
 
-        root.appendChild(r_valid)
+        # Rule 3 — Valid (green) — catch-all ELSE
+        r_valid = QgsRuleBasedRenderer.Rule(_line_sym("#4CAF50", 1.2))
+        r_valid.setFilterExpression("ELSE")
+        r_valid.setLabel("Valid")
+
         root.appendChild(r_mgr)
         root.appendChild(r_invalid)
+        root.appendChild(r_valid)
 
         renderer = QgsRuleBasedRenderer(root)
         layer.setRenderer(renderer)
@@ -92,8 +100,8 @@ def _apply_point_labels(layer) -> None:
     """
     try:
         from qgis.core import (
-            QgsPalLayerSettings, QgsTextFormat, QgsTextBuffer,
-            QgsVectorLayerSimpleLabeling,
+            QgsPalLayerSettings, QgsTextFormat,
+            QgsVectorLayerSimpleLabeling, QgsUnitTypes,
         )
         from qgis.PyQt.QtGui import QColor, QFont
 
@@ -104,19 +112,20 @@ def _apply_point_labels(layer) -> None:
         if label_field is None:
             return
 
-        buf = QgsTextBuffer()
-        buf.setEnabled(True)
-        buf.setSize(1.0)
-        buf.setSizeUnit(QgsTextBuffer.MM)
-        buf.setColor(QColor("white"))
-
         fmt = QgsTextFormat()
         font = QFont("Arial", 9)
         font.setBold(True)
         fmt.setFont(font)
         fmt.setSize(9)
         fmt.setColor(QColor("black"))
-        fmt.setBuffer(buf)
+
+        # QgsTextFormat.buffer() returns the owned QgsTextBufferSettings object.
+        # Mutating it in-place is the correct QGIS 3 pattern — no setBuffer() needed.
+        buf = fmt.buffer()
+        buf.setEnabled(True)
+        buf.setSize(1.0)
+        buf.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+        buf.setColor(QColor("white"))
 
         pal = QgsPalLayerSettings()
         pal.fieldName = label_field
@@ -578,6 +587,9 @@ class GeoLevelPlugin:
 
         self._load_line_layer(result["lines_geojson"], result["line_style"], new_lines)
         self._load_point_layer(result.get("points_geojson", ""), result.get("point_style", ""))
+        # Push validated statuses from memory into the layer attribute table so
+        # the rule-based renderer has fresh, accurate values on first paint.
+        self._sync_map_statuses()
         self._show_dock()
         self.dock.load_lines(self._lines, self._val_results)
 
@@ -1127,6 +1139,44 @@ class GeoLevelPlugin:
                 self.dock.log("Double-Runs ERROR: " + str(exc))
             QMessageBox.critical(self.iface.mainWindow(), "Double-Runs -- Error", str(exc))
 
+    def _sync_map_statuses(self) -> None:
+        """Push current in-memory line statuses into the active QGIS line layer.
+
+        Runs after every load and re-validation so the rule-based renderer
+        always paints colours that match the dock's validation table — even
+        when the layer was built before validation completed.
+        """
+        if not self._layer or not self._layer.isValid():
+            return
+        status_idx   = self._layer.fields().indexOf("status")
+        filename_idx = self._layer.fields().indexOf("filename")
+        if status_idx < 0 or filename_idx < 0:
+            return
+
+        # Build a filename → uppercase status string lookup from memory
+        status_map = {
+            ln.filename: (
+                ln.status.value.upper()
+                if hasattr(ln.status, "value")
+                else str(ln.status).upper()
+            )
+            for ln in self._lines
+            if ln.filename
+        }
+        if not status_map:
+            return
+
+        self._layer.startEditing()
+        for feat in self._layer.getFeatures():
+            fname = str(feat[filename_idx])
+            if fname in status_map:
+                self._layer.changeAttributeValue(
+                    feat.id(), status_idx, status_map[fname]
+                )
+        self._layer.commitChanges()
+        _apply_line_renderer(self._layer)
+        self.iface.mapCanvas().refresh()
+
     def _check_point_resolution(self, new_lines: list) -> bool:
         """Verify ambiguous or unresolved field point IDs before loading.
 
@@ -1145,8 +1195,6 @@ class GeoLevelPlugin:
             if not db_mgr.is_configured():
                 return True
 
-            from core_logic.engine.point_normalizer import PointNormalizer
-
             unique_pids = sorted(
                 {ln.start_point for ln in new_lines if ln.start_point}
                 | {ln.end_point for ln in new_lines if ln.end_point}
@@ -1156,31 +1204,19 @@ class GeoLevelPlugin:
             candidate_map: dict = {}         # pid → List[BenchmarkRecord]
 
             for pid in unique_pids:
-                direct_hits = db_mgr.get_candidates(pid)
+                # get_candidates already runs PointNormalizer internally so this
+                # single call covers ASCII, stripped, and Hebrew transliterations.
+                hits = db_mgr.get_candidates(pid)
 
-                if len(direct_hits) == 1:
-                    # Unambiguous direct match — pre-populate cache and skip dialog.
-                    db_mgr._cache[pid.strip().upper()] = direct_hits[0]
+                if len(hits) == 1:
+                    # Unambiguous single match — pre-populate cache, skip dialog.
+                    db_mgr._cache[pid.strip().upper()] = hits[0]
                     continue
 
-                if len(direct_hits) >= 2:
-                    # Spatial duplicate — engineer must choose.
-                    needs_dialog.append(pid)
-                    candidate_map[pid] = direct_hits
-                    continue
-
-                # Zero direct hits — try Hebrew transliteration expansion.
-                expanded_hits: list = []
-                for candidate_name in PointNormalizer.generate_search_candidates(pid):
-                    if candidate_name == pid or candidate_name == pid.strip().upper():
-                        continue  # already tried
-                    hits = db_mgr.get_candidates(candidate_name)
-                    for rec in hits:
-                        if rec not in expanded_hits:
-                            expanded_hits.append(rec)
-
+                # 0 hits (unresolved) or 2+ hits (spatial duplicate) both need
+                # engineer confirmation before the layer is built.
                 needs_dialog.append(pid)
-                candidate_map[pid] = expanded_hits  # may still be empty
+                candidate_map[pid] = hits
 
             if not needs_dialog:
                 return True
