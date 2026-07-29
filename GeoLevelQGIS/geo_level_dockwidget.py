@@ -591,13 +591,15 @@ class GeoLevelDockWidget(QDockWidget):
             # NORMAL → EXCLUDED
             line.is_used          = False
             line.manager_override = False
-            state_str = "excluded"
+            state_str    = "excluded"
+            emit_status  = "excluded"
         elif not is_used:
             # EXCLUDED → OVERRIDE
             line.is_used          = True
             line.manager_override = True
             line.status           = LineStatus.VALID_BY_MANAGER
-            state_str = "Valid by Manager (override)"
+            state_str    = "Valid by Manager (override)"
+            emit_status  = line.status.value
         else:
             # OVERRIDE → NORMAL
             line.is_used          = True
@@ -620,7 +622,8 @@ class GeoLevelDockWidget(QDockWidget):
                     line.status = LineStatus.VALID
             else:
                 line.status = LineStatus.VALID
-            state_str = "included (normal)"
+            state_str    = "included (normal)"
+            emit_status  = line.status.value
 
         list_item = self.line_list.item(idx)
         if list_item:
@@ -629,7 +632,7 @@ class GeoLevelDockWidget(QDockWidget):
 
         self._refresh_val_table()
         self.log(line.filename + " → " + state_str)
-        self.override_changed.emit(line.filename, line.status.value)
+        self.override_changed.emit(line.filename, emit_status)
 
     def _on_val_table_context_menu(self, pos):
         """
@@ -758,6 +761,10 @@ class GeoLevelDockWidget(QDockWidget):
             list_item.setForeground(self._list_item_color(idx))
         self._refresh_val_table()
         self.log(line.filename + (" → excluded" if exclude else " → re-included"))
+        # Emit so _on_override_changed updates the QGIS layer attribute and
+        # triggers a map repaint (transparent rule for excluded lines).
+        emit_status = "excluded" if exclude else line.status.value
+        self.override_changed.emit(line.filename, emit_status)
 
     def _export_validation_to_excel(self):
         """Export the current validation table to a colour-coded .xlsx file."""

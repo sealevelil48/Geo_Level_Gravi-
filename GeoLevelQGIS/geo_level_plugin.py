@@ -59,9 +59,14 @@ def _apply_line_renderer(layer):
 
         root = QgsRuleBasedRenderer.Rule(None)
 
-        # Rule 0 — Excluded (transparent) — MUST be first so excluded lines
-        # are invisible rather than falling through to green.
-        r_excl = QgsRuleBasedRenderer.Rule(_line_sym("0,0,0,0", 0))
+        # Rule 0 — Excluded (invisible) — MUST be first so excluded lines
+        # are not rendered rather than falling through to green.
+        sym_excl = QgsLineSymbol.createSimple({
+            "line_style": "no",
+            "color": "0,0,0,0",
+            "width": "0",
+        })
+        r_excl = QgsRuleBasedRenderer.Rule(sym_excl)
         r_excl.setFilterExpression("\"status\" ILIKE '%exclud%'")
         r_excl.setLabel("Excluded")
 
@@ -1204,13 +1209,20 @@ class GeoLevelPlugin:
         if status_idx < 0 or filename_idx < 0:
             return
 
-        # filename → uppercase status value string (used by ILIKE rules)
-        filename_map: dict = {
-            ln.filename: (
+        # filename → uppercase status string for the ILIKE renderer rules.
+        # Excluded lines (is_used=False) write "EXCLUDED" regardless of the
+        # LineStatus enum value, which still holds the original validation result.
+        def _status_str(ln) -> str:
+            if not getattr(ln, "is_used", True):
+                return "EXCLUDED"
+            return (
                 ln.status.value.upper()
                 if hasattr(ln.status, "value")
                 else str(ln.status).upper()
             )
+
+        filename_map: dict = {
+            ln.filename: _status_str(ln)
             for ln in self._lines
             if ln.filename
         }
