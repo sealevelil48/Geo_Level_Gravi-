@@ -210,6 +210,7 @@ def process_geodetic_data(
     file_paths: List[str],
     leveling_class: str,
     output_dir: str,
+    name_overrides: dict = None,
 ) -> Dict:
     """
     Parse, validate and export a list of measurement files.
@@ -256,6 +257,15 @@ def process_geodetic_data(
         raise RuntimeError(
             "No files could be parsed.\n" + "\n".join(parse_errors)
         )
+
+    # Apply verified DB name overrides (e.g. ASCII → Hebrew) before any
+    # validation, coordinate resolution, or GeoJSON export runs.
+    if name_overrides:
+        for ln in lines:
+            if ln.start_point in name_overrides:
+                ln.start_point = name_overrides[ln.start_point]
+            if ln.end_point in name_overrides:
+                ln.end_point = name_overrides[ln.end_point]
 
     # ------------------------------------------------------------------ #
     # 2. Apply selected class to validator

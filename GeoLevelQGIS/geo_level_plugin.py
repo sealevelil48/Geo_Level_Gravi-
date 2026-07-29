@@ -47,25 +47,33 @@ def _apply_line_renderer(layer):
         )
         from qgis.PyQt.QtGui import QColor
 
-        def _line_sym(hex_color, width_mm):
+        def _line_sym(hex_color, width_mm, offset_mm=0.0):
             sym = QgsLineSymbol.createSimple({
                 "color": hex_color,
                 "width": str(width_mm),
                 "capstyle": "round",
+                "offset": str(offset_mm),
+                "offset_unit": "MM",
             })
             return sym
 
         root = QgsRuleBasedRenderer.Rule(None)
 
-        # Rule 1 — Manager override (amber) — MUST be first
-        r_mgr = QgsRuleBasedRenderer.Rule(_line_sym("#FFC107", 1.4))
+        # Rule 0 — Excluded (transparent) — MUST be first so excluded lines
+        # are invisible rather than falling through to green.
+        r_excl = QgsRuleBasedRenderer.Rule(_line_sym("0,0,0,0", 0))
+        r_excl.setFilterExpression("\"status\" ILIKE '%exclud%'")
+        r_excl.setLabel("Excluded")
+
+        # Rule 1 — Manager override (amber) — before valid to avoid substring match
+        r_mgr = QgsRuleBasedRenderer.Rule(_line_sym("#FFC107", 1.4, 0.6))
         r_mgr.setFilterExpression(
             "\"status\" ILIKE '%manager%' OR \"status\" ILIKE '%mgr%'"
         )
         r_mgr.setLabel("Valid by Manager")
 
         # Rule 2 — Invalid (red)
-        r_invalid = QgsRuleBasedRenderer.Rule(_line_sym("#F44336", 1.2))
+        r_invalid = QgsRuleBasedRenderer.Rule(_line_sym("#F44336", 1.2, 0.6))
         r_invalid.setFilterExpression(
             "\"status\" ILIKE '%invalid%' OR \"status\" ILIKE '%fail%' "
             "OR \"status\" ILIKE '%error%' OR \"status\" ILIKE '%exceed%' "
@@ -74,10 +82,11 @@ def _apply_line_renderer(layer):
         r_invalid.setLabel("Invalid")
 
         # Rule 3 — Valid (green) — catch-all ELSE
-        r_valid = QgsRuleBasedRenderer.Rule(_line_sym("#4CAF50", 1.2))
+        r_valid = QgsRuleBasedRenderer.Rule(_line_sym("#4CAF50", 1.2, 0.6))
         r_valid.setFilterExpression("ELSE")
         r_valid.setLabel("Valid")
 
+        root.appendChild(r_excl)
         root.appendChild(r_mgr)
         root.appendChild(r_invalid)
         root.appendChild(r_valid)
@@ -576,11 +585,16 @@ class GeoLevelPlugin:
         # This second run picks up the confirmed DB coordinates and regenerates
         # both lines_geojson and points_geojson with the correct geometry.
         self._lines = self._lines[:-len(new_lines)]   # remove the pre-resolution lines
+        # Pass verified name overrides so process_geodetic_data applies them
+        # before validation and GeoJSON export — fixes INVALID_ENDPOINT errors
+        # and missing symbols caused by ASCII names reaching the exporter.
+        pid_remap = getattr(self, "_pending_pid_remap", {})
         try:
             result = process_geodetic_data(
                 file_paths=new_paths,
                 leveling_class=leveling_class,
                 output_dir=output_dir,
+                name_overrides=pid_remap or None,
             )
         except Exception as exc:
             QgsMessageLog.logMessage(
@@ -589,20 +603,10 @@ class GeoLevelPlugin:
             )
             # Fall back to the pre-resolution result rather than leaving the
             # user with nothing.
-            pass
-        new_lines = result["lines"]
-
-        # Apply the Hebrew/verified name remap to the fresh new_lines so the
-        # correct DB names are used for GeoJSON export, symbology, and LSA.
-        pid_remap = getattr(self, "_pending_pid_remap", {})
-        if pid_remap:
-            for ln in new_lines:
-                if ln.start_point in pid_remap:
-                    ln.start_point = pid_remap[ln.start_point]
-                if ln.end_point in pid_remap:
-                    ln.end_point = pid_remap[ln.end_point]
+        finally:
             self._pending_pid_remap = {}   # consume — one-shot per load
 
+        new_lines = result["lines"]
         self._lines.extend(new_lines)
 
         # Seed the DB spatial centroid from the 'נקודות בקרה' control-points layer.
