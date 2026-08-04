@@ -788,34 +788,41 @@ class GeoLevelPlugin:
     def _on_override_changed(self, filename: str, new_status: str):
         """Update the 'status' attribute on the matching line feature in the
         active QGIS layer and immediately repaint the canvas so colour changes
-        (valid=green / invalid=red / VALID_BY_MANAGER=amber) are reflected
-        without requiring a full pipeline re-run."""
-        if not self._layer or not self._layer.isValid():
+        (valid=green / invalid=red / VALID_BY_MANAGER=amber / excluded=invisible)
+        are reflected without requiring a full pipeline re-run."""
+        # Prefer cached reference; fall back to project name lookup so this
+        # works even when self._layer is stale or None.
+        layer = self._layer if (self._layer and self._layer.isValid()) else None
+        if layer is None:
+            try:
+                from qgis.core import QgsProject
+                hits = QgsProject.instance().mapLayersByName("Geodetic Results")
+                if hits:
+                    layer = hits[-1]
+            except Exception:
+                pass
+        if layer is None or not layer.isValid():
             return
 
-        status_idx = self._layer.fields().indexOf("status")
-        filename_idx = self._layer.fields().indexOf("filename")
+        status_idx   = layer.fields().indexOf("status")
+        filename_idx = layer.fields().indexOf("filename")
         if status_idx < 0 or filename_idx < 0:
             return
 
-        # Always write uppercase so the IN() filter in _apply_line_renderer
-        # matches without relying on lower()/upper() at render time.
-        # new_status from LineStatus.value is e.g. "valid_by_manager" (lower);
-        # we normalise to uppercase here for unambiguous filter matching.
+        # Always write uppercase so the ILIKE rules in _apply_line_renderer match.
+        # The dock emits "excluded" (lowercase) for excluded lines — normalise here.
         status_value = new_status.upper()
 
-        self._layer.startEditing()
+        layer.startEditing()
         changed = 0
-        for feat in self._layer.getFeatures():
+        for feat in layer.getFeatures():
             if str(feat[filename_idx]) == filename:
-                self._layer.changeAttributeValue(feat.id(), status_idx, status_value)
+                layer.changeAttributeValue(feat.id(), status_idx, status_value)
                 changed += 1
-        self._layer.commitChanges()
+        layer.commitChanges()
 
         if changed:
-            # Re-apply renderer so rule filters re-evaluate against the newly
-            # committed attribute value — triggerRepaint alone can miss this.
-            _apply_line_renderer(self._layer)
+            _apply_line_renderer(layer)
             self.iface.mapCanvas().refresh()
             QgsMessageLog.logMessage(
                 f"Override repaint: '{filename}' → status='{status_value}' "
@@ -1199,10 +1206,22 @@ class GeoLevelPlugin:
         Runs after every load and re-validation so the renderer always reflects
         the dock's validation table.
         """
-        if not self._layer or not self._layer.isValid():
+        # Prefer the cached reference; fall back to QgsProject name lookup so
+        # the method works even if self._layer was not set yet (e.g. when the
+        # builder path sets the layer but a code path doesn't update the ref).
+        layer = self._layer if (self._layer and self._layer.isValid()) else None
+        if layer is None:
+            try:
+                from qgis.core import QgsProject
+                hits = QgsProject.instance().mapLayersByName("Geodetic Results")
+                if hits:
+                    layer = hits[-1]   # last added = most recent load
+            except Exception:
+                pass
+        if layer is None or not layer.isValid():
             return
 
-        fields       = self._layer.fields()
+        fields       = layer.fields()
         status_idx   = fields.indexOf("status")
         filename_idx = fields.indexOf("filename")
 
@@ -1229,16 +1248,16 @@ class GeoLevelPlugin:
         if not filename_map:
             return
 
-        self._layer.startEditing()
-        for feat in self._layer.getFeatures():
+        layer.startEditing()
+        for feat in layer.getFeatures():
             fname = str(feat[filename_idx])
             status_str = filename_map.get(fname)
             if status_str is not None:
-                self._layer.changeAttributeValue(feat.id(), status_idx, status_str)
-        self._layer.commitChanges()
+                layer.changeAttributeValue(feat.id(), status_idx, status_str)
+        layer.commitChanges()
 
         # Rebuild the renderer so ILIKE rules re-evaluate against fresh values
-        _apply_line_renderer(self._layer)
+        _apply_line_renderer(layer)
         self.iface.mapCanvas().refresh()
 
     def _check_point_resolution(self, new_lines: list) -> bool:
