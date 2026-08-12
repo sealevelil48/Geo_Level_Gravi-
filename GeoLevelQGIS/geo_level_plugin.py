@@ -1592,8 +1592,21 @@ class GeoLevelPlugin:
             dlg = GeoLevelPointExclusionDialog(self._lines, self.iface.mainWindow())
             if dlg.exec_():
                 self._lines = dlg.updated_lines
+
+                # Re-validate to prevent deepcopy desync with self._val_results
+                try:
+                    from core_logic.validators import BatchValidator
+                    cls = self.dock.get_selected_class() if self.dock else self._last_class
+                    bv = BatchValidator(leveling_class=int(cls[1]))
+                    self._val_results = bv.validate_batch(self._lines)
+                except Exception:
+                    pass
+
                 if self.dock:
                     self.dock.load_lines(self._lines, self._val_results)
+
+                # Push the EXCLUDED statuses to the QGIS map instantly
+                self._sync_map_statuses()
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)

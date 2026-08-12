@@ -87,6 +87,14 @@ class LevelingValidator:
         # Tolerance check (uses new formula if available)
         result.tolerance_valid = self._check_tolerance(line, result)
 
+        # CRITICAL FIX: Ensure line.status reflects the final validation truth
+        # so the QGIS map renderer does not falsely paint invalid lines green.
+        # The regulation checks (line length, sight distances, method, balance)
+        # only set result.is_valid=False via add_error and never touch line.status,
+        # so a line failing only those keeps the default LineStatus.VALID.
+        if not result.is_valid and line.status == LineStatus.VALID:
+            line.status = LineStatus.EXCEEDED_TOLERANCE
+
         return result
     
     def _check_endpoint(self, line: LevelingLine, result: ValidationResult) -> bool:
