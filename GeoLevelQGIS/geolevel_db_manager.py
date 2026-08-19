@@ -633,6 +633,79 @@ class BenchmarkDBManager:
                     all_hits.append(rec)
         return all_hits
 
+    def get_candidates_batch(self, point_names: List[str]) -> Dict[str, List[BenchmarkRecord]]:
+        """
+        Batch-fetch all DB candidates for multiple point names in one optimized pass.
+
+        Expands each point name into ASCII/Hebrew variants, then runs ONE batch SQL query
+        for all candidates, dramatically faster than looping with individual get_candidates()
+        calls.  Useful for pre-calculation point verification before layer building.
+
+        Args:
+            point_names: List of field point IDs to resolve.
+
+        Returns:
+            Dict mapping each input point_name → List[BenchmarkRecord] (may be empty).
+        """
+        if not self.is_configured():
+            return {pn: [] for pn in point_names}
+
+        result: Dict[str, List[BenchmarkRecord]] = {pn: [] for pn in point_names}
+
+        if not point_names:
+            return result
+
+        try:
+            from core_logic.engine.point_normalizer import PointNormalizer
+        except Exception:
+            PointNormalizer = None
+
+        # Expand all names into search variants
+        all_search_names: List[str] = []
+        name_to_search_names: Dict[str, List[str]] = {}
+
+        for pn in point_names:
+            if PointNormalizer:
+                try:
+                    variants = PointNormalizer.generate_search_candidates(pn)
+                except Exception:
+                    variants = [pn.strip().upper()]
+            else:
+                variants = [pn.strip().upper()]
+
+            variants = [v.strip().upper() for v in variants]
+            name_to_search_names[pn] = variants
+            all_search_names.extend(variants)
+
+        # Query all unique search names in one pass
+        all_unique = list(set(all_search_names))
+        logger.debug("Batch query: %d unique search names from %d input points",
+                     len(all_unique), len(point_names))
+
+        batch_records: List[BenchmarkRecord] = []
+        seen: set = set()
+
+        for search_name in all_unique:
+            for rec in self._query_candidates(search_name):
+                key = f"{rec.name}\x00{rec.x}\x00{rec.y}"
+                if key not in seen:
+                    seen.add(key)
+                    batch_records.append(rec)
+
+        # Map batch results back to input point names
+        for pn in point_names:
+            search_names_for_pn = name_to_search_names[pn]
+            matches = []
+            for rec in batch_records:
+                # Check if this record's name matches any variant for this point
+                for sv in search_names_for_pn:
+                    if self._normalize_name(rec.name) == self._normalize_name(sv):
+                        matches.append(rec)
+                        break
+            result[pn] = matches
+
+        return result
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #

@@ -376,6 +376,8 @@ class GeoLevelPlugin:
         self._layer = None
         self._last_output_dir = ""
         self._last_class = "H3"
+        self._pending_pid_remap = {}         # Point ID remaps from resolution dialog
+        self._pending_marker_pids = {}       # Marker PIDs (estimate/pkt) from resolution
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -492,7 +494,7 @@ class GeoLevelPlugin:
             layer.selectionChanged.connect(lambda: self._sync_dock_to_map(layer))
 
     def _sync_dock_to_map(self, layer):
-        """When a feature is selected on the map, highlight it in the dock."""
+        """When a feature is selected on the map, highlight it in the dock and populate details."""
         selected_ids = layer.selectedFeatureIds()
         if not selected_ids or not self.dock:
             return
@@ -500,6 +502,10 @@ class GeoLevelPlugin:
         filename = feat["filename"] if feat.fields().indexOf("filename") >= 0 else None
         if filename:
             self.dock.select_line_by_filename(filename)
+            # Trigger the same logic as if the user clicked the list manually
+            idx = self.dock.get_current_index()
+            if idx >= 0 and idx < len(self._lines):
+                self._on_line_selected(idx)
 
     # ------------------------------------------------------------------
     # File loading / processing
@@ -868,7 +874,8 @@ class GeoLevelPlugin:
         data = {
             "class": self._last_class,
             "output_dir": output_dir,
-            "files": [ln.filename for ln in self._lines],
+            # Store absolute paths using os.path.abspath for robustness
+            "files": [os.path.abspath(ln.filename) for ln in self._lines],
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -888,13 +895,30 @@ class GeoLevelPlugin:
         files      = data.get("files", [])
         cls        = data.get("class", "H3")
         output_dir = data.get("output_dir", "")
-        missing = [fp for fp in files if not os.path.exists(fp)]
+
+        # Resolve files with fallback: if absolute path fails, search .glp directory
+        # This allows users to bundle .DAT files and .glp file in a single folder
+        glp_dir = os.path.dirname(path)
+        resolved_files = []
+        for fp in files:
+            if os.path.exists(fp):
+                # Absolute path works — use it
+                resolved_files.append(fp)
+            else:
+                # Try relative to .glp file location
+                basename = os.path.basename(fp)
+                fallback = os.path.join(glp_dir, basename)
+                if os.path.exists(fallback):
+                    resolved_files.append(fallback)
+
+        missing = [fp for fp in files if not os.path.exists(fp)
+                   and not os.path.exists(os.path.join(glp_dir, os.path.basename(fp)))]
         if missing:
             QMessageBox.warning(self.iface.mainWindow(), "Load Project",
                                 "The following DAT files could not be found and will be skipped:\n"
                                 + "\n".join(missing))
-            files = [fp for fp in files if os.path.exists(fp)]
-        if not files:
+
+        if not resolved_files:
             QMessageBox.warning(self.iface.mainWindow(), "Load Project",
                                 "No loadable files found in this project.")
             return
@@ -902,14 +926,14 @@ class GeoLevelPlugin:
         # If the saved output directory is gone, derive one from the first DAT
         # file so _process_files never stalls on a directory picker dialog.
         if not output_dir or not os.path.isdir(output_dir):
-            output_dir = os.path.dirname(files[0])
+            output_dir = os.path.dirname(resolved_files[0])
 
         self._last_class = cls
         self._last_output_dir = output_dir
         # Clear existing lines so deduplication does not silently block re-load
         self._lines = []
         self._val_results = []
-        self._process_files(files, cls, output_dir)
+        self._process_files(resolved_files, cls, output_dir)
 
     def _new_project(self):
         """Clear all loaded data and start a fresh session."""
@@ -1286,10 +1310,11 @@ class GeoLevelPlugin:
             needs_dialog: list = []          # pids requiring user confirmation
             candidate_map: dict = {}         # pid → List[BenchmarkRecord]
 
+            # Batch-fetch all candidates in one query instead of N individual calls
+            batch_results = db_mgr.get_candidates_batch(unique_pids)
+
             for pid in unique_pids:
-                # get_candidates already runs PointNormalizer internally so this
-                # single call covers ASCII, stripped, and Hebrew transliterations.
-                hits = db_mgr.get_candidates(pid)
+                hits = batch_results[pid]
 
                 if len(hits) == 1:
                     # Unambiguous single match — pre-populate cache, skip dialog.
@@ -1311,11 +1336,30 @@ class GeoLevelPlugin:
             if not dlg.exec_():
                 return False
 
-            resolved = dlg.get_resolved()
-            pid_remap: dict = {}   # ASCII field pid → verified DB name
-            for pid, rec in resolved.items():
+            result = dlg.get_resolved()
+            records = result["records"]
+            modes = result["modes"]
+
+            pid_remap: dict = {}          # ASCII field pid → verified DB name
+            excluded_pids: set = set()     # pids marked for exclusion
+            marker_pids: dict = {}         # pids with estimate/pkt markers
+
+            for pid, rec in records.items():
+                mode = modes[pid]
+
+                if mode == "exclude":
+                    excluded_pids.add(pid)
+                    continue
+
+                if mode in ("estimate", "pkt_average"):
+                    # Track marker records for the engine to process
+                    marker_pids[pid] = (rec, mode)
+                    continue
+
+                # mode == "use_selected"
                 if rec is None:
                     continue
+
                 verified_name = rec.name.strip()
                 cache_key = pid.strip().upper()
                 db_mgr._cache[cache_key] = rec
@@ -1324,6 +1368,13 @@ class GeoLevelPlugin:
                 # Only record a rename when the DB name differs from the field ID
                 if verified_name and verified_name != pid:
                     pid_remap[pid] = verified_name
+
+            # Remove excluded points from the lines entirely
+            if excluded_pids:
+                new_lines[:] = [
+                    ln for ln in new_lines
+                    if ln.start_point not in excluded_pids and ln.end_point not in excluded_pids
+                ]
 
             # Rename start_point / end_point on new_lines so the re-run uses the
             # correct (possibly Hebrew) names for GeoJSON export and symbology.
@@ -1334,9 +1385,10 @@ class GeoLevelPlugin:
                     if ln.end_point in pid_remap:
                         ln.end_point = pid_remap[ln.end_point]
 
-            # Persist the remap so _process_files can apply it to the fresh
-            # new_lines produced by the post-resolution re-run as well.
+            # Persist the remap and marker data so _process_files can apply them
+            # to the fresh new_lines produced by the post-resolution re-run.
             self._pending_pid_remap = pid_remap
+            self._pending_marker_pids = marker_pids
 
             return True
 

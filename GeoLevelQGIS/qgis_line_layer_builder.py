@@ -150,12 +150,12 @@ class QGISLineLayerBuilder:
 
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField("start_point",       QVariant.String),
-            QgsField("end_point",         QVariant.String),
-            QgsField("filename",          QVariant.String),
-            QgsField("total_distance",    QVariant.Double),
-            QgsField("total_height_diff", QVariant.Double),
-            QgsField("status",            QVariant.String),
+            QgsField("start_point",       type=QVariant.String),
+            QgsField("end_point",         type=QVariant.String),
+            QgsField("filename",          type=QVariant.String),
+            QgsField("total_distance",    type=QVariant.Double),
+            QgsField("total_height_diff", type=QVariant.Double),
+            QgsField("status",            type=QVariant.String),
         ])
         layer.updateFields()
         logger.info(

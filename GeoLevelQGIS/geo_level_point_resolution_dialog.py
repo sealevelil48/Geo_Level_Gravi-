@@ -44,11 +44,12 @@ class GeoLevelPointResolutionDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Point Verification / אימות נקודות")
-        self.setMinimumSize(860, 420)
+        self.setMinimumSize(1000, 480)
         self._target_points = target_points
         self._candidate_map = candidate_map
-        self._combos: Dict[str, QComboBox] = {}
-        self._edits: Dict[str, QLineEdit] = {}
+        self._combos: Dict[str, QComboBox] = {}          # field ID → DB candidate dropdown
+        self._edits: Dict[str, QLineEdit] = {}            # field ID → manual name override
+        self._handling: Dict[str, QComboBox] = {}         # field ID → handling mode dropdown
         self._setup_ui()
         self._populate()
 
@@ -71,17 +72,19 @@ class GeoLevelPointResolutionDialog(QDialog):
         info.setWordWrap(True)
         root.addWidget(info)
 
-        self._table = QTableWidget(0, 3)
+        self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels([
             "Field Point ID",
             "DB Candidate  (Name | Easting | Northing | Height | Class)",
             "Manual Name Override",
+            "Handling Option",
         ])
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self._table.verticalHeader().setVisible(False)
         root.addWidget(self._table)
 
@@ -127,6 +130,15 @@ class GeoLevelPointResolutionDialog(QDialog):
             self._table.setCellWidget(row, 2, edit)
             self._edits[pid] = edit
 
+            # Column 3 — handling option
+            handling_combo = QComboBox()
+            handling_combo.addItem("Use Selected Match", "use_selected")
+            handling_combo.addItem("Exclude from Project", "exclude")
+            handling_combo.addItem("Point Not Found (Estimate)", "estimate")
+            handling_combo.addItem("PKT (Average Neighbors)", "pkt_average")
+            self._table.setCellWidget(row, 3, handling_combo)
+            self._handling[pid] = handling_combo
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -149,20 +161,56 @@ class GeoLevelPointResolutionDialog(QDialog):
     # ------------------------------------------------------------------
 
     def get_resolved(self) -> Dict[str, object]:
-        """Return mapping of field PID → BenchmarkRecord (or synthetic record).
+        """Return mapping of field PID → handling mode and resolution data.
 
         Must be called only after the dialog has been accepted (exec_() returned
-        QDialog.Accepted).  For manual-override entries a minimal synthetic
-        BenchmarkRecord is created so callers can always access `.name` and
-        `.gova_ort` without branching.
+        QDialog.Accepted).
+
+        Returns a dict with two keys:
+          'records': Dict[pid → BenchmarkRecord | None]
+          'modes':   Dict[pid → handling mode string]
+
+        Handling modes:
+          'use_selected' — use the DB candidate or manual override
+          'exclude' — skip this point from the project
+          'estimate' — point not found; ask engine to estimate from neighbors
+          'pkt_average' — PKT point; use average of all neighbor positions
         """
         from geolevel_db_manager import BenchmarkRecord  # local import — avoids circular dep
 
-        resolved: Dict[str, object] = {}
+        records: Dict[str, object] = {}
+        modes: Dict[str, str] = {}
+
         for pid in self._target_points:
+            mode = self._handling[pid].currentData()
+            modes[pid] = mode
+
+            if mode == "exclude":
+                records[pid] = None
+                continue
+
+            if mode in ("estimate", "pkt_average"):
+                # For these modes, create a synthetic marker record so the engine
+                # can recognize them and apply topological estimation/averaging logic.
+                synthetic = BenchmarkRecord(
+                    ot_nekuda="",
+                    mispar_nekuda=0,
+                    name=f"[{mode.upper()}:{pid}]",
+                    gova_ort=None,
+                    shem_darga_gova=None,
+                    taarih_gova_ort=None,
+                    ot_nekuda_kfula=None,
+                    mispar_nekuda_kfula=None,
+                    x=None,
+                    y=None,
+                )
+                records[pid] = synthetic
+                continue
+
+            # mode == "use_selected" (default)
             manual = self._edits[pid].text().strip()
             if manual:
-                resolved[pid] = BenchmarkRecord(
+                records[pid] = BenchmarkRecord(
                     ot_nekuda="",
                     mispar_nekuda=0,
                     name=manual,
@@ -177,5 +225,6 @@ class GeoLevelPointResolutionDialog(QDialog):
             else:
                 combo = self._combos[pid]
                 rec = combo.currentData()
-                resolved[pid] = rec  # may be None if "(no DB match)" was selected
-        return resolved
+                records[pid] = rec  # may be None if "(no DB match)" was selected
+
+        return {"records": records, "modes": modes}
