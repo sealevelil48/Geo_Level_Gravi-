@@ -182,7 +182,9 @@ class TrimbleParser(BaseParser):
                 # not the full raw line.  This prevents a point ID that begins
                 # with a label letter (e.g. "Z123" in col 2) from being mistaken
                 # for a height or distance field.
-                data_cols = '|'.join(parts[3:]) if len(parts) > 3 else ''
+                # \x00 is used as the separator so no regex pattern (including
+                # \s, ., or any character class) can span across column boundaries.
+                data_cols = '\x00'.join(parts[3:]) if len(parts) > 3 else ''
                 rb_match = self.rb_pattern.search(data_cols)
                 rf_match = self.rf_pattern.search(data_cols)
                 z_match  = self.z_pattern.search(data_cols)
@@ -281,7 +283,8 @@ class TrimbleParser(BaseParser):
                     leveling_line.end_point = point_id
 
                 # Apply value patterns only to the data columns, same as KD1.
-                kd2_data = '|'.join(parts[3:]) if len(parts) > 3 else ''
+                # \x00 separator prevents cross-column pattern matches.
+                kd2_data = '\x00'.join(parts[3:]) if len(parts) > 3 else ''
 
                 # Use the instrument's authoritative summary distances (Db + Df)
                 db_match = self.db_pattern.search(kd2_data)
