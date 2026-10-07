@@ -451,7 +451,7 @@ class GeoLevelDockWidget(QDockWidget):
     def _populate_setup_table(self, line):
         self.setup_table.setRowCount(len(line.setups))
         for row, s in enumerate(line.setups):
-            dist = ((s.distance_back or 0) + (s.distance_fore or 0)) / 2
+            dist = (s.distance_back or 0) + (s.distance_fore or 0)
             bs = "{:.5f}".format(s.backsight_reading) if s.backsight_reading is not None else "--"
             fs = "{:.5f}".format(s.foresight_reading) if s.foresight_reading is not None else "--"
             for col, val in enumerate([

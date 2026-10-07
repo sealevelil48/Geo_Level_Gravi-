@@ -194,7 +194,7 @@ class TrimbleParser(BaseParser):
                 if db_match and df_match:
                     db = float(db_match.group(1))
                     df = float(df_match.group(1))
-                    leveling_line.total_distance = (db + df) / 2
+                    leveling_line.total_distance = db + df
         
         # Calculate totals if not already set
         if leveling_line.total_distance == 0:

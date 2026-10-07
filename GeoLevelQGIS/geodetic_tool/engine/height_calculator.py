@@ -50,17 +50,17 @@ def calculate_line_totals(line: LevelingLine) -> Tuple[float, float]:
     total_height_diff = 0.0
     
     for setup in line.setups:
-        # Average distance for each setup
-        setup_dist = (setup.distance_back + setup.distance_fore) / 2
+        # Total distance per setup = backsight distance + foresight distance
+        setup_dist = (setup.distance_back + setup.distance_fore)
         total_distance += setup_dist
-        
+
         # Height difference
         if setup.height_diff is not None:
             total_height_diff += setup.height_diff
         elif setup.backsight_reading and setup.foresight_reading:
             dh = calculate_height_diff(setup.backsight_reading, setup.foresight_reading)
             total_height_diff += dh
-    
+
     return total_distance, total_height_diff
 
 
@@ -138,7 +138,7 @@ def distribute_misclosure(
             return [0.0] * n_setups
         
         for setup in line.setups:
-            setup_dist = (setup.distance_back + setup.distance_fore) / 2
+            setup_dist = (setup.distance_back + setup.distance_fore)
             proportion = setup_dist / total_distance
             correction = -misclosure * proportion
             corrections.append(correction)
@@ -250,8 +250,8 @@ def merge_bf_measurements(
     
     # Mean of forward and negative of backward
     mean_dh = (forward_dh - backward_dh) / 2
-    
-    # BF difference in mm
+
+    # BF difference in mm (misclosure / closure error)
     bf_diff = (forward_dh + backward_dh) * 1000
-    
+
     return mean_dh, bf_diff

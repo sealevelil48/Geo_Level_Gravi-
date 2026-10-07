@@ -84,7 +84,7 @@ class LevelingLine:
     def calculate_totals(self):
         """Calculate total distance and height difference from setups."""
         self.total_distance = sum(
-            (s.distance_back + s.distance_fore) / 2 for s in self.setups
+            s.distance_back + s.distance_fore for s in self.setups
         )
         self.total_height_diff = sum(
             s.height_diff for s in self.setups if s.height_diff is not None
