@@ -120,7 +120,6 @@ class TrimbleParser(BaseParser):
         prev_z             = 0.0    # cumulative Z before this station
         setup_number       = 0
         in_measurement     = False
-        next_station_is_repeat = False  # set when "Station repeated" TO line is seen
 
         for raw_line in lines:
             line = raw_line.strip()
@@ -151,15 +150,22 @@ class TrimbleParser(BaseParser):
 
                 elif 'Station repeated' in text:
                     # The NEXT station block replaces the LAST committed setup.
-                    # Roll back: remove that setup and restore prev_z to the
-                    # Z value before it was committed.
+                    # 1. Roll back the last committed setup and its Z contribution.
                     if leveling_line.setups:
                         discarded = leveling_line.setups.pop()
                         prev_z = discarded.cumulative_height - discarded.height_diff \
                                  if discarded.height_diff is not None \
                                  else prev_z
                         setup_number -= 1
-                    next_station_is_repeat = False  # already rolled back
+                    # 2. Also clear any partial in-progress block state so readings
+                    #    from the discarded attempt do not bleed into the replacement.
+                    current_from_point = None
+                    current_to_point   = None
+                    current_rb1 = current_rb2 = None
+                    current_rf1 = current_rf2 = None
+                    current_rb1_dist = current_rb2_dist = None
+                    current_rf1_dist = current_rf2_dist = None
+                    rb_count = rf_count = 0
 
                 continue
 
@@ -172,11 +178,16 @@ class TrimbleParser(BaseParser):
                 if temp_match:
                     current_temp = float(temp_match.group(1))
 
-                rb_match = self.rb_pattern.search(line)
-                rf_match = self.rf_pattern.search(line)
-                z_match  = self.z_pattern.search(line)
-                sh_match = self.sh_pattern.search(line)
-                hd_match = self.hd_pattern.search(line)
+                # Apply value patterns only to the data columns (parts[3..5]),
+                # not the full raw line.  This prevents a point ID that begins
+                # with a label letter (e.g. "Z123" in col 2) from being mistaken
+                # for a height or distance field.
+                data_cols = '|'.join(parts[3:]) if len(parts) > 3 else ''
+                rb_match = self.rb_pattern.search(data_cols)
+                rf_match = self.rf_pattern.search(data_cols)
+                z_match  = self.z_pattern.search(data_cols)
+                sh_match = self.sh_pattern.search(data_cols)
+                hd_match = self.hd_pattern.search(data_cols)
 
                 hd_val = float(hd_match.group(1)) if hd_match else 0.0
 
@@ -269,9 +280,12 @@ class TrimbleParser(BaseParser):
                 if point_id:
                     leveling_line.end_point = point_id
 
+                # Apply value patterns only to the data columns, same as KD1.
+                kd2_data = '|'.join(parts[3:]) if len(parts) > 3 else ''
+
                 # Use the instrument's authoritative summary distances (Db + Df)
-                db_match = self.db_pattern.search(line)
-                df_match = self.df_pattern.search(line)
+                db_match = self.db_pattern.search(kd2_data)
+                df_match = self.df_pattern.search(kd2_data)
                 if db_match and df_match:
                     leveling_line.total_distance = (
                         float(db_match.group(1)) + float(df_match.group(1))
@@ -280,7 +294,7 @@ class TrimbleParser(BaseParser):
                 # The KD2 Z field is the final cumulative dH for the whole line —
                 # use it directly instead of summing per-setup values to avoid any
                 # floating-point accumulation error.
-                z_match = self.z_pattern.search(line)
+                z_match = self.z_pattern.search(kd2_data)
                 if z_match:
                     leveling_line.total_height_diff = float(z_match.group(1))
 
