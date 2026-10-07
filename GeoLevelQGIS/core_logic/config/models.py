@@ -84,7 +84,15 @@ class LevelingLine:
         return self.total_distance / 1000.0
     
     def calculate_totals(self):
-        """Calculate total distance and height difference from setups."""
+        """Calculate total distance and height difference from setups.
+
+        total_distance is the full traverse length of the line (sum of every
+        backsight leg + foresight leg for every setup).  This is the 'L' that
+        enters the tolerance formula T = k·√L (Directive ג2, Appendix B §4.1).
+        Do NOT divide by 2 — that would give an average sight distance, not the
+        line length, and would cause tolerance checks to use √(L/2) instead of
+        √L.
+        """
         self.total_distance = sum(
             s.distance_back + s.distance_fore for s in self.setups
         )
