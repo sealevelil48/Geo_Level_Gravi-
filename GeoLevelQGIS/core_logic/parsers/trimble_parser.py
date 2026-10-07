@@ -55,17 +55,40 @@ class TrimbleParser(BaseParser):
     def parse(self, filepath: str) -> LevelingLine:
         """
         Parse a Trimble DAT file.
-        
+
         Args:
             filepath: Path to the DAT file
-            
+
         Returns:
             LevelingLine object with parsed data
+
+        Station grouping (BFFB / BF)
+        ─────────────────────────────
+        The Trimble M5 records a full station as a block of KD1 lines ending with
+        a Z-summary line (the line that has a Z field but no Rb/Rf reading).
+
+        For BFFB the block contains: Rb1, Rf1, Rf2, Rb2.
+        For BF  the block contains: Rb,  Rf.
+
+        The Z value on the summary line is the instrument's cumulative height
+        (already temperature-corrected) — it is the authoritative source for
+        per-station dH.  Deriving dH from Z-differences avoids double-counting
+        the individual readings, which was the bug that caused a factor-of-~2.7
+        error on BFFB files.
+
+        "Station repeated" handling
+        ───────────────────────────
+        When the instrument operator repeats a station (TO  Station repeated),
+        the repeated block REPLACES the previous one.  We discard the previous
+        station's setup and use the repeated data instead.  The Z value after
+        the repeated block is already cumulative from the start of the line, so
+        using Z-differences automatically handles this correctly as long as we
+        only keep the LAST station block at each slot.
         """
         self.clear_messages()
         filename = self.extract_filename(filepath)
         lines = self.read_file(filepath)
-        
+
         # Initialize
         leveling_line = LevelingLine(
             filename=filename,
@@ -74,144 +97,211 @@ class TrimbleParser(BaseParser):
             setups=[],
             method="BF"
         )
-        
-        # State tracking
-        current_from_point = None
-        current_rb = None
-        current_rb_dist = None
-        current_temp = None
-        setup_number = 0
-        in_measurement = False
-        
-        for i, line in enumerate(lines):
-            line = line.strip()
+
+        # ── Pass 1: collect station blocks ──────────────────────────────────
+        # A "station block" is all KD1 lines between consecutive Z-summary lines.
+        # Each block yields exactly ONE StationSetup whose dH comes from the Z diff.
+
+        # State for the current in-progress station block
+        current_from_point = None   # backsight point id (from_point)
+        current_to_point   = None   # foresight point id (to_point)
+        current_rb1        = None   # first Rb in the block
+        current_rb1_dist   = None
+        current_rf1        = None   # first Rf in the block
+        current_rf1_dist   = None
+        current_rb2        = None   # second Rb (BFFB only)
+        current_rb2_dist   = None
+        current_rf2        = None   # second Rf (BFFB only)
+        current_rf2_dist   = None
+        current_temp       = None
+        rf_count           = 0      # how many Rf readings seen in current block
+        rb_count           = 0      # how many Rb readings seen in current block
+
+        prev_z             = 0.0    # cumulative Z before this station
+        setup_number       = 0
+        in_measurement     = False
+        next_station_is_repeat = False  # set when "Station repeated" TO line is seen
+
+        for raw_line in lines:
+            line = raw_line.strip()
             if not line or '|' not in line:
                 continue
-            
+
             parts = [p.strip() for p in line.split('|')]
             if len(parts) < 3:
                 continue
-            
+
             content = parts[2]
-            
-            # Parse TO (text) records
+
+            # ── TO (text annotation) records ────────────────────────────────
             if content.startswith('TO'):
                 text = content[2:].strip()
-                
+
                 if 'Start-Line' in text:
                     in_measurement = True
-                    # Extract method (BF or BFFB)
                     if 'BFFB' in text:
                         leveling_line.method = 'BFFB'
                     elif 'BF' in text:
                         leveling_line.method = 'BF'
                     elif 'FB' in text:
                         leveling_line.method = 'FB'
-                    
+
                 elif 'End-Line' in text:
                     in_measurement = False
-                    
-                elif text.endswith('.dat'):
-                    # Internal filename
-                    pass
-                    
+
+                elif 'Station repeated' in text:
+                    # The NEXT station block replaces the LAST committed setup.
+                    # Roll back: remove that setup and restore prev_z to the
+                    # Z value before it was committed.
+                    if leveling_line.setups:
+                        discarded = leveling_line.setups.pop()
+                        prev_z = discarded.cumulative_height - discarded.height_diff \
+                                 if discarded.height_diff is not None \
+                                 else prev_z
+                        setup_number -= 1
+                    next_station_is_repeat = False  # already rolled back
+
                 continue
-            
-            # Parse KD1 (measurement) records
+
+            # ── KD1 (measurement) records ────────────────────────────────────
             if content.startswith('KD1'):
                 kd1_content = content[3:].strip()
-                
-                # Extract point ID (first token before temperature)
                 point_id = self._extract_point_id(kd1_content)
-                
-                # Extract temperature if present
+
                 temp_match = self.temp_pattern.search(line)
                 if temp_match:
                     current_temp = float(temp_match.group(1))
-                
-                # Check for Rb (backsight)
+
                 rb_match = self.rb_pattern.search(line)
-                if rb_match:
-                    current_rb = float(rb_match.group(1))
-                    current_from_point = point_id
-                    
-                    # Get distance
-                    hd_match = self.hd_pattern.search(line)
-                    if hd_match:
-                        current_rb_dist = float(hd_match.group(1))
-                    
-                    # Set start point if first measurement
-                    if not leveling_line.start_point:
-                        leveling_line.start_point = point_id
-                
-                # Check for Rf (foresight)
                 rf_match = self.rf_pattern.search(line)
-                if rf_match and current_rb is not None:
-                    rf = float(rf_match.group(1))
-                    
-                    # Get distance
-                    rf_dist = 0.0
-                    hd_match = self.hd_pattern.search(line)
-                    if hd_match:
-                        rf_dist = float(hd_match.group(1))
-                    
-                    # Create setup
-                    setup_number += 1
-                    setup = StationSetup(
-                        setup_number=setup_number,
-                        from_point=current_from_point or "",
-                        to_point=point_id,
-                        backsight_reading=current_rb,
-                        foresight_reading=rf,
-                        distance_back=current_rb_dist or 0.0,
-                        distance_fore=rf_dist,
-                        temperature=current_temp
-                    )
-                    leveling_line.setups.append(setup)
-                
-                # Check for Z (accumulated height)
-                z_match = self.z_pattern.search(line)
-                if z_match and leveling_line.setups:
-                    z_value = float(z_match.group(1))
-                    leveling_line.setups[-1].cumulative_height = z_value
-                
-                # Check for Sh (final height shift) - indicates end point
+                z_match  = self.z_pattern.search(line)
                 sh_match = self.sh_pattern.search(line)
-                if sh_match:
+                hd_match = self.hd_pattern.search(line)
+
+                hd_val = float(hd_match.group(1)) if hd_match else 0.0
+
+                # Rb reading (backsight) ──────────────────────────────────────
+                if rb_match:
+                    rb_val = float(rb_match.group(1))
+                    rb_count += 1
+                    if rb_count == 1:
+                        current_rb1      = rb_val
+                        current_rb1_dist = hd_val
+                        current_from_point = point_id
+                        if not leveling_line.start_point:
+                            leveling_line.start_point = point_id
+                    else:
+                        # Second Rb in BFFB block
+                        current_rb2      = rb_val
+                        current_rb2_dist = hd_val
+
+                # Rf reading (foresight) ──────────────────────────────────────
+                elif rf_match:
+                    rf_val = float(rf_match.group(1))
+                    rf_count += 1
+                    if rf_count == 1:
+                        current_rf1      = rf_val
+                        current_rf1_dist = hd_val
+                        current_to_point = point_id
+                    else:
+                        current_rf2      = rf_val
+                        current_rf2_dist = hd_val
+
+                # Sh line — end-point marker (no Rb/Rf, has Sh field) ─────────
+                elif sh_match:
                     leveling_line.end_point = point_id
-            
-            # Parse KD2 (summary) records
+
+                # Z-summary line — closes the current station block ───────────
+                # The Z-summary line has a Z field but no Rb or Rf reading.
+                # It carries the instrument's cumulative height after this station.
+                if z_match and not rb_match and not rf_match:
+                    z_val = float(z_match.group(1))
+                    station_dh = z_val - prev_z
+
+                    # Representative Rb and Rf for the setup record.
+                    # For BFFB use the mean of both halves; for BF use the single pair.
+                    if current_rb1 is not None and current_rf1 is not None:
+                        if current_rb2 is not None and current_rf2 is not None:
+                            # BFFB: mean readings (representative only — dH comes from Z diff)
+                            rep_rb   = (current_rb1 + current_rb2) / 2
+                            rep_rf   = (current_rf1 + current_rf2) / 2
+                            dist_b   = (current_rb1_dist + current_rb2_dist) / 2
+                            dist_f   = (current_rf1_dist + current_rf2_dist) / 2
+                        else:
+                            # BF: single pair
+                            rep_rb   = current_rb1
+                            rep_rf   = current_rf1
+                            dist_b   = current_rb1_dist or 0.0
+                            dist_f   = current_rf1_dist or 0.0
+
+                        setup_number += 1
+                        setup = StationSetup(
+                            setup_number=setup_number,
+                            from_point=current_from_point or "",
+                            to_point=current_to_point or "",
+                            backsight_reading=rep_rb,
+                            foresight_reading=rep_rf,
+                            distance_back=dist_b,
+                            distance_fore=dist_f,
+                            temperature=current_temp,
+                            # dH from the instrument's Z difference — authoritative
+                            height_diff=station_dh,
+                            cumulative_height=z_val,
+                        )
+                        leveling_line.setups.append(setup)
+                        prev_z = z_val
+
+                    # Reset block state
+                    current_from_point = None
+                    current_to_point   = None
+                    current_rb1 = current_rb2 = None
+                    current_rf1 = current_rf2 = None
+                    current_rb1_dist = current_rb2_dist = None
+                    current_rf1_dist = current_rf2_dist = None
+                    rb_count = rf_count = 0
+
+                continue
+
+            # ── KD2 (line-summary) records ───────────────────────────────────
             if content.startswith('KD2'):
                 kd2_content = content[3:].strip()
                 point_id = self._extract_point_id(kd2_content)
-                
                 if point_id:
                     leveling_line.end_point = point_id
-                
-                # Extract summary distances
+
+                # Use the instrument's authoritative summary distances (Db + Df)
                 db_match = self.db_pattern.search(line)
                 df_match = self.df_pattern.search(line)
                 if db_match and df_match:
-                    db = float(db_match.group(1))
-                    df = float(df_match.group(1))
-                    leveling_line.total_distance = db + df
-        
-        # Calculate totals if not already set
+                    leveling_line.total_distance = (
+                        float(db_match.group(1)) + float(df_match.group(1))
+                    )
+
+                # The KD2 Z field is the final cumulative dH for the whole line —
+                # use it directly instead of summing per-setup values to avoid any
+                # floating-point accumulation error.
+                z_match = self.z_pattern.search(line)
+                if z_match:
+                    leveling_line.total_height_diff = float(z_match.group(1))
+
+        # ── Fallback totals ──────────────────────────────────────────────────
+        # Only reached when the file has no KD2 record (non-standard files).
         if leveling_line.total_distance == 0:
-            leveling_line.calculate_totals()
-        else:
-            # Calculate total height diff from setups
+            leveling_line.total_distance = sum(
+                s.distance_back + s.distance_fore for s in leveling_line.setups
+            )
+        if leveling_line.total_height_diff == 0.0 and leveling_line.setups:
             leveling_line.total_height_diff = sum(
                 s.height_diff for s in leveling_line.setups if s.height_diff is not None
             )
-        
-        # Validate end point
+
+        # ── Validate end point ───────────────────────────────────────────────
         if not is_benchmark(leveling_line.end_point):
             leveling_line.status = LineStatus.INVALID_ENDPOINT
             leveling_line.validation_errors.append(
                 f"End point '{leveling_line.end_point}' is a turning point, not a benchmark"
             )
-        
+
         return leveling_line
     
     def _extract_point_id(self, kd_content: str) -> str:
