@@ -1,0 +1,12 @@
+# Normalize line endings for the QGIS plugin
+* text=auto
+
+# Force LF for Python source files (QGIS runs on Linux/Mac too)
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.qml text eol=lf
+*.geojson text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf

@@ -10,10 +10,7 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from config.models import LevelingLine, Benchmark
+from core_logic.config.models import LevelingLine, Benchmark
 
 
 @dataclass
@@ -188,6 +185,22 @@ class GeoJSONExporter:
         for point_id in all_points:
             coords = self.coord_manager.get_coordinates(point_id)
             if coords:
+                # coords is (lon, lat, height) from get_coordinates(), but
+                # process.py may store a 4-tuple (lon, lat, height, tag) in
+                # cm.coordinates directly to mark estimated PKT points.
+                raw = self.coord_manager.coordinates.get(str(point_id))
+                pkt_tag = raw[3] if raw and len(raw) == 4 else None
+
+                if pkt_tag == "PKT":
+                    pt_status      = "PKT"
+                    pt_is_benchmark = 0
+                elif not str(point_id).isdigit():
+                    pt_status      = "benchmark"
+                    pt_is_benchmark = 1
+                else:
+                    pt_status      = "turning_point"
+                    pt_is_benchmark = 0
+
                 point_feature = {
                     'type': 'Feature',
                     'geometry': {
@@ -195,9 +208,10 @@ class GeoJSONExporter:
                         'coordinates': [coords[0], coords[1], coords[2]]
                     },
                     'properties': {
-                        'point_id': str(point_id),
-                        'height': float(coords[2]) if coords[2] is not None else 0.0,
-                        'is_benchmark': not str(point_id).isdigit()
+                        'point_id':     str(point_id),
+                        'height':       float(coords[2]) if coords[2] is not None else 0.0,
+                        'is_benchmark': pt_is_benchmark,
+                        'status':       pt_status,
                     }
                 }
                 point_features.append(point_feature)
@@ -291,15 +305,40 @@ class QGISStyleGenerator:
     
     @staticmethod
     def generate_line_style(output_path: str, color: str = '#FF0000', width: float = 1.5):
-        """Generate a QML style file for lines."""
-        qml_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+        """Generate a rule-based QML style for lines.
+
+        Rules (evaluated top-to-bottom, first match wins):
+          VALID            → green  #4CAF50
+          VALID_BY_MANAGER → amber  #FFC107  (manager override)
+          INVALID / other  → red    #F44336
+        """
+        qml_content = '''<?xml version="1.0" encoding="UTF-8"?>
 <qgis version="3.0" styleCategories="AllStyleCategories">
-  <renderer-v2 type="singleSymbol">
+  <renderer-v2 type="RuleRenderer">
+    <rules key="{r0}">
+      <rule key="{r1}" filter="\"status\" = 'valid'" label="Valid" symbol="0"/>
+      <rule key="{r2}" filter="\"status\" = 'valid_by_manager' OR \"status\" = 'VALID_BY_MANAGER'" label="Valid by Manager" symbol="1"/>
+      <rule key="{r3}" filter="ELSE" label="Invalid" symbol="2"/>
+    </rules>
     <symbols>
-      <symbol type="line" name="0">
+      <symbol type="line" name="0" alpha="1">
         <layer class="SimpleLine" enabled="1">
-          <prop k="line_color" v="{color}"/>
-          <prop k="line_width" v="{width}"/>
+          <prop k="line_color" v="76,175,80,255"/>
+          <prop k="line_width" v="1.2"/>
+          <prop k="line_style" v="solid"/>
+        </layer>
+      </symbol>
+      <symbol type="line" name="1" alpha="1">
+        <layer class="SimpleLine" enabled="1">
+          <prop k="line_color" v="255,193,7,255"/>
+          <prop k="line_width" v="1.2"/>
+          <prop k="line_style" v="solid"/>
+        </layer>
+      </symbol>
+      <symbol type="line" name="2" alpha="1">
+        <layer class="SimpleLine" enabled="1">
+          <prop k="line_color" v="244,67,54,255"/>
+          <prop k="line_width" v="1.2"/>
           <prop k="line_style" v="solid"/>
         </layer>
       </symbol>
@@ -310,34 +349,59 @@ class QGISStyleGenerator:
       <text-style fieldName="concat(start_point, ' → ', end_point)" fontSize="8"/>
     </settings>
   </labeling>
-</qgis>'''
-        
+</qgis>'''.format(
+            r0="{a7b3c4d5-0001-0000-0000-000000000000}",
+            r1="{a7b3c4d5-0001-0000-0000-000000000001}",
+            r2="{a7b3c4d5-0001-0000-0000-000000000002}",
+            r3="{a7b3c4d5-0001-0000-0000-000000000003}",
+        )
+
         with open(output_path, 'w') as f:
             f.write(qml_content)
-    
+
     @staticmethod
     def generate_point_style(output_path: str):
-        """Generate a QML style file for points."""
+        """Generate a rule-based QML style for points.
+
+        Rules:
+          is_benchmark = 1 (DB benchmark)    → blue triangle,  size 4
+          status = 'PKT' (estimated field pt) → yellow diamond, size 5
+          else (turning point)                → orange circle,  size 3
+        """
         qml_content = '''<?xml version="1.0" encoding="UTF-8"?>
 <qgis version="3.0" styleCategories="AllStyleCategories">
-  <renderer-v2 type="categorizedSymbol" attr="is_benchmark">
-    <categories>
-      <category symbol="0" value="true" label="Benchmark"/>
-      <category symbol="1" value="false" label="Turning Point"/>
-    </categories>
+  <renderer-v2 type="RuleRenderer">
+    <rules key="{r0}">
+      <rule key="{r1}" filter="\"is_benchmark\" = 1 OR \"is_benchmark\" = 'true'" label="Benchmark" symbol="0"/>
+      <rule key="{r2}" filter="\"status\" = 'PKT'" label="Estimated field point" symbol="1"/>
+      <rule key="{r3}" filter="ELSE" label="Turning Point" symbol="2"/>
+    </rules>
     <symbols>
-      <symbol type="marker" name="0">
+      <symbol type="marker" name="0" alpha="1">
         <layer class="SimpleMarker" enabled="1">
-          <prop k="color" v="0,0,255,255"/>
+          <prop k="color" v="33,150,243,255"/>
           <prop k="size" v="4"/>
           <prop k="name" v="triangle"/>
+          <prop k="outline_color" v="255,255,255,255"/>
+          <prop k="outline_width" v="0.3"/>
         </layer>
       </symbol>
-      <symbol type="marker" name="1">
+      <symbol type="marker" name="1" alpha="1">
         <layer class="SimpleMarker" enabled="1">
-          <prop k="color" v="255,165,0,255"/>
+          <prop k="color" v="255,235,59,255"/>
+          <prop k="size" v="5"/>
+          <prop k="name" v="diamond"/>
+          <prop k="outline_color" v="80,80,80,255"/>
+          <prop k="outline_width" v="0.4"/>
+        </layer>
+      </symbol>
+      <symbol type="marker" name="2" alpha="1">
+        <layer class="SimpleMarker" enabled="1">
+          <prop k="color" v="255,152,0,255"/>
           <prop k="size" v="3"/>
           <prop k="name" v="circle"/>
+          <prop k="outline_color" v="255,255,255,255"/>
+          <prop k="outline_width" v="0.3"/>
         </layer>
       </symbol>
     </symbols>
@@ -347,46 +411,72 @@ class QGISStyleGenerator:
       <text-style fieldName="point_id" fontSize="8"/>
     </settings>
   </labeling>
-</qgis>'''
-        
+</qgis>'''.format(
+            r0="{b8c4d5e6-0002-0000-0000-000000000000}",
+            r1="{b8c4d5e6-0002-0000-0000-000000000001}",
+            r2="{b8c4d5e6-0002-0000-0000-000000000002}",
+            r3="{b8c4d5e6-0002-0000-0000-000000000003}",
+        )
+
         with open(output_path, 'w') as f:
             f.write(qml_content)
 
 
-def export_network_to_geojson(lines: List[LevelingLine], 
+def export_network_to_geojson(lines: List[LevelingLine],
                                output_folder: str,
-                               project_name: str = "leveling_network") -> Dict[str, str]:
+                               project_name: str = "leveling_network",
+                               coord_manager=None) -> Dict[str, str]:
     """
     Convenience function to export a complete network to GeoJSON files.
-    
+
     Args:
         lines: List of LevelingLine objects
         output_folder: Output folder path
         project_name: Base name for output files
-        
+        coord_manager: Optional pre-populated CoordinateManager with real
+                       WGS84 coordinates. When None, schematic coords are
+                       generated automatically.
+
     Returns:
         Dictionary of output file paths
     """
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    exporter = GeoJSONExporter()
-    
-    # Export lines and points
+
+    exporter = GeoJSONExporter(coord_manager=coord_manager)
+
+    # Export lines (mixed FeatureCollection — lines + points bundled)
     lines_file = output_path / f"{project_name}_lines.geojson"
-    exporter.export_lines(lines, str(lines_file))
-    
+    geojson_data = exporter.export_lines(lines, str(lines_file))
+
+    # Export points as a separate GeoJSON so the plugin can load them as an
+    # independent layer on the QGIS map canvas with their own symbology.
+    points_file = output_path / f"{project_name}_points.geojson"
+    point_features = [
+        f for f in geojson_data.get("features", [])
+        if f.get("geometry", {}).get("type") == "Point"
+    ]
+    points_geojson = {
+        "type": "FeatureCollection",
+        "name": "Leveling Points",
+        "crs": geojson_data.get("crs", {}),
+        "features": point_features,
+    }
+    with open(str(points_file), "w", encoding="utf-8") as _f:
+        json.dump(points_geojson, _f, indent=2, ensure_ascii=False)
+
     # Generate QGIS styles
     line_style = output_path / f"{project_name}_lines.qml"
     point_style = output_path / f"{project_name}_points.qml"
-    
+
     QGISStyleGenerator.generate_line_style(str(line_style))
     QGISStyleGenerator.generate_point_style(str(point_style))
-    
+
     return {
-        'lines_geojson': str(lines_file),
-        'line_style': str(line_style),
-        'point_style': str(point_style)
+        'lines_geojson':  str(lines_file),
+        'points_geojson': str(points_file),
+        'line_style':     str(line_style),
+        'point_style':    str(point_style),
     }
 
 
