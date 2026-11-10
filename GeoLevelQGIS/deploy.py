@@ -95,10 +95,12 @@ def main():
     #   *.pyc         — compiled bytecode (QGIS regenerates on first load)
     #   __pycache__   — bytecode cache directories
     #   *.glp         — project files (user data, not plugin code)
+    #   *.gpkg*       — project GeoPackages (user data, not plugin code)
     print("  Copying plugin files...")
     shutil.copytree(
         src, dst,
-        ignore=shutil.ignore_patterns("deploy.py", "*.pyc", "__pycache__", "*.glp"),
+        ignore=shutil.ignore_patterns("deploy.py", "*.pyc", "__pycache__", "*.glp",
+                                      "*.gpkg", "*.gpkg-wal", "*.gpkg-shm"),
     )
     print(f"  Copied to {dst}")
     print()

@@ -268,6 +268,7 @@ def process_geodetic_data(
         try:
             parser = create_parser(fp)
             line = parser.parse(fp)
+            line.source_path = os.path.abspath(fp)
             lines.append(line)
             log.info("Parsed: %s  (%s → %s)", Path(fp).name,
                      line.start_point, line.end_point)

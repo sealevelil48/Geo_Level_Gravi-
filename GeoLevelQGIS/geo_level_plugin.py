@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 from qgis.PyQt.QtWidgets import (
@@ -385,6 +386,8 @@ class GeoLevelPlugin:
         self._point_overrides = {}
         # current (possibly renamed) point name -> original field point ID
         self._point_origin = {}
+        # GeoPackage holding the current project's layers + line/setup tables
+        self._gpkg_path = ""
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -551,11 +554,14 @@ class GeoLevelPlugin:
             if not output_dir:
                 return
 
-        # Deduplicate: skip files whose basename is already loaded
-        existing = {os.path.basename(ln.filename) for ln in self._lines}
-        existing.update({ln.filename for ln in self._lines})
-        new_paths = [fp for fp in file_paths if fp not in existing
-                     and os.path.basename(fp) not in existing]
+        # Deduplicate: skip files already loaded.  LevelingLine.filename is the
+        # file stem (it is the map-sync key), source_path the absolute path.
+        existing = {ln.filename for ln in self._lines}
+        existing.update(os.path.normcase(os.path.abspath(ln.source_path))
+                        for ln in self._lines if getattr(ln, "source_path", None))
+        new_paths = [fp for fp in file_paths
+                     if os.path.normcase(os.path.abspath(fp)) not in existing
+                     and Path(fp).stem not in existing]
         if not new_paths:
             self.iface.messageBar().pushMessage(
                 "Geo Level Gravi", "All selected files are already loaded.",
@@ -673,6 +679,9 @@ class GeoLevelPlugin:
         # Push validated statuses from memory into the layer attribute table so
         # the rule-based renderer has fresh, accurate values on first paint.
         self._sync_map_statuses()
+        # Persist layers + line data to the project GeoPackage and swap the
+        # volatile memory/GeoJSON layers for the GPKG-backed ones.
+        self._persist_to_gpkg()
         self._show_dock()
         self.dock.load_lines(self._lines, self._val_results)
 
@@ -897,20 +906,38 @@ class GeoLevelPlugin:
         # load path never has to prompt the user for a directory.
         output_dir = self._last_output_dir
         if not output_dir or not os.path.isdir(output_dir):
-            output_dir = os.path.dirname(self._lines[0].filename) if self._lines else ""
+            output_dir = self._default_output_dir()
+
+        # Make sure the GeoPackage holds the current state (statuses,
+        # overrides, Point Settings choices) before the .glp points to it.
+        gpkg = self._refresh_gpkg_tables()
+        gpkg_ref = ""
+        if gpkg:
+            try:
+                gpkg_ref = os.path.relpath(gpkg, os.path.dirname(os.path.abspath(path)))
+            except ValueError:            # different drive on Windows
+                gpkg_ref = os.path.abspath(gpkg)
+
         data = {
+            "version": 2,
             "class": self._last_class,
             "output_dir": output_dir,
-            # Store absolute paths using os.path.abspath for robustness
-            "files": [os.path.abspath(ln.filename) for ln in self._lines],
+            # GeoPackage with layers + line/setup tables: loading uses it
+            # directly, without re-parsing files or querying the DB.
+            "gpkg": gpkg_ref,
+            # Real measurement-file paths (fallback when the GPKG is missing)
+            "files": [self._line_src_path(ln) for ln in self._lines],
             # Point Settings choices keyed by original field point ID
             "point_overrides": self._point_overrides,
         }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        self.iface.messageBar().pushMessage("Geo Level Gravi",
-                                            f"Project saved: {path}",
-                                            level=Qgis.Success, duration=4)
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        msg = f"Project saved: {path}"
+        if not gpkg:
+            msg += "  (GeoPackage could not be written - reload will re-parse files)"
+        self.iface.messageBar().pushMessage("Geo Level Gravi", msg,
+                                            level=Qgis.Success if gpkg else Qgis.Warning,
+                                            duration=5)
 
     def _load_project(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -924,24 +951,28 @@ class GeoLevelPlugin:
         files      = data.get("files", [])
         cls        = data.get("class", "H3")
         output_dir = data.get("output_dir", "")
+        glp_dir    = os.path.dirname(os.path.abspath(path))
 
-        # Resolve files with fallback: if absolute path fails, search .glp directory
-        # This allows users to bundle .DAT files and .glp file in a single folder
-        glp_dir = os.path.dirname(path)
-        resolved_files = []
+        overrides = data.get("point_overrides", {})
+        overrides = dict(overrides) if isinstance(overrides, dict) else {}
+
+        # -- Fast path: everything is in the project GeoPackage ----------
+        gpkg = self._resolve_gpkg_ref(data.get("gpkg"), glp_dir, output_dir)
+        if gpkg and self._load_project_from_gpkg(gpkg, cls, output_dir, overrides):
+            return
+
+        # -- Legacy path: re-parse the measurement files ------------------
+        # Resolve each file: absolute path, then the .glp folder and the
+        # output folder (by basename, or by stem for old .glp files that
+        # stored the extension-less line name).
+        resolved_files, missing = [], []
         for fp in files:
-            if os.path.exists(fp):
-                # Absolute path works — use it
-                resolved_files.append(fp)
+            hit = self._resolve_measurement_file(fp, [glp_dir, output_dir])
+            if hit:
+                resolved_files.append(hit)
             else:
-                # Try relative to .glp file location
-                basename = os.path.basename(fp)
-                fallback = os.path.join(glp_dir, basename)
-                if os.path.exists(fallback):
-                    resolved_files.append(fallback)
+                missing.append(fp)
 
-        missing = [fp for fp in files if not os.path.exists(fp)
-                   and not os.path.exists(os.path.join(glp_dir, os.path.basename(fp)))]
         if missing:
             QMessageBox.warning(self.iface.mainWindow(), "Load Project",
                                 "The following DAT files could not be found and will be skipped:\n"
@@ -963,8 +994,8 @@ class GeoLevelPlugin:
         self._lines = []
         self._val_results = []
         self._point_origin = {}
-        overrides = data.get("point_overrides", {})
-        self._point_overrides = dict(overrides) if isinstance(overrides, dict) else {}
+        self._gpkg_path = ""
+        self._point_overrides = overrides
         try:
             from geolevel_db_manager import get_db_manager
             get_db_manager().clear_session_cache()
@@ -972,6 +1003,302 @@ class GeoLevelPlugin:
             pass
         self._remove_result_layers()
         self._process_files(resolved_files, cls, output_dir)
+
+    # ------------------------------------------------------------------
+    # GeoPackage persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _line_src_path(ln) -> str:
+        src = getattr(ln, "source_path", None)
+        return os.path.abspath(src) if src else ln.filename
+
+    def _default_output_dir(self) -> str:
+        for ln in self._lines:
+            src = getattr(ln, "source_path", None)
+            if src:
+                return os.path.dirname(src)
+        return ""
+
+    @staticmethod
+    def _resolve_measurement_file(fp: str, search_dirs) -> str:
+        """Return an existing path for *fp* or "" (absolute -> basename -> stem.*)."""
+        if fp and os.path.isfile(fp):
+            return fp
+        base = os.path.basename(fp or "")
+        stem = os.path.splitext(base)[0]
+        exts = (".dat", ".raw", ".gsi")
+        for d in search_dirs:
+            if not d or not os.path.isdir(d):
+                continue
+            cand = os.path.join(d, base)
+            if base and os.path.isfile(cand):
+                return cand
+            try:
+                for name in os.listdir(d):
+                    n_stem, n_ext = os.path.splitext(name)
+                    if n_stem == stem and n_ext.lower() in exts:
+                        return os.path.join(d, name)
+            except OSError:
+                pass
+        return ""
+
+    @staticmethod
+    def _resolve_gpkg_ref(ref, glp_dir: str, output_dir: str) -> str:
+        if not ref:
+            return ""
+        cands = [ref if os.path.isabs(ref) else os.path.join(glp_dir, ref),
+                 os.path.join(glp_dir, os.path.basename(ref))]
+        if output_dir:
+            cands.append(os.path.join(output_dir, os.path.basename(ref)))
+        for c in cands:
+            if os.path.isfile(c):
+                return os.path.normpath(c)
+        return ""
+
+    def _gpkg_meta(self) -> dict:
+        cls = self.dock.get_selected_class() if self.dock else self._last_class
+        return {
+            "class": cls or self._last_class or "H3",
+            "output_dir": self._last_output_dir,
+            "point_overrides": self._point_overrides,
+            "point_origin": self._point_origin,
+            "saved_utc": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+
+    @staticmethod
+    def _result_layers(name: str) -> list:
+        return list(QgsProject.instance().mapLayersByName(name))
+
+    def _layers_use_gpkg(self, gpkg: str) -> bool:
+        """True when every 'Geodetic Results' layer is read from *gpkg*."""
+        if not gpkg:
+            return False
+        target = os.path.normcase(os.path.abspath(gpkg))
+        lyrs = self._result_layers("Geodetic Results")
+        if not lyrs:
+            return False
+        for lyr in lyrs:
+            src = lyr.source().split("|")[0]
+            if os.path.normcase(os.path.abspath(src)) != target:
+                return False
+        return True
+
+    def _persist_to_gpkg(self) -> str:
+        """Write the current map layers + lines into the project GeoPackage and
+        replace the map layers with GPKG-backed ones.  Returns the GPKG path
+        ("" on failure - the map then keeps equivalent in-memory layers)."""
+        if not self._lines:
+            return ""
+        output_dir = self._last_output_dir or self._default_output_dir()
+        if not output_dir:
+            return ""
+        try:
+            import geo_level_gpkg as gp
+        except Exception:
+            QgsMessageLog.logMessage("geo_level_gpkg import failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+            return ""
+
+        # Snapshot every result layer (appending files adds one layer per
+        # batch) into single memory layers, lines in self._lines order so
+        # _zoom_to_line_feature(idx) matches the dock list.
+        order = {ln.filename: i for i, ln in enumerate(self._lines)}
+        try:
+            line_src = self._result_layers("Geodetic Results")
+            if self._layer is not None and self._layer in line_src:
+                line_src.remove(self._layer)
+                line_src.insert(0, self._layer)
+            mem_lines = gp.merge_layers_to_memory(
+                line_src, "line",
+                order_key=lambda a: order.get(str(a.get("filename")), len(order)),
+                dedupe_field="filename")
+            mem_pts = gp.merge_layers_to_memory(
+                self._result_layers("Geodetic Points"), "point", dedupe_field="point_id")
+        except Exception:
+            QgsMessageLog.logMessage("GeoPackage snapshot failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+            return ""
+
+        # Release every layer reading the old GPKG/GeoJSON before writing.
+        self._remove_result_layers()
+        default = os.path.join(output_dir, gp.DEFAULT_GPKG_NAME)
+        stem, ext = os.path.splitext(default)
+        candidates = [self._gpkg_path or default]
+        candidates += [f"{stem}_{n}{ext}" for n in range(1, 50)]
+        written = ""
+        for cand in candidates:
+            try:
+                written = gp.write_project_gpkg(cand, mem_lines, mem_pts,
+                                                self._lines, self._gpkg_meta())
+                break
+            except PermissionError:
+                continue          # still locked by Windows - try the next name
+            except Exception:
+                QgsMessageLog.logMessage("GeoPackage write failed: " + traceback.format_exc(),
+                                         "GeoLevelPlugin", level=Qgis.Warning)
+                break
+
+        if not written:
+            # Put the snapshot back so the map never ends up empty.
+            self._add_result_layers(mem_lines, mem_pts)
+            return ""
+
+        self._gpkg_path = written
+        if not self._add_gpkg_layers(written):
+            self._add_result_layers(mem_lines, mem_pts)
+        QgsMessageLog.logMessage(f"Project GeoPackage written: {written}",
+                                 "GeoLevelPlugin", level=Qgis.Info)
+        return written
+
+    def _refresh_gpkg_tables(self) -> str:
+        """Bring the GeoPackage up to date before saving the .glp.
+
+        When the map already reads from the project GPKG, only the line /
+        setup / meta tables are rewritten in place (layer attribute edits are
+        committed to the GPKG directly).  Otherwise the whole file is written.
+        """
+        gpkg = self._gpkg_path
+        if gpkg and os.path.isfile(gpkg) and self._layers_use_gpkg(gpkg):
+            try:
+                import geo_level_gpkg as gp
+                gp.write_attribute_tables(gpkg, self._lines, self._gpkg_meta())
+                return gpkg
+            except Exception:
+                QgsMessageLog.logMessage("GeoPackage table update failed, rewriting file: "
+                                         + traceback.format_exc(),
+                                         "GeoLevelPlugin", level=Qgis.Warning)
+        canvas = self.iface.mapCanvas()
+        extent = canvas.extent()
+        written = self._persist_to_gpkg()
+        canvas.setExtent(extent)
+        canvas.refresh()
+        return written
+
+    def _add_result_layers(self, line_layer, point_layer) -> None:
+        """Add line/point layers to the project with the plugin symbology."""
+        proj = QgsProject.instance()
+        if line_layer is not None and line_layer.isValid():
+            line_layer.setName("Geodetic Results")
+            _apply_line_renderer(line_layer)
+            proj.addMapLayer(line_layer)      # layerWasAdded -> selection sync
+            self._layer = line_layer
+        if point_layer is not None and point_layer.isValid():
+            point_layer.setName("Geodetic Points")
+            _apply_point_renderer(point_layer)
+            proj.addMapLayer(point_layer)
+            _apply_point_labels(point_layer)
+        self.iface.mapCanvas().refresh()
+
+    def _add_gpkg_layers(self, gpkg: str) -> bool:
+        import geo_level_gpkg as gp
+        lines = gp.gpkg_layer(gpkg, gp.LINES_LAYER, "Geodetic Results")
+        pts = gp.gpkg_layer(gpkg, gp.POINTS_LAYER, "Geodetic Points")
+        if lines is None and pts is None:
+            return False
+        self._add_result_layers(lines, pts)
+        return True
+
+    def _revalidate_all(self, cls: str) -> None:
+        """Re-derive line statuses in memory (no file parsing)."""
+        try:
+            from core_logic.validators import BatchValidator
+            from core_logic.config.models import LineStatus
+            keep = (LineStatus.EXCLUDED_FROM_MERGE, LineStatus.MERGED)
+            for ln in self._lines:
+                if ln.status not in keep:
+                    ln.status = LineStatus.VALID
+            bv = BatchValidator(leveling_class=int((cls or "H3")[1]))
+            self._val_results = bv.validate_batch(self._lines)
+            for ln in self._lines:
+                if getattr(ln, "manager_override", False):
+                    ln.status = LineStatus.VALID_BY_MANAGER
+        except Exception:
+            QgsMessageLog.logMessage("Re-validation failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+
+    def _replay_point_overrides(self) -> None:
+        """Put the saved Point Settings choices back into the DB session cache
+        (in memory only - no DB query) so later edits rebuild consistently."""
+        try:
+            from geolevel_db_manager import get_db_manager
+            db_mgr = get_db_manager()
+            db_mgr.clear_session_cache()
+            for pid, ov in (self._point_overrides or {}).items():
+                ov = ov or {}
+                if ov.get("mode") in ("estimate", "pkt_average"):
+                    db_mgr.accept_record(pid, None)
+                elif ov.get("record"):
+                    rec = self._record_from_dict(ov.get("record"))
+                    name = (rec.name or "").strip() or pid
+                    db_mgr.accept_record(pid, rec)
+                    db_mgr.accept_record(name, rec)
+                    self._point_origin.setdefault(name, pid)
+        except Exception:
+            QgsMessageLog.logMessage("Replaying point overrides failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+
+    def _load_project_from_gpkg(self, gpkg: str, cls: str, output_dir: str,
+                                overrides: dict) -> bool:
+        """Restore a project from its GeoPackage: no file parsing, no DB query,
+        no point-resolution dialog.  Returns False to fall back to the files."""
+        try:
+            import geo_level_gpkg as gp
+            if not gp.has_project_tables(gpkg):
+                return False
+            lines, meta = gp.read_attribute_tables(gpkg)
+        except Exception:
+            QgsMessageLog.logMessage("Reading project GeoPackage failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+            return False
+        if not lines:
+            return False
+
+        if not output_dir or not os.path.isdir(output_dir):
+            output_dir = os.path.dirname(gpkg)
+        self._last_class = cls or meta.get("class") or "H3"
+        self._last_output_dir = output_dir
+        self._lines = lines
+        self._val_results = []
+        saved = meta.get("point_overrides") if isinstance(meta.get("point_overrides"), dict) else {}
+        self._point_overrides = overrides or dict(saved)
+        origin = meta.get("point_origin")
+        self._point_origin = dict(origin) if isinstance(origin, dict) else {}
+        self._replay_point_overrides()
+
+        self._remove_result_layers()
+        self._gpkg_path = gpkg
+        if not self._add_gpkg_layers(gpkg):
+            QgsMessageLog.logMessage(f"No map layers found in {gpkg}", "GeoLevelPlugin",
+                                     level=Qgis.Warning)
+
+        # Anchor the DB centroid on the on-screen control points layer
+        # (reads a QGIS layer only) for later LSA / loops dialogs.
+        try:
+            from geolevel_db_manager import get_db_manager
+            get_db_manager().seed_from_qgis_layer(self._unique_points(self._lines))
+        except Exception:
+            pass
+
+        if self.dock and hasattr(self.dock, "class_combo"):
+            self.dock.class_combo.setCurrentText(self._last_class)
+        self._revalidate_all(self._last_class)
+        self._sync_map_statuses()
+        self._show_dock()
+        if self.dock:
+            self.dock.load_lines(self._lines, self._val_results)
+        if self._layer is not None and self._layer.isValid():
+            ext = self._layer.extent()
+            if not ext.isEmpty():
+                ext.scale(1.1)
+                self.iface.mapCanvas().setExtent(ext)
+        self.iface.mapCanvas().refresh()
+        self.iface.messageBar().pushMessage(
+            "Geo Level Gravi",
+            f"Project loaded from GeoPackage - {len(self._lines)} line(s) "
+            f"({os.path.basename(gpkg)})",
+            level=Qgis.Success, duration=5)
+        return True
 
     def _new_project(self):
         """Clear all loaded data and start a fresh session."""
@@ -1001,6 +1328,7 @@ class GeoLevelPlugin:
 
         self._point_overrides = {}
         self._point_origin = {}
+        self._gpkg_path = ""
 
         # Remove the QGIS map layers (lines + points)
         self._remove_result_layers()
@@ -1710,7 +2038,7 @@ class GeoLevelPlugin:
         """
         output_dir = self._last_output_dir
         if not output_dir or not os.path.isdir(output_dir):
-            output_dir = os.path.dirname(self._lines[0].filename) if self._lines else ""
+            output_dir = self._default_output_dir()
 
         try:
             from core_logic.validators import BatchValidator
@@ -1752,6 +2080,7 @@ class GeoLevelPlugin:
                               self._lines)
         self._load_point_layer(files.get("points_geojson", ""), files.get("point_style", ""))
         self._sync_map_statuses()
+        self._persist_to_gpkg()
         if self._layer is not None and self._layer.isValid():
             self._layer.triggerRepaint()
         self.iface.mapCanvas().refresh()

@@ -72,6 +72,7 @@ class LevelingLine:
     is_used: bool = True  # Flag to include/exclude entire line in exports
     original_direction: str = "BF"  # Track original direction for reversal
     manager_override: bool = False  # Manager override: treat as valid despite validation failure
+    source_path: Optional[str] = None  # Absolute path of the measurement file it was parsed from
     
     @property
     def num_setups(self) -> int:
