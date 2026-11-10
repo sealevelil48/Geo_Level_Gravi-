@@ -438,17 +438,21 @@ def gpkg_layer(path, layer_name, display_name):
 
 
 def is_network_path(p) -> bool:
-    """True for UNC / network paths (\\\\server\\share, //server, \\\\?\\UNC\\...).
+    """True for UNC / network / device paths that must never be touched.
 
-    Touching such a path from an untrusted project file can make Windows send
-    the user's NTLM credentials to a remote host, so callers refuse them.
+    Covers \\\\server\\share, //server, mixed \\/server, the Win32 device
+    prefixes \\\\?\\ and \\\\.\\ (incl. \\\\?\\UNC\\...), and the NT object
+    prefix \\??\\.  Only a plain drive-letter path (X:...) or a relative path
+    is considered local.  Touching a network path from an untrusted project
+    file can make Windows send the user's NTLM credentials to a remote host,
+    so callers refuse them.
     """
     if not p:
         return False
     # Unify separators first so mixed forms like '\/server' or '/\server'
     # cannot slip past the prefix test.
     s = str(p).strip().replace("/", "\\")
-    if s.startswith("\\\\"):
+    if s.startswith("\\\\") or s.startswith("\\??\\"):
         return True
     import ntpath
     drive = ntpath.splitdrive(s)[0]
