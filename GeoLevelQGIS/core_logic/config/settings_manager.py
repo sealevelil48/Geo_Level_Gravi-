@@ -295,7 +295,8 @@ class SettingsManager:
         return self._load_settings_file().get("db_connection", {})
 
     def set_db_connection(self, host: str, port: int, dbname: str,
-                          user: str, table: str, authcfg: str) -> bool:
+                          user: str, table: str, authcfg: str,
+                          search_radius_km: float = 15.0) -> bool:
         """
         Persist non-sensitive DB connection params and authcfg ID to settings.json.
         Password is NEVER written here.
@@ -311,6 +312,7 @@ class SettingsManager:
             "user":    user,
             "table":   table,
             "authcfg": authcfg,
+            "search_radius_km": float(search_radius_km),
         }
         try:
             with open(self.settings_file, 'w', encoding='utf-8') as f:

@@ -206,6 +206,29 @@ def _build_coord_manager(lines, db_manager):
     return cm
 
 
+def export_layers(lines, output_dir: str, project_name: str = "geo_level_result") -> Dict:
+    """Re-export GeoJSON + QML for in-memory *lines* (no file parsing).
+
+    Used by the Point Settings screen to rebuild the map after a point was
+    re-selected.  Coordinates come from the DB manager session cache, so the
+    engineer's choices are honoured.
+
+    Returns dict with lines_geojson, points_geojson, line_style, point_style
+    (paths are "" when the export was blocked).
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    from core_logic.gis.geojson_export import export_network_to_geojson
+    from geolevel_db_manager import get_db_manager
+    coord_manager = _build_coord_manager(lines, get_db_manager())
+    try:
+        return export_network_to_geojson(
+            lines, output_dir, project_name=project_name, coord_manager=coord_manager,
+        )
+    except OSError as exc:   # PermissionError is a subclass
+        log.error("GeoJSON re-export failed (%s) — continuing without GeoJSON", exc)
+        return {"lines_geojson": "", "points_geojson": "", "line_style": "", "point_style": ""}
+
+
 def process_geodetic_data(
     file_paths: List[str],
     leveling_class: str,

@@ -378,6 +378,13 @@ class GeoLevelPlugin:
         self._last_class = "H3"
         self._pending_pid_remap = {}         # Point ID remaps from resolution dialog
         self._pending_marker_pids = {}       # Marker PIDs (estimate/pkt) from resolution
+        self._pending_excluded = set()       # Field PIDs excluded in the resolution dialog
+        self._pending_unuse = set()          # PIDs excluded via Point Settings (.glp)
+        # Point Settings: engineer's DB choices keyed by ORIGINAL field point ID
+        # (persisted in .glp so a reload re-applies them without asking again)
+        self._point_overrides = {}
+        # current (possibly renamed) point name -> original field point ID
+        self._point_origin = {}
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -478,6 +485,7 @@ class GeoLevelPlugin:
         self.dock.loops_requested.connect(self._detect_loops)
         self.dock.enhanced_lsa_requested.connect(self._run_enhanced_lsa)
         self.dock.override_changed.connect(self._on_override_changed)
+        self.dock.edit_points_requested.connect(self._edit_points)
 
     def _show_dock(self):
         if self.dock:
@@ -582,12 +590,15 @@ class GeoLevelPlugin:
 
         # Append new lines to existing list
         new_lines = result["lines"]
+        n_prev = len(self._lines)
         self._lines.extend(new_lines)
 
-        # Pre-calculation point verification: catch ASCII/Hebrew mismatches and
-        # spatial duplicates before any layer or LSA calculation runs.
+        # Pre-calculation point verification: catch ASCII/Hebrew mismatches,
+        # spatial twins and out-of-radius picks before any layer or LSA runs.
+        # (The dialog may shrink new_lines in place, so trim by n_prev.)
+        self._pending_excluded = set()
         if not self._check_point_resolution(new_lines):
-            self._lines = self._lines[:-len(new_lines)]
+            self._lines = self._lines[:n_prev]
             return
 
         # Re-run the full geodetic pipeline now that db_mgr._cache contains the
@@ -595,7 +606,7 @@ class GeoLevelPlugin:
         # had an empty cache, so its GeoJSON used estimated/missing positions.
         # This second run picks up the confirmed DB coordinates and regenerates
         # both lines_geojson and points_geojson with the correct geometry.
-        self._lines = self._lines[:-len(new_lines)]   # remove the pre-resolution lines
+        self._lines = self._lines[:n_prev]   # remove the pre-resolution lines
         # Pass verified name overrides so process_geodetic_data applies them
         # before validation and GeoJSON export — fixes INVALID_ENDPOINT errors
         # and missing symbols caused by ASCII names reaching the exporter.
@@ -618,6 +629,22 @@ class GeoLevelPlugin:
             self._pending_pid_remap = {}   # consume — one-shot per load
 
         new_lines = result["lines"]
+        # Keep setup endpoints consistent with the renamed line endpoints
+        self._rename_points_in_lines(new_lines, pid_remap, setups_only=True)
+        # Re-apply exclusions chosen in the dialog (the re-run re-parsed them)
+        excluded = getattr(self, "_pending_excluded", set())
+        if excluded:
+            new_lines = [ln for ln in new_lines
+                         if ln.start_point not in excluded and ln.end_point not in excluded]
+            self._pending_excluded = set()
+        # Points excluded later in Point Settings (saved in .glp): keep the
+        # lines but mark them unused, exactly as the edit screen did.
+        unuse = getattr(self, "_pending_unuse", set())
+        if unuse:
+            for ln in new_lines:
+                if ln.start_point in unuse or ln.end_point in unuse:
+                    ln.is_used = False
+            self._pending_unuse = set()
         self._lines.extend(new_lines)
 
         # Seed the DB spatial centroid from the 'נקודות בקרה' control-points layer.
@@ -876,6 +903,8 @@ class GeoLevelPlugin:
             "output_dir": output_dir,
             # Store absolute paths using os.path.abspath for robustness
             "files": [os.path.abspath(ln.filename) for ln in self._lines],
+            # Point Settings choices keyed by original field point ID
+            "point_overrides": self._point_overrides,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -933,6 +962,15 @@ class GeoLevelPlugin:
         # Clear existing lines so deduplication does not silently block re-load
         self._lines = []
         self._val_results = []
+        self._point_origin = {}
+        overrides = data.get("point_overrides", {})
+        self._point_overrides = dict(overrides) if isinstance(overrides, dict) else {}
+        try:
+            from geolevel_db_manager import get_db_manager
+            get_db_manager().clear_session_cache()
+        except Exception:
+            pass
+        self._remove_result_layers()
         self._process_files(resolved_files, cls, output_dir)
 
     def _new_project(self):
@@ -961,10 +999,11 @@ class GeoLevelPlugin:
         except Exception:
             pass
 
-        # Remove the QGIS map layer
-        if self._layer and self._layer.isValid():
-            QgsProject.instance().removeMapLayer(self._layer)
-        self._layer = None
+        self._point_overrides = {}
+        self._point_origin = {}
+
+        # Remove the QGIS map layers (lines + points)
+        self._remove_result_layers()
 
         # Wipe the dock UI
         if self.dock:
@@ -1284,17 +1323,181 @@ class GeoLevelPlugin:
         _apply_line_renderer(layer)
         self.iface.mapCanvas().refresh()
 
+    # ------------------------------------------------------------------
+    # Point resolution (load-time) and Point Settings (edit-time)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _unique_points(lines) -> list:
+        return sorted(
+            {ln.start_point for ln in lines if ln.start_point}
+            | {ln.end_point for ln in lines if ln.end_point}
+        )
+
+    @staticmethod
+    def _record_to_dict(rec) -> dict:
+        """Serialise the persistent (non-scoring) fields of a BenchmarkRecord."""
+        keys = ("ot_nekuda", "mispar_nekuda", "name", "gova_ort", "shem_darga_gova",
+                "taarih_gova_ort", "ot_nekuda_kfula", "mispar_nekuda_kfula",
+                "x", "y", "kfar_aher_name", "objectid", "hearot")
+        return {k: getattr(rec, k, None) for k in keys}
+
+    @staticmethod
+    def _record_from_dict(d: dict):
+        from geolevel_db_manager import BenchmarkRecord
+        import dataclasses
+        allowed = {f.name for f in dataclasses.fields(BenchmarkRecord)}
+        kw = {k: v for k, v in (d or {}).items() if k in allowed}
+        for req in ("ot_nekuda", "mispar_nekuda", "name", "gova_ort", "shem_darga_gova",
+                    "taarih_gova_ort", "ot_nekuda_kfula", "mispar_nekuda_kfula", "x", "y"):
+            kw.setdefault(req, None)
+        kw["ot_nekuda"] = kw["ot_nekuda"] or ""
+        kw["mispar_nekuda"] = kw["mispar_nekuda"] or 0
+        kw["name"] = kw["name"] or ""
+        return BenchmarkRecord(**kw)
+
+    @staticmethod
+    def _rename_points_in_lines(lines, remap: dict, setups_only: bool = False) -> int:
+        """Rename points per *remap* {old: new} in ONE pass (chained remaps
+        such as A→B, B→C are not applied twice).  Renames line endpoints
+        (unless *setups_only*) and setup from/to points.
+        Returns the number of lines whose endpoints changed."""
+        remap = {o: n for o, n in (remap or {}).items() if o and n and o != n}
+        if not remap:
+            return 0
+        touched = 0
+        for ln in lines:
+            if not setups_only:
+                s0, e0 = ln.start_point, ln.end_point
+                ln.start_point = remap.get(s0, s0)
+                ln.end_point = remap.get(e0, e0)
+                touched += int((ln.start_point, ln.end_point) != (s0, e0))
+            for st in getattr(ln, "setups", []) or []:
+                fp = getattr(st, "from_point", None)
+                tp = getattr(st, "to_point", None)
+                if fp in remap:
+                    st.from_point = remap[fp]
+                if tp in remap:
+                    st.to_point = remap[tp]
+        return touched
+
+    def _resolve_manual_name(self, db_mgr, pid: str, manual: str, lines):
+        """Look a manually typed DB name up; return a full record or None."""
+        try:
+            recs = db_mgr.get_candidates(manual, include_twins=False)
+        except Exception:
+            recs = []
+        if not recs:
+            return None
+        recs = db_mgr.score_candidates(pid, recs, lines)
+        if len(recs) == 1:
+            return recs[0]
+        return db_mgr.pick_unambiguous(recs) or recs[0]
+
+    def _apply_resolution(self, db_mgr, result: dict, lines, edit_mode: bool) -> dict:
+        """Apply the output of GeoLevelPointResolutionDialog.get_resolved().
+
+        Pins every chosen record in the DB manager cache, renames point IDs
+        to the verified DB names, persists the choice in _point_overrides and
+        handles exclude / estimate modes.
+
+        Load mode: *lines* are the freshly parsed lines; renames are returned
+        as ``remap`` so the post-resolution re-run applies them too.
+        Edit mode: *lines* is self._lines and is renamed in place; excluded
+        points switch their lines to is_used=False (reversible).
+
+        Returns {"remap": {old: new}, "excluded": set, "markers": {pid: (rec, mode)}}.
+        """
+        records = result["records"]
+        modes = result["modes"]
+        manual = result.get("manual", {})
+
+        remap: dict = {}
+        excluded: set = set()
+        markers: dict = {}
+
+        for pid, rec in records.items():
+            mode = modes.get(pid, "use_selected")
+            origin = self._point_origin.get(pid, pid)
+
+            if mode == "exclude":
+                excluded.add(pid)
+                if edit_mode:
+                    self._point_overrides[origin] = {"mode": "exclude"}
+                continue
+
+            if mode in ("estimate", "pkt_average"):
+                markers[pid] = (rec, mode)
+                # Pin as "not in DB" so resolve_benchmark() never auto-picks;
+                # coordinates are then estimated topologically from neighbours.
+                db_mgr.accept_record(pid, None)
+                self._point_overrides[origin] = {"mode": mode}
+                continue
+
+            if pid in manual:
+                full = self._resolve_manual_name(db_mgr, pid, manual[pid], lines)
+                if full is not None:
+                    rec = full
+                else:
+                    # Unknown name: rename only, let the normal lookup run.
+                    new_name = manual[pid].strip()
+                    db_mgr.forget(new_name)
+                    if new_name != pid:
+                        remap[pid] = new_name
+                        db_mgr.forget(pid)
+                    self._point_overrides[origin] = {"mode": "rename", "name": new_name}
+                    self._point_origin[new_name] = origin
+                    continue
+
+            if rec is None:
+                continue
+
+            verified_name = (rec.name or "").strip() or pid
+            db_mgr.accept_record(verified_name, rec)
+            if not edit_mode or verified_name == pid:
+                db_mgr.accept_record(pid, rec)
+            if verified_name != pid:
+                remap[pid] = verified_name
+            self._point_overrides[origin] = {"mode": "use_selected",
+                                             "record": self._record_to_dict(rec)}
+            self._point_origin[verified_name] = origin
+
+        if edit_mode:
+            n = self._rename_points_in_lines(lines, remap)
+            if self.dock:
+                for old, new in remap.items():
+                    self.dock.log(f"Point Settings: '{old}' → '{new}'")
+                if remap:
+                    self.dock.log(f"Point Settings: {n} line(s) renamed")
+            for pid in excluded:
+                for ln in lines:
+                    if pid in (ln.start_point, ln.end_point):
+                        ln.is_used = False
+        else:
+            if excluded:
+                lines[:] = [ln for ln in lines
+                            if ln.start_point not in excluded and ln.end_point not in excluded]
+            self._rename_points_in_lines(lines, remap)
+
+        return {"remap": remap, "excluded": excluded, "markers": markers}
+
+    def _score_batch(self, db_mgr, batch: dict, lines) -> dict:
+        return {pid: db_mgr.score_candidates(pid, recs, lines, batch)
+                for pid, recs in batch.items()}
+
     def _check_point_resolution(self, new_lines: list) -> bool:
         """Verify ambiguous or unresolved field point IDs before loading.
 
-        Queries the DB for each unique point ID in *new_lines*.  Points that
-        return exactly one candidate with a direct name match are auto-approved
-        and pre-populated in the DB manager cache.  Points that return 0 or 2+
-        candidates — or that required Hebrew transliteration expansion to find
-        anything — are presented to the engineer in GeoLevelPointResolutionDialog.
+        Pipeline:
+          1. Saved choices (from Point Settings / .glp) are applied first.
+          2. Batch-fetch candidates for the rest, including < 1 m spatial twins.
+          3. Establish the field anchor from unambiguous measured points and
+             score every candidate (normal radius + measured line lengths).
+          4. Auto-approve only a single in-radius, length-consistent location
+             without differently named twins; everything else → dialog.
 
         Returns True when loading should proceed, False when the user cancelled.
-        DB not configured → returns True immediately (no-op, existing behaviour).
+        DB not configured → returns True immediately.
         """
         try:
             from geolevel_db_manager import get_db_manager
@@ -1302,103 +1505,264 @@ class GeoLevelPlugin:
             if not db_mgr.is_configured():
                 return True
 
-            unique_pids = sorted(
-                {ln.start_point for ln in new_lines if ln.start_point}
-                | {ln.end_point for ln in new_lines if ln.end_point}
-            )
+            unique_pids = self._unique_points(new_lines)
+            pid_remap: dict = {}
+            self._pending_unuse = set()
 
-            needs_dialog: list = []          # pids requiring user confirmation
-            candidate_map: dict = {}         # pid → List[BenchmarkRecord]
-
-            # Batch-fetch all candidates in one query instead of N individual calls
-            batch_results = db_mgr.get_candidates_batch(unique_pids)
-
+            # 1. Re-apply saved overrides
+            pending = []
             for pid in unique_pids:
-                hits = batch_results[pid]
-
-                if len(hits) == 1:
-                    # Unambiguous single match — pre-populate cache, skip dialog.
-                    db_mgr._cache[pid.strip().upper()] = hits[0]
+                ov = self._point_overrides.get(pid)
+                if not ov:
+                    pending.append(pid)
                     continue
+                if ov.get("mode") in ("estimate", "pkt_average"):
+                    db_mgr.accept_record(pid, None)
+                    continue
+                if ov.get("mode") == "exclude":
+                    self._pending_unuse.add(pid)
+                    continue
+                if ov.get("mode") == "rename":
+                    new_name = (ov.get("name") or "").strip()
+                    if new_name and new_name != pid:
+                        pid_remap[pid] = new_name
+                        self._point_origin[new_name] = pid
+                    continue
+                rec = self._record_from_dict(ov.get("record"))
+                name = (rec.name or "").strip() or pid
+                db_mgr.accept_record(pid, rec)
+                db_mgr.accept_record(name, rec)
+                self._point_origin[name] = pid
+                if name != pid:
+                    pid_remap[pid] = name
+            if pid_remap:
+                self._rename_points_in_lines(new_lines, pid_remap)
 
-                # 0 hits (unresolved) or 2+ hits (spatial duplicate) both need
-                # engineer confirmation before the layer is built.
-                needs_dialog.append(pid)
-                candidate_map[pid] = hits
-
-            if not needs_dialog:
+            if not pending:
+                self._pending_pid_remap = pid_remap
                 return True
 
-            from geo_level_point_resolution_dialog import GeoLevelPointResolutionDialog
-            dlg = GeoLevelPointResolutionDialog(
-                needs_dialog, candidate_map, parent=self.iface.mainWindow()
+            # The first parse pass already ran resolve_benchmark() and may have
+            # auto-picked by centroid (e.g. the wrong 250A).  Those picks are
+            # unconfirmed — drop them so they cannot bias anchor or topology.
+            for pid in pending:
+                db_mgr.forget(pid)
+
+            # 2-3. Candidates, anchor, scoring
+            batch = db_mgr.get_candidates_batch(pending)
+            db_mgr.establish_anchor(batch)
+            scored = self._score_batch(db_mgr, batch, new_lines)
+
+            needs_dialog: list = []
+            for pid in pending:
+                self._point_origin.setdefault(pid, pid)
+                pick = db_mgr.pick_unambiguous(scored[pid])
+                if pick is not None:
+                    db_mgr.accept_record(pid, pick)
+                    continue
+                needs_dialog.append(pid)
+
+            QgsMessageLog.logMessage(
+                f"Point resolution: {len(pending) - len(needs_dialog)} auto-approved, "
+                f"{len(needs_dialog)} need confirmation: {needs_dialog or 'none'}",
+                "GeoLevel", level=Qgis.Info,
             )
-            if not dlg.exec_():
-                return False
 
-            result = dlg.get_resolved()
-            records = result["records"]
-            modes = result["modes"]
+            if needs_dialog:
+                from geo_level_point_resolution_dialog import GeoLevelPointResolutionDialog
+                dlg = GeoLevelPointResolutionDialog(
+                    needs_dialog, {p: scored[p] for p in needs_dialog},
+                    parent=self.iface.mainWindow(), mode="load",
+                )
+                if not dlg.exec_():
+                    return False
+                applied = self._apply_resolution(db_mgr, dlg.get_resolved(),
+                                                 new_lines, edit_mode=False)
+                pid_remap.update(applied["remap"])
+                self._pending_excluded = set(applied["excluded"])
+                self._pending_marker_pids = applied["markers"]
 
-            pid_remap: dict = {}          # ASCII field pid → verified DB name
-            excluded_pids: set = set()     # pids marked for exclusion
-            marker_pids: dict = {}         # pids with estimate/pkt markers
-
-            for pid, rec in records.items():
-                mode = modes[pid]
-
-                if mode == "exclude":
-                    excluded_pids.add(pid)
-                    continue
-
-                if mode in ("estimate", "pkt_average"):
-                    # Track marker records for the engine to process
-                    marker_pids[pid] = (rec, mode)
-                    continue
-
-                # mode == "use_selected"
-                if rec is None:
-                    continue
-
-                verified_name = rec.name.strip()
-                cache_key = pid.strip().upper()
-                db_mgr._cache[cache_key] = rec
-                # Also cache under the verified DB name so the re-run lookup hits
-                db_mgr._cache[verified_name.upper()] = rec
-                # Only record a rename when the DB name differs from the field ID
-                if verified_name and verified_name != pid:
-                    pid_remap[pid] = verified_name
-
-            # Remove excluded points from the lines entirely
-            if excluded_pids:
-                new_lines[:] = [
-                    ln for ln in new_lines
-                    if ln.start_point not in excluded_pids and ln.end_point not in excluded_pids
-                ]
-
-            # Rename start_point / end_point on new_lines so the re-run uses the
-            # correct (possibly Hebrew) names for GeoJSON export and symbology.
-            if pid_remap:
-                for ln in new_lines:
-                    if ln.start_point in pid_remap:
-                        ln.start_point = pid_remap[ln.start_point]
-                    if ln.end_point in pid_remap:
-                        ln.end_point = pid_remap[ln.end_point]
-
-            # Persist the remap and marker data so _process_files can apply them
-            # to the fresh new_lines produced by the post-resolution re-run.
             self._pending_pid_remap = pid_remap
-            self._pending_marker_pids = marker_pids
-
             return True
 
-        except Exception as exc:
-            import traceback
+        except Exception:
             QgsMessageLog.logMessage(
                 "Point resolution check failed: " + traceback.format_exc(),
                 "GeoLevel", level=Qgis.Warning,
             )
             return True  # non-fatal — fall through to normal load
+
+    def _edit_points(self, pids=None):
+        """Point Settings screen — re-select DB benchmarks without reloading files."""
+        if not self._lines:
+            QMessageBox.information(self.iface.mainWindow(), "Point Settings",
+                                    "No lines loaded.")
+            return
+        try:
+            from geolevel_db_manager import get_db_manager
+            db_mgr = get_db_manager()
+        except Exception as exc:
+            QMessageBox.critical(self.iface.mainWindow(), "Point Settings", str(exc))
+            return
+        if not db_mgr.is_configured():
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Point Settings",
+                "The benchmark database is not configured.\n"
+                "Open Settings ▸ Database Connection first.",
+            )
+            return
+
+        all_pids = self._unique_points(self._lines)
+        targets = [p for p in (pids or []) if p in all_pids] or all_pids
+
+        try:
+            self.iface.mainWindow().setCursor(Qt.WaitCursor)
+            batch = db_mgr.get_candidates_batch(targets)
+            # Anchor on the points NOT being edited (their pick is trusted);
+            # fall back to the whole session pool when editing everything.
+            others = []
+            for p in all_pids:
+                if p in targets:
+                    continue
+                rec = db_mgr._cache.get(p.strip().upper())
+                if rec is not None and rec.x is not None and rec.y is not None:
+                    others.append((rec.x, rec.y))
+            if others:
+                db_mgr.establish_anchor(batch, extra_coords=others, include_resolved=False)
+            else:
+                db_mgr.establish_anchor(batch)
+            scored = self._score_batch(db_mgr, batch, self._lines)
+        finally:
+            self.iface.mainWindow().unsetCursor()
+
+        current = {p: db_mgr._cache.get(p.strip().upper()) for p in targets}
+        current_modes = {}
+        for p in targets:
+            ov = self._point_overrides.get(self._point_origin.get(p, p)) or {}
+            m = ov.get("mode")
+            current_modes[p] = m if m in ("estimate", "pkt_average", "exclude") else "use_selected"
+
+        def _search(pid, query):
+            recs = db_mgr.get_candidates(query)
+            return db_mgr.score_candidates(pid, recs, self._lines)
+
+        from geo_level_point_resolution_dialog import GeoLevelPointResolutionDialog
+        dlg = GeoLevelPointResolutionDialog(
+            targets, scored, parent=self.iface.mainWindow(), mode="edit",
+            current_selection=current, search_fn=_search,
+            current_modes=current_modes,
+        )
+        if not dlg.exec_():
+            return
+
+        result = dlg.get_resolved()
+        # Only apply rows the engineer actually touched AND that differ from
+        # the current state (untouched rows are never re-pinned).
+        changed = {}
+        manual = result.get("manual", {})
+        for pid in targets:
+            if pid not in result.get("dirty", set()):
+                continue
+            mode = result["modes"].get(pid)
+            rec = result["records"].get(pid)
+            cur = current.get(pid)
+            if pid not in manual:
+                if mode == "use_selected":
+                    if rec is None:
+                        continue
+                    if (current_modes.get(pid) == "use_selected"
+                            and GeoLevelPointResolutionDialog._same(rec, cur)):
+                        continue
+                elif mode == current_modes.get(pid):
+                    continue
+            changed[pid] = pid
+        if not changed:
+            self.iface.messageBar().pushMessage("Point Settings", "No changes.",
+                                                level=Qgis.Info, duration=3)
+            return
+
+        sub = {
+            "records": {p: result["records"][p] for p in changed},
+            "modes": {p: result["modes"][p] for p in changed},
+            "manual": {p: v for p, v in result.get("manual", {}).items() if p in changed},
+        }
+        self._apply_resolution(db_mgr, sub, self._lines, edit_mode=True)
+        self._rebuild_map_layers()
+        self.iface.messageBar().pushMessage(
+            "Point Settings",
+            f"Updated {len(changed)} point(s): {', '.join(changed)} — map refreshed.",
+            level=Qgis.Success, duration=6,
+        )
+
+    def _remove_result_layers(self) -> None:
+        """Remove every 'Geodetic Results' / 'Geodetic Points' layer."""
+        proj = QgsProject.instance()
+        for name in ("Geodetic Results", "Geodetic Points"):
+            for lyr in proj.mapLayersByName(name):
+                proj.removeMapLayer(lyr.id())
+        self._layer = None
+
+    def _rebuild_map_layers(self) -> None:
+        """Rebuild line + point layers from in-memory self._lines.
+
+        No measurement file is re-parsed: direction toggles, use flags and
+        manager overrides on the LevelingLine objects are preserved.
+        """
+        output_dir = self._last_output_dir
+        if not output_dir or not os.path.isdir(output_dir):
+            output_dir = os.path.dirname(self._lines[0].filename) if self._lines else ""
+
+        try:
+            from core_logic.validators import BatchValidator
+            cls = self.dock.get_selected_class() if self.dock else self._last_class
+            cls = cls or self._last_class or "H3"
+            bv = BatchValidator(leveling_class=int(cls[1]))
+            # The validator only ever downgrades status; lines were not
+            # re-parsed, so reset before re-deriving it from renamed points.
+            from core_logic.config.models import LineStatus
+            keep = (LineStatus.EXCLUDED_FROM_MERGE, LineStatus.MERGED)
+            for ln in self._lines:
+                if ln.status not in keep:
+                    ln.status = LineStatus.VALID
+            self._val_results = bv.validate_batch(self._lines)
+            for ln in self._lines:
+                if getattr(ln, "manager_override", False):
+                    ln.status = LineStatus.VALID_BY_MANAGER
+        except Exception:
+            QgsMessageLog.logMessage("Re-validation failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+
+        canvas = self.iface.mapCanvas()
+        extent = canvas.extent()
+
+        # Release the old layers (and their GeoJSON file handles) first, then
+        # export under a fresh name so Windows file locks cannot block it.
+        self._remove_result_layers()
+        self._rebuild_counter = getattr(self, "_rebuild_counter", 0) + 1
+        files = {"lines_geojson": "", "points_geojson": "", "line_style": "", "point_style": ""}
+        try:
+            from core_logic.process import export_layers
+            files = export_layers(self._lines, output_dir,
+                                  project_name=f"geo_level_result_edit{self._rebuild_counter}")
+        except Exception:
+            QgsMessageLog.logMessage("Layer re-export failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+
+        self._load_line_layer(files.get("lines_geojson", ""), files.get("line_style", ""),
+                              self._lines)
+        self._load_point_layer(files.get("points_geojson", ""), files.get("point_style", ""))
+        self._sync_map_statuses()
+        if self._layer is not None and self._layer.isValid():
+            self._layer.triggerRepaint()
+        self.iface.mapCanvas().refresh()
+        if self.dock:
+            cur = self.dock.get_current_index()
+            self.dock.load_lines(self._lines, self._val_results)
+            if 0 <= cur < len(self._lines):
+                self.dock.line_list.setCurrentRow(cur)
+        # load_lines/setCurrentRow zoom to a line — restore the user's view
+        canvas.setExtent(extent)
+        canvas.refresh()
 
     def _run_lsa(self):
         if not self._lines:

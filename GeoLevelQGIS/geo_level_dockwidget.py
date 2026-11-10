@@ -50,6 +50,8 @@ class GeoLevelDockWidget(QDockWidget):
     loops_requested       = pyqtSignal()
     enhanced_lsa_requested = pyqtSignal()
     override_changed      = pyqtSignal(str, str)  # (filename, new_status_value)
+    # Point Settings: list of point IDs to edit ([] = every point in the project)
+    edit_points_requested = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__("Geo Level Gravi", parent)
@@ -92,6 +94,8 @@ class GeoLevelDockWidget(QDockWidget):
         self.line_list = QListWidget()
         self.line_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.line_list.currentRowChanged.connect(self._on_line_selected)
+        self.line_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.line_list.customContextMenuRequested.connect(self._on_line_list_context_menu)
         vbox.addWidget(self.line_list)
 
         btn_add = QPushButton("+ Add Files")
@@ -175,6 +179,15 @@ class GeoLevelDockWidget(QDockWidget):
         self.btn_lsa.setEnabled(False)
         self.btn_lsa.clicked.connect(self.lsa_requested.emit)
         btn_row.addWidget(self.btn_lsa)
+
+        self.btn_edit_points = QPushButton("Edit Points… / הגדרות נקודה")
+        self.btn_edit_points.setToolTip(
+            "Point Settings: re-select the database benchmark for any point "
+            "without reloading the measurement files"
+        )
+        self.btn_edit_points.setEnabled(False)
+        self.btn_edit_points.clicked.connect(lambda: self.edit_points_requested.emit([]))
+        btn_row.addWidget(self.btn_edit_points)
         vbox.addLayout(btn_row)
 
         return w
@@ -326,6 +339,7 @@ class GeoLevelDockWidget(QDockWidget):
         if lines:
             self.btn_lsa.setEnabled(True)
             self.line_list.setCurrentRow(0)
+        self.btn_edit_points.setEnabled(bool(lines))
 
         self._refresh_val_table()
 
@@ -496,6 +510,30 @@ class GeoLevelDockWidget(QDockWidget):
         if row < len(self._val_results):
             _, vr = self._val_results[row]
             self._show_val_detail(vr)
+
+    def _on_line_list_context_menu(self, pos):
+        """Right-click on a line → Point Settings for its two endpoints."""
+        item = self.line_list.itemAt(pos)
+        if item is None:
+            return
+        idx = self.line_list.row(item)
+        if idx < 0 or idx >= len(self._lines):
+            return
+        line = self._lines[idx]
+        pts = [p for p in (line.start_point, line.end_point) if p]
+        menu = QMenu(self)
+        act_ends = QAction(
+            "Edit endpoints… ({})".format(" / ".join(pts) or "?"), menu
+        )
+        act_ends.setEnabled(bool(pts))
+        act_ends.triggered.connect(
+            lambda _=False, p=list(dict.fromkeys(pts)): self.edit_points_requested.emit(p)
+        )
+        menu.addAction(act_ends)
+        act_all = QAction("Point Settings — all points…", menu)
+        act_all.triggered.connect(lambda _=False: self.edit_points_requested.emit([]))
+        menu.addAction(act_all)
+        menu.exec_(self.line_list.viewport().mapToGlobal(pos))
 
     def _on_add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -857,6 +895,7 @@ class GeoLevelDockWidget(QDockWidget):
         self.setup_table.setRowCount(0)
         self.btn_adjust_line.setEnabled(False)
         self.btn_lsa.setEnabled(False)
+        self.btn_edit_points.setEnabled(False)
 
         # Tab 1 — Validation
         self.val_table.setRowCount(0)

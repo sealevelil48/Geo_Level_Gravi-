@@ -18,6 +18,7 @@ Coordinate convention (Survey of Israel DB):
   BenchmarkRecord.y → Northing (standard GIS convention)
 """
 
+import copy
 import math
 import re
 import logging
@@ -88,6 +89,89 @@ class BenchmarkRecord:
     x: Optional[float]                  # Easting  (ITM 2005, EPSG:2039) — standard GIS x
     y: Optional[float]                  # Northing (ITM 2005, EPSG:2039) — standard GIS y
     kfar_aher_name: Optional[str] = None  # City / locality name from kfar_aher table
+    objectid: Optional[int] = None        # Stable DB row key (dedup / persistence)
+    hearot: Optional[str] = None          # Remarks, e.g. "= 849L" for twin monuments
+
+    # --- Transient scoring annotations (set by score_candidates / twins) ---
+    twin_of: Optional[str] = None         # Name of the record this one is a spatial twin of
+    twin_dist_m: Optional[float] = None   # Distance (m) to that twin
+    dist_to_anchor_m: Optional[float] = None  # Distance to field anchor (m)
+    in_radius: Optional[bool] = None      # Inside the normal working radius?
+    topo_ok: Optional[bool] = None        # Consistent with measured line lengths?
+
+    def key(self) -> str:
+        """Stable identity key for deduplication."""
+        if self.objectid is not None:
+            return f"oid:{self.objectid}"
+        xs = f"{self.x:.3f}" if self.x is not None else "?"
+        ys = f"{self.y:.3f}" if self.y is not None else "?"
+        return f"{self.name}\x00{xs}\x00{ys}"
+
+
+# Default "normal working radius" around the field anchor (metres)
+DEFAULT_SEARCH_RADIUS_M = 15000.0
+# Two DB points closer than this are considered the same physical monument
+TWIN_TOLERANCE_M = 1.0
+# Topology bound: straight distance between line endpoints must not exceed
+# the leveled line length × factor + slack.
+TOPO_FACTOR = 1.1
+TOPO_SLACK_M = 100.0
+
+
+def _dist(a_x: float, a_y: float, b_x: float, b_y: float) -> float:
+    return math.hypot(a_x - b_x, a_y - b_y)
+
+
+def group_twins(records: List["BenchmarkRecord"],
+                tol_m: float = TWIN_TOLERANCE_M) -> List[List["BenchmarkRecord"]]:
+    """Cluster records whose coordinates lie within *tol_m* of each other.
+
+    Single-linkage clustering: two records end up in the same cluster when a
+    chain of < tol_m hops connects them.  Records with no coordinates form a
+    cluster of their own.  Order of clusters follows the first appearance in
+    *records* (so a pre-sorted list keeps its ranking).
+    """
+    clusters: List[List[BenchmarkRecord]] = []
+    for rec in records:
+        if rec.x is None or rec.y is None:
+            clusters.append([rec])
+            continue
+        home = None
+        for cl in clusters:
+            if any(o.x is not None and o.y is not None
+                   and _dist(rec.x, rec.y, o.x, o.y) < tol_m for o in cl):
+                if home is None:
+                    home = cl
+                    cl.append(rec)
+                else:  # rec bridges two clusters — merge
+                    home.extend(cl)
+                    cl.clear()
+        clusters = [c for c in clusters if c]
+        if home is None:
+            clusters.append([rec])
+    return clusters
+
+
+def cluster_heights_disagree(cluster: List["BenchmarkRecord"], tol_m: float = 0.001) -> bool:
+    """True when records of one < 1 m cluster carry different heights
+    (e.g. two DB rows for the same monument with a re-levelled gova_ort)."""
+    hs = [r.gova_ort for r in cluster]
+    if len(cluster) < 2:
+        return False
+    if any(h is None for h in hs):
+        return not all(h is None for h in hs)
+    return max(hs) - min(hs) > tol_m
+
+
+def cluster_needs_choice(cluster: List["BenchmarkRecord"]) -> bool:
+    """A cluster the user must resolve: different names or different heights."""
+    return cluster_has_distinct_names(cluster) or cluster_heights_disagree(cluster)
+
+
+def cluster_has_distinct_names(cluster: List["BenchmarkRecord"]) -> bool:
+    """True when a twin cluster holds ≥2 differently named DB points."""
+    names = {re.sub(r'[^A-Z0-9א-ת]', '', (r.name or '').upper()) for r in cluster}
+    return len(names) > 1
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +182,7 @@ class BenchmarkRecord:
 # Coordinates come from the PostGIS geometry column (geom_full, EPSG:2039)
 # via ST_X / ST_Y so we always get true ITM 2005 metres regardless of whether
 # the raw x/y columns contain WGS84 degrees or ITM metres.
-_SQL_TEMPLATE = """
-SELECT
+_SQL_COLUMNS = """
     ot_nekuda,
     mispar_nekuda,
     name,
@@ -110,7 +193,23 @@ SELECT
     mispar_nekuda_kfula,
     ST_X(geom_full) AS x,
     ST_Y(geom_full) AS y,
-    kfar_aher_name
+    kfar_aher_name,
+    objectid,
+    hearot
+"""
+
+# Spatial twins — every DB point within %s metres of a given ITM location.
+# Catches monuments recorded under two names whose coordinates differ only
+# after the decimal point (e.g. 250/A vs 849/L, 0.30 m apart).
+_SQL_TWINS = """
+SELECT {cols}
+FROM {table}
+WHERE geom_full IS NOT NULL
+  AND ST_DWithin(geom_full, ST_SetSRID(ST_MakePoint(%s, %s), 2039), %s)
+"""
+
+_SQL_TEMPLATE = """
+SELECT {cols}
 FROM {table}
 WHERE
     UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || '/' || COALESCE(CAST(ot_nekuda AS TEXT), ''))) = UPPER(TRIM(%s))
@@ -173,13 +272,20 @@ class BenchmarkDBManager:
         self._all_dat_point_names: List[str] = []
         # Cached result of _build_global_pool_centroid (built at most once per session)
         self._global_pool_centroid: Optional[Tuple[float, float]] = None
+        # "Normal working radius" around the field anchor (metres)
+        self._radius_m: float = DEFAULT_SEARCH_RADIUS_M
+        # Field anchor established from unambiguous measured points
+        self._anchor: Optional[Tuple[float, float]] = None
+        # Cache of spatial-twin lookups keyed by record key
+        self._twin_cache: Dict[str, List[BenchmarkRecord]] = {}
 
     # ------------------------------------------------------------------ #
     # Configuration
     # ------------------------------------------------------------------ #
 
     def configure(self, host: str, port: int, dbname: str,
-                  user: str, table: str, authcfg: str) -> None:
+                  user: str, table: str, authcfg: str,
+                  search_radius_km: Optional[float] = None) -> None:
         """Store connection params and clear session cache."""
         self._params = {
             "host": host,
@@ -189,8 +295,28 @@ class BenchmarkDBManager:
             "table": table,
             "authcfg": authcfg,
         }
+        if search_radius_km is not None:
+            self.set_search_radius_km(search_radius_km)
         self.clear_session_cache()
-        logger.info("DB manager configured: %s@%s/%s table=%s", user, host, dbname, table)
+        logger.info("DB manager configured: %s@%s/%s table=%s radius=%.1f km",
+                    user, host, dbname, table, self._radius_m / 1000.0)
+
+    def set_search_radius_km(self, km: float) -> None:
+        """Set the normal working radius (km). Values ≤ 0 are ignored."""
+        try:
+            km = float(km)
+        except (TypeError, ValueError):
+            return
+        if km > 0:
+            self._radius_m = km * 1000.0
+
+    @property
+    def search_radius_m(self) -> float:
+        return self._radius_m
+
+    @property
+    def anchor(self) -> Optional[Tuple[float, float]]:
+        return self._anchor
 
     def is_configured(self) -> bool:
         """True only when both table name and authcfg are set."""
@@ -202,6 +328,8 @@ class BenchmarkDBManager:
         self._resolved_coords.clear()
         self._all_dat_point_names = []
         self._global_pool_centroid = None
+        self._anchor = None
+        self._twin_cache.clear()
         logger.debug("DB session cache cleared")
 
     # ------------------------------------------------------------------ #
@@ -603,56 +731,45 @@ class BenchmarkDBManager:
         self._cache[key] = rec
         return rec
 
-    def get_candidates(self, point_name: str) -> List[BenchmarkRecord]:
+    def get_candidates(self, point_name: str,
+                       include_twins: bool = True) -> List[BenchmarkRecord]:
         """Return all DB candidates for *point_name* across ASCII and Hebrew variants.
 
-        Runs PointNormalizer.generate_search_candidates() to expand the raw
-        field ID into every plausible ASCII and Hebrew form, then queries the
-        DB for each candidate and deduplicates results by (name, x, y).
+        Expands the raw field ID with PointNormalizer.generate_search_candidates(),
+        queries every variant, deduplicates by DB identity and (optionally)
+        appends near-coincident spatial twins (< TWIN_TOLERANCE_M).
 
         Unlike resolve_benchmark(), this method never auto-selects by proximity
-        and never writes to the cache.  It is used by the pre-calculation point
-        verification dialog so the engineer can choose the correct match.
+        and never writes to the cache.  It is used by the point verification /
+        Point Settings dialogs so the engineer can choose the correct match.
         """
         if not self.is_configured():
             return []
+        return self.get_candidates_batch([point_name], include_twins)[point_name]
 
-        try:
-            from core_logic.engine.point_normalizer import PointNormalizer
-            search_names = PointNormalizer.generate_search_candidates(point_name)
-        except Exception:
-            search_names = [point_name.strip().upper()]
-
-        all_hits: List[BenchmarkRecord] = []
-        seen: set = set()
-        for name in search_names:
-            for rec in self._query_candidates(name.strip().upper()):
-                key = f"{rec.name}\x00{rec.x}\x00{rec.y}"
-                if key not in seen:
-                    seen.add(key)
-                    all_hits.append(rec)
-        return all_hits
-
-    def get_candidates_batch(self, point_names: List[str]) -> Dict[str, List[BenchmarkRecord]]:
+    def get_candidates_batch(self, point_names: List[str],
+                             include_twins: bool = True) -> Dict[str, List[BenchmarkRecord]]:
         """
-        Batch-fetch all DB candidates for multiple point names in one optimized pass.
+        Fetch all DB candidates for multiple point names.
 
-        Expands each point name into ASCII/Hebrew variants, then runs ONE batch SQL query
-        for all candidates, dramatically faster than looping with individual get_candidates()
-        calls.  Useful for pre-calculation point verification before layer building.
+        Each input name is expanded into ASCII/Hebrew variants; every unique
+        variant is queried once.  Records are mapped back to an input name by
+        *which search variant returned them* (not by comparing rec.name), so
+        matches found through the _kfula alternate-name columns are kept.
 
-        Args:
-            point_names: List of field point IDs to resolve.
+        When *include_twins* is True, every hit is checked for other DB points
+        within TWIN_TOLERANCE_M (same monument, different name, coordinates
+        differing only after the decimal point).  Twins are appended and tagged
+        via ``twin_of`` / ``twin_dist_m`` so the dialog can force a choice.
+
+        Returned records are per-pid copies, so scoring annotations written by
+        score_candidates() for one pid never leak into another.
 
         Returns:
-            Dict mapping each input point_name → List[BenchmarkRecord] (may be empty).
+            Dict mapping each input point_name -> List[BenchmarkRecord] (may be empty).
         """
-        if not self.is_configured():
-            return {pn: [] for pn in point_names}
-
         result: Dict[str, List[BenchmarkRecord]] = {pn: [] for pn in point_names}
-
-        if not point_names:
+        if not self.is_configured() or not point_names:
             return result
 
         try:
@@ -660,90 +777,299 @@ class BenchmarkDBManager:
         except Exception:
             PointNormalizer = None
 
-        # Expand all names into search variants
-        all_search_names: List[str] = []
         name_to_search_names: Dict[str, List[str]] = {}
-
         for pn in point_names:
+            variants: List[str] = []
             if PointNormalizer:
                 try:
-                    variants = PointNormalizer.generate_search_candidates(pn)
+                    variants = list(PointNormalizer.generate_search_candidates(pn))
                 except Exception:
-                    variants = [pn.strip().upper()]
-            else:
-                variants = [pn.strip().upper()]
-
-            variants = [v.strip().upper() for v in variants]
+                    variants = []
+            variants = [v.strip().upper() for v in variants if v and v.strip()]
+            base = pn.strip().upper()
+            if base not in variants:
+                variants.insert(0, base)
             name_to_search_names[pn] = variants
-            all_search_names.extend(variants)
 
-        # Query all unique search names in one pass
-        all_unique = list(set(all_search_names))
+        all_unique = sorted({v for vs in name_to_search_names.values() for v in vs})
         logger.debug("Batch query: %d unique search names from %d input points",
                      len(all_unique), len(point_names))
 
-        batch_records: List[BenchmarkRecord] = []
-        seen: set = set()
+        hits_by_search: Dict[str, List[BenchmarkRecord]] = {
+            sn: self._query_candidates(sn) for sn in all_unique
+        }
 
-        for search_name in all_unique:
-            for rec in self._query_candidates(search_name):
-                key = f"{rec.name}\x00{rec.x}\x00{rec.y}"
-                if key not in seen:
-                    seen.add(key)
-                    batch_records.append(rec)
-
-        # Map batch results back to input point names
         for pn in point_names:
-            search_names_for_pn = name_to_search_names[pn]
-            matches = []
-            for rec in batch_records:
-                # Check if this record's name matches any variant for this point
-                for sv in search_names_for_pn:
-                    if self._normalize_name(rec.name) == self._normalize_name(sv):
-                        matches.append(rec)
-                        break
+            seen: set = set()
+            matches: List[BenchmarkRecord] = []
+            for sv in name_to_search_names[pn]:
+                for rec in hits_by_search.get(sv, []):
+                    k = rec.key()
+                    if k not in seen:
+                        seen.add(k)
+                        matches.append(copy.copy(rec))
+
+            if include_twins:
+                for rec in list(matches):
+                    for tw in self.get_spatial_twins(rec):
+                        k = tw.key()
+                        if k not in seen:
+                            seen.add(k)
+                            matches.append(copy.copy(tw))
+                self._annotate_twins(matches)
+
             result[pn] = matches
 
         return result
+
+    def get_spatial_twins(self, rec: BenchmarkRecord,
+                          tol_m: float = TWIN_TOLERANCE_M) -> List[BenchmarkRecord]:
+        """Return other DB points lying within *tol_m* metres of *rec*.
+
+        Uses PostGIS ST_DWithin on geom_full (EPSG:2039 metres).  A distance
+        test is used rather than truncating coordinates to whole metres, which
+        would miss pairs straddling an integer boundary (e.g. .98 vs 1.02).
+        """
+        if rec.x is None or rec.y is None:
+            return []
+        ck = f"{rec.key()}\x00{tol_m}"
+        if ck in self._twin_cache:
+            return self._twin_cache[ck]
+
+        table = self._params.get("table", "")
+        if not table:
+            return []
+        sql = _SQL_TWINS.format(cols=_SQL_COLUMNS, table=table)
+        rows = self._fetch(sql, (float(rec.x), float(rec.y), float(tol_m)),
+                           what=f"twins of '{rec.name}'")
+        own = rec.key()
+        twins = [r for r in self._rows_to_records(rows) if r.key() != own]
+        if twins:
+            logger.info("Spatial twins of '%s' (< %.2f m): %s", rec.name, tol_m,
+                        ", ".join(f"{t.name} ({_dist(rec.x, rec.y, t.x, t.y):.2f} m)"
+                                  for t in twins if t.x is not None))
+        self._twin_cache[ck] = twins
+        return twins
+
+    @staticmethod
+    def _annotate_twins(records: List[BenchmarkRecord]) -> None:
+        """Tag records that share a < 1 m cluster with a differently named point."""
+        for cl in group_twins([r for r in records if r.x is not None and r.y is not None]):
+            if not cluster_has_distinct_names(cl):
+                continue
+            for r in cl:
+                others = [o for o in cl if o is not r and o.name != r.name]
+                if not others:
+                    continue
+                nearest = min(others, key=lambda o: _dist(r.x, r.y, o.x, o.y))
+                r.twin_of = nearest.name
+                r.twin_dist_m = _dist(r.x, r.y, nearest.x, nearest.y)
+
+    # ------------------------------------------------------------------ #
+    # Field anchor + "normal radius" scoring
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _cluster_center(cluster: List[BenchmarkRecord]) -> Tuple[float, float]:
+        return (sum(r.x for r in cluster) / len(cluster),
+                sum(r.y for r in cluster) / len(cluster))
+
+    def _unique_location(self, recs: List[BenchmarkRecord]) -> Optional[Tuple[float, float]]:
+        """Location of a point whose candidates all sit in ONE < 1 m cluster."""
+        spatial = [r for r in recs if r.x is not None and r.y is not None]
+        if not spatial:
+            return None
+        clusters = group_twins(spatial)
+        if len(clusters) != 1:
+            return None
+        return self._cluster_center(clusters[0])
+
+    def accept_record(self, point_name: str, rec: Optional[BenchmarkRecord]) -> None:
+        """Pin *rec* as the resolution of *point_name* for this session.
+
+        Writes the cache (so resolve_benchmark() never re-picks) and the
+        resolved-coords pool used for the anchor.  ``rec=None`` pins the point
+        as 'not in DB' so downstream code estimates it topologically.
+        """
+        key = point_name.strip().upper()
+        self._cache[key] = rec
+        if rec is not None and rec.x is not None and rec.y is not None:
+            self._resolved_coords[key] = (rec.x, rec.y)
+        else:
+            self._resolved_coords.pop(key, None)
+
+    def forget(self, point_name: str) -> None:
+        """Drop any unconfirmed auto-pick for *point_name* (cache + anchor pool)."""
+        key = point_name.strip().upper()
+        self._cache.pop(key, None)
+        norm = self._normalise_name(point_name)
+        # Layer seeding stores coords under the raw layer value (e.g. '250/A'
+        # for field id '250A') — drop every key that normalises to the same id.
+        for k in [k for k in self._resolved_coords if self._normalise_name(k) == norm]:
+            self._resolved_coords.pop(k, None)
+
+    def establish_anchor(self, batch: Dict[str, List[BenchmarkRecord]],
+                         extra_coords: Optional[List[Tuple[float, float]]] = None,
+                         include_resolved: bool = True,
+                         ) -> Optional[Tuple[float, float]]:
+        """Establish the field anchor (project area centre) from measurements.
+
+        Sources, merged then robust-centred with the Spatial Median + k=1 pipeline:
+          * points already resolved this session / seeded from the map layer;
+          * every measured point whose DB candidates collapse to ONE location.
+        Fallback when nothing is unambiguous: robust centre of all candidates.
+
+        The anchor is stored on the manager and used by score_candidates()
+        and _resolve_by_proximity().
+        """
+        coords: List[Tuple[float, float]] = (
+            list(self._resolved_coords.values()) if include_resolved else []
+        )
+        coords.extend(extra_coords or [])
+        for recs in batch.values():
+            loc = self._unique_location(recs)
+            if loc is not None:
+                coords.append(loc)
+
+        source = "unambiguous points"
+        if not coords:
+            coords = [(r.x, r.y) for recs in batch.values() for r in recs
+                      if r.x is not None and r.y is not None]
+            source = "all candidates (no unambiguous point)"
+
+        if not coords:
+            self._anchor = None
+            logger.warning("establish_anchor: no coordinates available - radius filter disabled")
+            return None
+
+        self._anchor = self._kmeans1_centroid(coords)
+        logger.info("Field anchor from %s (%d coords): E=%.1f N=%.1f, radius=%.1f km",
+                    source, len(coords), self._anchor[0], self._anchor[1],
+                    self._radius_m / 1000.0)
+        return self._anchor
+
+    def score_candidates(self, pid: str, recs: List[BenchmarkRecord],
+                         lines: list,
+                         batch: Optional[Dict[str, List[BenchmarkRecord]]] = None
+                         ) -> List[BenchmarkRecord]:
+        """Annotate and rank the candidates of *pid*.
+
+        Sets on every record:
+          dist_to_anchor_m - distance to the field anchor (None if no anchor)
+          in_radius        - dist <= normal working radius (None if no anchor)
+          topo_ok          - for every measured line pid<->partner whose partner
+                             location is known, the straight distance from the
+                             candidate to the partner is <= length*1.1 + 100 m.
+                             None when no line can be checked.
+
+        Returns the records sorted: topology-consistent first, then in-radius,
+        then nearest to the anchor.
+        """
+        batch = batch or {}
+        partners: List[Tuple[Tuple[float, float], float]] = []
+        for ln in lines or []:
+            s, e = getattr(ln, "start_point", None), getattr(ln, "end_point", None)
+            if s == pid and e and e != pid:
+                other = e
+            elif e == pid and s and s != pid:
+                other = s
+            else:
+                continue
+            length = getattr(ln, "total_distance", None)
+            if not length or length <= 0:
+                continue
+            loc = None
+            if other in batch:
+                # Partner is being resolved/edited too: only trust it when its
+                # candidates collapse to one location (never its current pick).
+                loc = self._unique_location(batch[other])
+            else:
+                cached = self._cache.get(other.strip().upper())
+                if cached is not None and cached.x is not None and cached.y is not None:
+                    loc = (cached.x, cached.y)
+            if loc is not None:
+                partners.append((loc, float(length)))
+
+        anchor = self._anchor
+        for r in recs:
+            if r.x is None or r.y is None:
+                r.dist_to_anchor_m = None
+                r.in_radius = None
+                r.topo_ok = None
+                continue
+            if anchor is not None:
+                r.dist_to_anchor_m = _dist(r.x, r.y, anchor[0], anchor[1])
+                r.in_radius = r.dist_to_anchor_m <= self._radius_m
+            else:
+                r.dist_to_anchor_m = None
+                r.in_radius = None
+            if partners:
+                r.topo_ok = all(
+                    _dist(r.x, r.y, px, py) <= length * TOPO_FACTOR + TOPO_SLACK_M
+                    for (px, py), length in partners
+                )
+            else:
+                r.topo_ok = None
+
+        def _rank(r: BenchmarkRecord):
+            return (
+                r.topo_ok is False,
+                r.in_radius is False,
+                r.x is None,
+                r.dist_to_anchor_m if r.dist_to_anchor_m is not None else float("inf"),
+            )
+
+        return sorted(recs, key=_rank)
+
+    @staticmethod
+    def pick_unambiguous(recs: List[BenchmarkRecord]) -> Optional[BenchmarkRecord]:
+        """Return the one acceptable candidate, or None if the user must choose.
+
+        Acceptable = has coordinates, not out of radius, not topology-inconsistent.
+        Exactly ONE < 1 m cluster may remain, and it must not mix different
+        names (a 250/A + 849/L twin always goes to the user) nor different
+        heights (duplicate rows of one monument).  Candidates without
+        coordinates also send the point to the user.
+        """
+        # Any candidate without coordinates cannot be ruled out spatially.
+        if any(r.x is None or r.y is None for r in recs):
+            return None
+        ok = [r for r in recs if r.in_radius is not False and r.topo_ok is not False]
+        if not ok:
+            return None
+        clusters = group_twins(ok)
+        if len(clusters) != 1 or cluster_needs_choice(clusters[0]):
+            return None
+        return clusters[0][0]
 
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _query_candidates(self, point_name: str) -> List[BenchmarkRecord]:
-        """Execute the multi-format SQL and return a list of BenchmarkRecord."""
-        table = self._params.get("table", "")
-        if not table:
-            return []
-
-        sql = _SQL_TEMPLATE.format(table=table)
-        params = (point_name,) * 6   # same value for all 6 %s placeholders
-
+    def _fetch(self, sql: str, params: tuple, what: str = "") -> list:
+        """Run *sql* and return all rows; [] on any error (logged)."""
         try:
             conn = self._get_connection()
             try:
                 with conn.cursor() as cur:
                     cur.execute(sql, params)
-                    rows = cur.fetchall()
+                    return cur.fetchall()
             finally:
                 conn.close()
         except Exception as exc:
-            logger.warning("DB query failed for '%s': %s", point_name, exc)
+            logger.warning("DB query failed for %s: %s", what, exc)
             return []
 
+    @staticmethod
+    def _rows_to_records(rows: list) -> List[BenchmarkRecord]:
         results = []
         for row in rows:
             (ot_nekuda, mispar_nekuda, name,
              gova_ort, shem_darga_gova, taarih_gova_ort,
              ot_nekuda_kfula, mispar_nekuda_kfula,
-             db_x, db_y, kfar_aher_name) = row
+             db_x, db_y, kfar_aher_name, objectid, hearot) = row
 
-            # ST_X(geom_full) → Easting  (EPSG:2039 X-axis, ITM)
-            # ST_Y(geom_full) → Northing (EPSG:2039 Y-axis, ITM)
-            # No column swap needed — PostGIS ST_X/ST_Y respect the CRS axes.
-            easting  = float(db_x) if db_x is not None else None
-            northing = float(db_y) if db_y is not None else None
-
+            # ST_X(geom_full) -> Easting, ST_Y(geom_full) -> Northing (EPSG:2039)
             results.append(BenchmarkRecord(
                 ot_nekuda=ot_nekuda or "",
                 mispar_nekuda=int(mispar_nekuda) if mispar_nekuda is not None else 0,
@@ -754,34 +1080,66 @@ class BenchmarkDBManager:
                 ot_nekuda_kfula=ot_nekuda_kfula,
                 mispar_nekuda_kfula=(int(mispar_nekuda_kfula)
                                      if mispar_nekuda_kfula is not None else None),
-                x=easting,
-                y=northing,
+                x=float(db_x) if db_x is not None else None,
+                y=float(db_y) if db_y is not None else None,
                 kfar_aher_name=kfar_aher_name or None,
+                objectid=int(objectid) if objectid is not None else None,
+                hearot=str(hearot) if hearot else None,
             ))
         return results
+
+    def _query_candidates(self, point_name: str) -> List[BenchmarkRecord]:
+        """Execute the multi-format SQL and return a list of BenchmarkRecord."""
+        table = self._params.get("table", "")
+        if not table:
+            return []
+        sql = _SQL_TEMPLATE.format(cols=_SQL_COLUMNS, table=table)
+        rows = self._fetch(sql, (point_name,) * 6, what=f"'{point_name}'")
+        return self._rows_to_records(rows)
 
     def _resolve_by_proximity(self, candidates: List[BenchmarkRecord],
                                key: str) -> Optional[BenchmarkRecord]:
         """
-        Select the candidate nearest to the K-Means project centroid.
+        Select the candidate nearest to the field anchor, restricted to the
+        normal working radius.  Candidates outside the radius are only used
+        (with a WARNING) when nothing lies inside it, so the call never
+        returns None for a non-empty candidate list.
         Updates _resolved_coords with the winner's (Easting, Northing).
         """
         spatial = [r for r in candidates if r.x is not None and r.y is not None]
         if not spatial:
             logger.warning(
-                "Ambiguous point '%s': none of %d candidates have coordinates — "
+                "Ambiguous point '%s': none of %d candidates have coordinates - "
                 "returning first", key, len(candidates)
             )
             return candidates[0]
 
-        cx, cy = self._get_project_centroid(fallback=spatial)
-        winner = min(spatial, key=lambda r: math.sqrt((r.x - cx) ** 2 + (r.y - cy) ** 2))
+        if self._anchor is not None:
+            cx, cy = self._anchor
+        else:
+            cx, cy = self._get_project_centroid(fallback=spatial)
 
-        if winner.x is not None and winner.y is not None:
-            self._resolved_coords[key] = (winner.x, winner.y)
+        def d(r):
+            return _dist(r.x, r.y, cx, cy)
 
+        inside = [r for r in spatial if d(r) <= self._radius_m]
+        if inside:
+            winner = min(inside, key=d)
+            dropped = len(spatial) - len(inside)
+            if dropped:
+                logger.info("'%s': %d candidate(s) outside %.1f km radius ignored",
+                            key, dropped, self._radius_m / 1000.0)
+        else:
+            winner = min(spatial, key=d)
+            logger.warning(
+                "'%s': no candidate within %.1f km of the field anchor - "
+                "nearest is '%s' at %.1f km. Verify this point in Point Settings.",
+                key, self._radius_m / 1000.0, winner.name, d(winner) / 1000.0,
+            )
+
+        self._resolved_coords[key] = (winner.x, winner.y)
         logger.debug(
-            "Proximity winner for '%s': name=%s E=%.1f N=%.1f (centroid E=%.1f N=%.1f)",
+            "Proximity winner for '%s': name=%s E=%.1f N=%.1f (anchor E=%.1f N=%.1f)",
             key, winner.name, winner.x, winner.y, cx, cy
         )
         return winner
@@ -975,6 +1333,7 @@ def get_db_manager() -> BenchmarkDBManager:
                     user=params.get("user", ""),
                     table=params.get("table", ""),
                     authcfg=params.get("authcfg", ""),
+                    search_radius_km=params.get("search_radius_km"),
                 )
         except Exception as exc:
             logger.warning("Could not auto-load DB params from settings: %s", exc)
