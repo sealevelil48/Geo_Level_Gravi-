@@ -544,6 +544,11 @@ class GeoLevelPlugin:
 
     def _process_files(self, file_paths, leveling_class=None, output_dir=None):
         """Core parse -> validate -> export pipeline. Appends new files, deduplicates."""
+        # One-shot: renames restored from a saved project (_load_project).
+        # Taken here so a map left by an aborted load never leaks into a
+        # later "Add Files".
+        load_remap = dict(getattr(self, "_pending_pid_remap", None) or {})
+        self._pending_pid_remap = {}
         leveling_class = leveling_class or self._last_class or "H3"
         output_dir     = output_dir or self._last_output_dir
 
@@ -583,6 +588,7 @@ class GeoLevelPlugin:
                 file_paths=new_paths,
                 leveling_class=leveling_class,
                 output_dir=output_dir,
+                name_overrides=load_remap or None,
             )
         except Exception as exc:
             progress.close()
@@ -596,6 +602,7 @@ class GeoLevelPlugin:
 
         # Append new lines to existing list
         new_lines = result["lines"]
+        self._rename_points_in_lines(new_lines, load_remap, setups_only=True)
         n_prev = len(self._lines)
         self._lines.extend(new_lines)
 
@@ -603,8 +610,9 @@ class GeoLevelPlugin:
         # spatial twins and out-of-radius picks before any layer or LSA runs.
         # (The dialog may shrink new_lines in place, so trim by n_prev.)
         self._pending_excluded = set()
-        if not self._check_point_resolution(new_lines):
+        if not self._check_point_resolution(new_lines, base_remap=load_remap):
             self._lines = self._lines[:n_prev]
+            self._pending_pid_remap = {}
             return
 
         # Re-run the full geodetic pipeline now that db_mgr._cache contains the
@@ -1003,6 +1011,12 @@ class GeoLevelPlugin:
         self._point_origin = {}
         self._gpkg_path = ""
         self._point_overrides = overrides
+        # Saved renames (e.g. '2599B' -> '2599/ב') must reach the FIRST
+        # process_geodetic_data pass too, independent of whether point
+        # resolution later runs (DB off / error would otherwise drop them).
+        self._pending_pid_remap = self._remap_from_overrides(overrides)
+        for old, new in self._pending_pid_remap.items():
+            self._point_origin[new] = old
         try:
             from geolevel_db_manager import get_db_manager
             get_db_manager().clear_session_cache()
@@ -1712,6 +1726,36 @@ class GeoLevelPlugin:
         return BenchmarkRecord(**kw)
 
     @staticmethod
+    def _remap_from_overrides(overrides) -> dict:
+        """Build {raw field ID: saved name} from saved Point Settings overrides.
+
+        Overrides are keyed by the raw (origin) field ID.  A new name comes from
+        ``{"mode": "rename", "name": ...}`` or from the verified DB record of
+        ``{"mode": "use_selected", "record": {...}}`` (e.g. '2599B' -> '2599/ב').
+        The .glp is untrusted input: anything malformed is skipped.
+        """
+        remap: dict = {}
+        if not isinstance(overrides, dict):
+            return remap
+        for origin, ov in overrides.items():
+            if not isinstance(origin, str) or not origin.strip() or not isinstance(ov, dict):
+                continue
+            mode = ov.get("mode")
+            if mode in ("exclude", "estimate", "pkt_average"):
+                continue
+            if mode == "rename":
+                new = ov.get("name")
+            else:
+                rec = ov.get("record")
+                new = rec.get("name") if isinstance(rec, dict) else None
+            if not isinstance(new, str):
+                continue
+            new = new.strip()
+            if new and new != origin:
+                remap[origin] = new
+        return remap
+
+    @staticmethod
     def _rename_points_in_lines(lines, remap: dict, setups_only: bool = False) -> int:
         """Rename points per *remap* {old: new} in ONE pass (chained remaps
         such as A→B, B→C are not applied twice).  Renames line endpoints
@@ -1840,7 +1884,7 @@ class GeoLevelPlugin:
         return {pid: db_mgr.score_candidates(pid, recs, lines, batch)
                 for pid, recs in batch.items()}
 
-    def _check_point_resolution(self, new_lines: list) -> bool:
+    def _check_point_resolution(self, new_lines: list, base_remap: dict = None) -> bool:
         """Verify ambiguous or unresolved field point IDs before loading.
 
         Pipeline:
@@ -1857,7 +1901,15 @@ class GeoLevelPlugin:
 
         Returns True when loading should proceed, False when the user cancelled.
         DB not configured → returns True immediately.
+
+        *base_remap* holds renames already applied to *new_lines* (saved
+        project overrides, raw ID -> saved name).  It is always carried into
+        ``self._pending_pid_remap`` — on every exit, including DB-off and
+        errors — so the post-resolution re-run keeps the saved names.
         """
+        base_remap = dict(base_remap or {})
+        self._pending_pid_remap = dict(base_remap)
+        pid_remap: dict = {}
         try:
             from geolevel_db_manager import get_db_manager
             db_mgr = get_db_manager()
@@ -1865,14 +1917,17 @@ class GeoLevelPlugin:
                 return True
 
             unique_pids = self._unique_points(new_lines)
-            pid_remap: dict = {}
             self._pending_unuse = set()
 
-            # 1. Re-apply saved overrides
+            # 1. Re-apply saved overrides.  Overrides are keyed by the raw
+            #    field ID; points renamed by base_remap are looked up by origin.
             pending = []
             for pid in unique_pids:
-                ov = self._point_overrides.get(pid)
-                if not ov:
+                origin = self._point_origin.get(pid, pid)
+                # Origin first: with chained/swapped renames (A->B, B->C) the
+                # override stored under the current name belongs to another point.
+                ov = self._point_overrides.get(origin) or self._point_overrides.get(pid)
+                if not isinstance(ov, dict) or not ov:
                     pending.append(pid)
                     continue
                 if ov.get("mode") in ("estimate", "pkt_average"):
@@ -1891,14 +1946,21 @@ class GeoLevelPlugin:
                 name = (rec.name or "").strip() or pid
                 db_mgr.accept_record(pid, rec)
                 db_mgr.accept_record(name, rec)
-                self._point_origin[name] = pid
+                if origin != pid:
+                    # Already renamed from the saved project: keep the raw ID
+                    # resolvable too, and never overwrite its true origin.
+                    db_mgr.accept_record(origin, rec)
+                else:
+                    self._point_origin[name] = pid
                 if name != pid:
                     pid_remap[pid] = name
+            # Only the NEW renames: base_remap is already applied to the lines
+            # (re-applying it could chain A->B->C).
             if pid_remap:
                 self._rename_points_in_lines(new_lines, pid_remap)
 
             if not pending:
-                self._pending_pid_remap = pid_remap
+                self._pending_pid_remap = {**base_remap, **pid_remap}
                 return True
 
             # The first parse pass already ran resolve_benchmark() and may have
@@ -2016,7 +2078,7 @@ class GeoLevelPlugin:
                 self._pending_excluded = set(applied["excluded"])
                 self._pending_marker_pids = applied["markers"]
 
-            self._pending_pid_remap = pid_remap
+            self._pending_pid_remap = {**base_remap, **pid_remap}
             return True
 
         except Exception:
@@ -2024,6 +2086,9 @@ class GeoLevelPlugin:
                 "Point resolution check failed: " + traceback.format_exc(),
                 "GeoLevel", level=Qgis.Warning,
             )
+            # Keep the saved names plus any rename already applied to the
+            # lines in step 1, so the re-run does not revert to raw IDs.
+            self._pending_pid_remap = {**base_remap, **pid_remap}
             return True  # non-fatal — fall through to normal load
 
     def _edit_points(self, pids=None):
