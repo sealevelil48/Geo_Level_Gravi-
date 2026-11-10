@@ -424,7 +424,29 @@ def write_project_gpkg(path, lines_layer, points_layer, lines, meta):
 
 
 def gpkg_layer(path, layer_name, display_name):
-    """Open one GeoPackage table as an OGR vector layer (None if absent)."""
+    """Open one GeoPackage table as an OGR vector layer (None if absent).
+
+    The default style stored in the GPKG (layer_styles table) is NOT loaded:
+    a project file received from someone else could embed layer actions or
+    form init code.  The plugin applies its own renderer and labels anyway.
+    """
     from qgis.core import QgsVectorLayer
-    lyr = QgsVectorLayer(f"{path}|layername={layer_name}", display_name, "ogr")
+    opts = QgsVectorLayer.LayerOptions()
+    opts.loadDefaultStyle = False
+    lyr = QgsVectorLayer(f"{path}|layername={layer_name}", display_name, "ogr", opts)
     return lyr if lyr.isValid() else None
+
+
+def is_network_path(p) -> bool:
+    """True for UNC / network paths (\\\\server\\share, //server, \\\\?\\UNC\\...).
+
+    Touching such a path from an untrusted project file can make Windows send
+    the user's NTLM credentials to a remote host, so callers refuse them.
+    """
+    if not p:
+        return False
+    s = str(p).strip()
+    if s.startswith(("\\\\", "//")):
+        return True
+    drive = os.path.splitdrive(s)[0]
+    return drive.startswith(("\\\\", "//"))

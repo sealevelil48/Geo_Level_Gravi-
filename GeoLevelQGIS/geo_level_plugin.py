@@ -952,6 +952,13 @@ class GeoLevelPlugin:
         cls        = data.get("class", "H3")
         output_dir = data.get("output_dir", "")
         glp_dir    = os.path.dirname(os.path.abspath(path))
+        # Paths inside the .glp are untrusted: never write to / read from a
+        # network (UNC) location named by the project file.
+        from geo_level_gpkg import is_network_path
+        if not isinstance(output_dir, str) or is_network_path(output_dir):
+            output_dir = ""
+        if not isinstance(files, list):
+            files = []
 
         overrides = data.get("point_overrides", {})
         overrides = dict(overrides) if isinstance(overrides, dict) else {}
