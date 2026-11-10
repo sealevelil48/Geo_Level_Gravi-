@@ -98,6 +98,8 @@ class BenchmarkRecord:
     dist_to_anchor_m: Optional[float] = None  # Distance to field anchor (m)
     in_radius: Optional[bool] = None      # Inside the normal working radius?
     topo_ok: Optional[bool] = None        # Consistent with measured line lengths?
+    topo_ratio: Optional[float] = None    # worst DB-distance / measured-length ratio
+    topo_ref: Optional[str] = None        # partner point giving that ratio
 
     def key(self) -> str:
         """Stable identity key for deduplication."""
@@ -172,6 +174,21 @@ def cluster_has_distinct_names(cluster: List["BenchmarkRecord"]) -> bool:
     """True when a twin cluster holds ≥2 differently named DB points."""
     names = {re.sub(r'[^A-Z0-9א-ת]', '', (r.name or '').upper()) for r in cluster}
     return len(names) > 1
+
+
+@dataclass
+class NetworkResolution:
+    """Result of BenchmarkDBManager.resolve_network()."""
+    known: Dict[str, Tuple[float, float]]      # pid -> (E, N) located points
+    chosen: Dict[str, "BenchmarkRecord"]       # pid -> auto/fixed record
+    status: Dict[str, str]                     # pid -> status keyword
+    notes: Dict[str, str]                      # pid -> human-readable reason
+    iterations: int = 0
+
+    AUTO = ("fixed", "anchor", "matched")
+
+    def unresolved(self, pids: List[str]) -> List[str]:
+        return [p for p in pids if self.status.get(p) not in self.AUTO + ("estimate",)]
 
 
 # ---------------------------------------------------------------------------
@@ -950,7 +967,8 @@ class BenchmarkDBManager:
 
     def score_candidates(self, pid: str, recs: List[BenchmarkRecord],
                          lines: list,
-                         batch: Optional[Dict[str, List[BenchmarkRecord]]] = None
+                         batch: Optional[Dict[str, List[BenchmarkRecord]]] = None,
+                         known: Optional[Dict[str, Tuple[float, float]]] = None,
                          ) -> List[BenchmarkRecord]:
         """Annotate and rank the candidates of *pid*.
 
@@ -966,7 +984,7 @@ class BenchmarkDBManager:
         then nearest to the anchor.
         """
         batch = batch or {}
-        partners: List[Tuple[Tuple[float, float], float]] = []
+        partners: List[Tuple[Tuple[float, float], float, str]] = []
         for ln in lines or []:
             s, e = getattr(ln, "start_point", None), getattr(ln, "end_point", None)
             if s == pid and e and e != pid:
@@ -979,7 +997,10 @@ class BenchmarkDBManager:
             if not length or length <= 0:
                 continue
             loc = None
-            if other in batch:
+            if known is not None:
+                # Network resolution already decided which partners are known.
+                loc = known.get(other)
+            elif other in batch:
                 # Partner is being resolved/edited too: only trust it when its
                 # candidates collapse to one location (never its current pick).
                 loc = self._unique_location(batch[other])
@@ -988,7 +1009,7 @@ class BenchmarkDBManager:
                 if cached is not None and cached.x is not None and cached.y is not None:
                     loc = (cached.x, cached.y)
             if loc is not None:
-                partners.append((loc, float(length)))
+                partners.append((loc, float(length), other))
 
         anchor = self._anchor
         for r in recs:
@@ -996,6 +1017,8 @@ class BenchmarkDBManager:
                 r.dist_to_anchor_m = None
                 r.in_radius = None
                 r.topo_ok = None
+                r.topo_ratio = None
+                r.topo_ref = None
                 continue
             if anchor is not None:
                 r.dist_to_anchor_m = _dist(r.x, r.y, anchor[0], anchor[1])
@@ -1006,10 +1029,17 @@ class BenchmarkDBManager:
             if partners:
                 r.topo_ok = all(
                     _dist(r.x, r.y, px, py) <= length * TOPO_FACTOR + TOPO_SLACK_M
-                    for (px, py), length in partners
+                    for (px, py), length, _n in partners
                 )
+                ratio, ref = max(
+                    ((_dist(r.x, r.y, px, py) / length, n) for (px, py), length, n in partners),
+                    key=lambda t: t[0],
+                )
+                r.topo_ratio, r.topo_ref = ratio, ref
             else:
                 r.topo_ok = None
+                r.topo_ratio = None
+                r.topo_ref = None
 
         def _rank(r: BenchmarkRecord):
             return (
@@ -1020,6 +1050,230 @@ class BenchmarkDBManager:
             )
 
         return sorted(recs, key=_rank)
+
+    # ------------------------------------------------------------------ #
+    # Network resolution — match DB distances against measured distances
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def build_edges(lines: list, exclude=()) -> Dict[str, Dict[str, float]]:
+        """Measured connections between line endpoints: pid -> {neighbour: length_m}.
+
+        The leveled length of a line is never shorter than the straight
+        distance between its endpoints, so it bounds where the neighbour can
+        be.  When several lines join the same pair the shortest length (the
+        tightest bound) is kept.
+        """
+        edges: Dict[str, Dict[str, float]] = {}
+        for ln in lines or []:
+            s, e = getattr(ln, "start_point", None), getattr(ln, "end_point", None)
+            length = getattr(ln, "total_distance", None)
+            if not s or not e or s == e or not length or length <= 0:
+                continue
+            if s in exclude or e in exclude:
+                continue
+            for a, b in ((s, e), (e, s)):
+                nb = edges.setdefault(a, {})
+                nb[b] = min(nb.get(b, float("inf")), float(length))
+        return edges
+
+    @staticmethod
+    def _fits(loc: Tuple[float, float],
+              constraints: List[Tuple[Tuple[float, float], float, str]]) -> bool:
+        return all(_dist(loc[0], loc[1], p[0], p[1]) <= L * TOPO_FACTOR + TOPO_SLACK_M
+                   for p, L, _n in constraints)
+
+    def resolve_network(self, pids: List[str], lines: list,
+                        batch: Dict[str, List[BenchmarkRecord]],
+                        fixed: Optional[Dict[str, Optional[BenchmarkRecord]]] = None,
+                        exclude=()) -> "NetworkResolution":
+        """Resolve duplicated names by matching DB distances to measured distances.
+
+        1. Known locations: user/saved choices (*fixed*), already-loaded points
+           in the session cache, and **anchors**: points whose DB candidates
+           collapse to one location (no duplicate elsewhere).
+        2. Anchors are cross-checked against each other through the measured
+           lines; an anchor that contradicts its measured neighbours is dropped
+           (status 'conflict').  A lone anchor with no verifying line that lies
+           outside the normal radius of the others is demoted ('unverified').
+        3. Propagation, repeated until no more progress: for every open point
+           linked by a measured line to a known point, keep the candidate
+           locations whose straight distance to every known neighbour is
+           <= leveled length x 1.1 + 100 m.  Exactly one surviving location ->
+           matched, and it becomes a known point for the next ones.
+
+        Statuses: fixed, estimate, anchor, matched, identity (location known but
+        twin/duplicate records need a human choice), ambiguous, conflict,
+        no_link (no measured line to a known point yet), not_in_db, no_coords,
+        unverified.
+        """
+        fixed = fixed or {}
+        exclude = set(exclude or ())
+        edges = self.build_edges(lines, exclude)
+        known: Dict[str, Tuple[float, float]] = {}
+        chosen: Dict[str, BenchmarkRecord] = {}
+        status: Dict[str, str] = {}
+        notes: Dict[str, str] = {}
+        cands: Dict[str, List[BenchmarkRecord]] = {}
+
+        for pid, rec in fixed.items():
+            if rec is not None and rec.x is not None and rec.y is not None:
+                known[pid] = (rec.x, rec.y)
+                chosen[pid] = rec
+                status[pid] = "fixed"
+            else:
+                status[pid] = "estimate"
+
+        # Points loaded from earlier files (not part of this resolution)
+        pid_set = set(pids)
+        for nb in edges:
+            if nb in pid_set or nb in fixed:
+                continue
+            rec = self._cache.get(nb.strip().upper())
+            if rec is not None and rec.x is not None and rec.y is not None:
+                known[nb] = (rec.x, rec.y)
+
+        def _clusters(pid):
+            return group_twins([r for r in cands[pid]])
+
+        seeds: Dict[str, Tuple[float, float]] = {}
+        for pid in pids:
+            if pid in status or pid in exclude:
+                continue
+            recs = list(batch.get(pid, []))
+            if not recs:
+                status[pid] = "not_in_db"
+                notes[pid] = "Not found in the DB - enter the point name, or keep PKT estimation"
+                continue
+            spatial = [r for r in recs if r.x is not None and r.y is not None]
+            cands[pid] = spatial
+            if not spatial:
+                status[pid] = "no_coords"
+                notes[pid] = "DB candidates have no coordinates - choose manually"
+                continue
+            if len(spatial) == len(recs):
+                loc = self._unique_location(spatial)
+                if loc is not None:
+                    seeds[pid] = loc
+
+        # --- cross-check anchors against each other and known points -------
+        while True:
+            drop = []
+            for p, loc in seeds.items():
+                good = bad = 0
+                bad_nb = []
+                for nb, L in edges.get(p, {}).items():
+                    other = seeds.get(nb) or known.get(nb)
+                    if other is None:
+                        continue
+                    if _dist(loc[0], loc[1], other[0], other[1]) <= L * TOPO_FACTOR + TOPO_SLACK_M:
+                        good += 1
+                    else:
+                        bad += 1
+                        bad_nb.append(nb)
+                if bad and bad >= good:
+                    drop.append((p, bad_nb))
+            if not drop:
+                break
+            for p, bad_nb in drop:
+                seeds.pop(p, None)
+                status[p] = "conflict"
+                notes[p] = ("The only DB location contradicts the measured distance to "
+                            + ", ".join(bad_nb) + " - wrong namesake or point missing in DB")
+
+        if len(seeds) > 1:
+            # Group anchors by area (single linkage within the normal radius)
+            groups: List[List[str]] = []
+            for p in seeds:
+                home = None
+                for g in groups:
+                    if any(_dist(*seeds[p], *seeds[q]) <= self._radius_m for q in g):
+                        if home is None:
+                            home = g
+                            g.append(p)
+                        else:
+                            home.extend(g)
+                            g.clear()
+                groups = [g for g in groups if g]
+                if home is None:
+                    groups.append([p])
+
+            def _support(g):
+                cx = sum(seeds[q][0] for q in g) / len(g)
+                cy = sum(seeds[q][1] for q in g) / len(g)
+                near = sum(1 for pid, rs in cands.items()
+                           if any(_dist(r.x, r.y, cx, cy) <= self._radius_m for r in rs))
+                return (near, len(g)), (cx, cy)
+
+            ranked = sorted(groups, key=lambda g: _support(g)[0], reverse=True)
+            main = ranked[0]
+            main_c = _support(main)[1]
+            for g in ranked[1:]:
+                for p in g:
+                    loc = seeds.pop(p)
+                    status[p] = "unverified"
+                    notes[p] = ("Only one DB location, but it is %.1f km from the project "
+                                "area - must be confirmed by a measured line"
+                                % (_dist(loc[0], loc[1], main_c[0], main_c[1]) / 1000.0))
+
+        for p, loc in seeds.items():
+            known[p] = loc
+            cl = _clusters(p)[0]
+            if cluster_needs_choice(cl):
+                status[p] = "identity"
+                notes[p] = "Twin DB points at the same location - choose which name/height"
+            else:
+                chosen[p] = cl[0]
+                status[p] = "anchor"
+                notes[p] = "Anchor: unique DB location"
+
+        # --- propagate along measured lines --------------------------------
+        open_pids = [p for p in pids if p in cands and p not in known
+                     and status.get(p) not in ("conflict",)]
+        iterations = 0
+        while open_pids:
+            iterations += 1
+            progress = False
+            for pid in list(open_pids):
+                cons = [(known[nb], L, nb) for nb, L in edges.get(pid, {}).items()
+                        if nb in known]
+                if not cons:
+                    if status.get(pid) != "unverified":
+                        status[pid] = "no_link"
+                        notes[pid] = "No measured line to a known point yet"
+                    continue
+                fit = [cl for cl in _clusters(pid) if self._fits(self._cluster_center(cl), cons)]
+                via = ", ".join(sorted({n for _p, _L, n in cons}))
+                if len(fit) == 1:
+                    known[pid] = self._cluster_center(fit[0])
+                    open_pids.remove(pid)
+                    progress = True
+                    has_coordless = len(cands[pid]) != len(batch.get(pid, []))
+                    if cluster_needs_choice(fit[0]) or has_coordless:
+                        status[pid] = "identity"
+                        notes[pid] = ("Located by measured distances to %s; twin/duplicate "
+                                      "records there - choose which one" % via)
+                    else:
+                        chosen[pid] = fit[0][0]
+                        status[pid] = "matched"
+                        notes[pid] = "Matched by measured distances to " + via
+                elif not fit:
+                    status[pid] = "conflict"
+                    notes[pid] = ("No DB candidate fits the measured distance to " + via
+                                  + " - point may be missing from the DB")
+                else:
+                    status[pid] = "ambiguous"
+                    notes[pid] = ("%d DB locations fit the measured distances to %s"
+                                  % (len(fit), via))
+            if not progress or iterations > len(pids) + 1:
+                break
+
+        n_auto = sum(1 for p in pids if status.get(p) in ("anchor", "matched"))
+        logger.info("Network resolution: %d/%d points resolved automatically in %d "
+                    "iteration(s); statuses=%s", n_auto, len(pids), iterations,
+                    {p: status.get(p) for p in pids})
+        return NetworkResolution(known=known, chosen=chosen, status=status,
+                                 notes=notes, iterations=iterations)
 
     @staticmethod
     def pick_unambiguous(recs: List[BenchmarkRecord]) -> Optional[BenchmarkRecord]:

@@ -172,6 +172,72 @@ db4.forget("250A")
 check("250/A" not in db4._resolved_coords and "250A" not in db4._cache,
       "forget('250A') also removes seeded '250/A' coordinate (no anchor bias)")
 
+# ---------------------------------------------------------------- 11. network matching (boss's drawing)
+# Chain 1 -A- 2 -B- 3 -C- 4 -D- 5, lines ~1 km.  Point 1 has a single DB
+# location (anchor); 2..4 each have a true location plus a namesake in
+# another city ~40 km away; 5 is a PKT (not in DB).
+def R(name, x, y, oid, h=0.0):
+    return BenchmarkRecord("A", 1, name, h, None, None, None, None, x, y, objectid=oid)
+
+
+TRUE = {"P1": (200000, 700000), "P2": (200800, 700500), "P3": (201600, 700100),
+        "P4": (202400, 700600)}
+FAR = (40000, -15000)
+net_batch = {
+    "P1": [R("1/A", *TRUE["P1"], 1)],
+    "P2": [R("2/A", *TRUE["P2"], 2), R("2/A", TRUE["P2"][0] + FAR[0], TRUE["P2"][1] + FAR[1], 12)],
+    "P3": [R("3/A", TRUE["P3"][0] + FAR[0], TRUE["P3"][1] + FAR[1], 13), R("3/A", *TRUE["P3"], 3)],
+    "P4": [R("4/A", *TRUE["P4"], 4), R("4/A", TRUE["P4"][0] - FAR[0], TRUE["P4"][1], 14)],
+    "PKT5": [],
+}
+
+
+def L(s, e, d):
+    return line(s, e, d)
+
+
+chain = [L("P1", "P2", 1000.0), L("P2", "P3", 950.0), L("P3", "P4", 1000.0), L("P4", "PKT5", 600.0)]
+pids = list(net_batch)
+dbn = FakeDB()
+net = dbn.resolve_network(pids, chain, net_batch)
+check(net.status["P1"] == "anchor", f"P1 is the anchor ({net.status['P1']})")
+check(all(net.status[p] == "matched" for p in ("P2", "P3", "P4")),
+      f"P2..P4 matched one by one along the chain ({[net.status[p] for p in ('P2','P3','P4')]})")
+check(all(net.chosen[p].objectid == int(p[1]) for p in ("P2", "P3", "P4")),
+      "the correct namesake chosen for every duplicated point")
+check(net.status["PKT5"] == "not_in_db", "PKT5 flagged as not in DB (user is asked / PKT estimate)")
+netr = FakeDB().resolve_network(list(reversed(pids)), chain, net_batch)
+check(netr.iterations >= 3 and all(netr.status[p] == "matched" for p in ("P2", "P3", "P4")),
+      f"recursive propagation converges regardless of order ({netr.iterations} iterations)")
+
+# Outlier 1: everything duplicated -> no anchor -> all go to the user
+nb2 = dict(net_batch)
+nb2["P1"] = [R("1/A", *TRUE["P1"], 1), R("1/A", TRUE["P1"][0] + FAR[0], TRUE["P1"][1] + FAR[1], 11)]
+net2 = FakeDB().resolve_network(pids, chain, nb2)
+check(not any(s in ("anchor", "matched") for s in net2.status.values()),
+      "everything duplicated -> no automatic anchor")
+check(set(net2.unresolved(pids)) == set(pids), "all points go to the dialog")
+# ... user picks P1 -> matching continues from it
+net3 = FakeDB().resolve_network(pids, chain, nb2, fixed={"P1": nb2["P1"][0]})
+check(all(net3.status[p] == "matched" for p in ("P2", "P3", "P4")),
+      "after the user picks one anchor, the rest are matched automatically")
+
+# Conflict: the only DB location of P3 is the far namesake (true point not in DB)
+nb4 = dict(net_batch)
+nb4["P3"] = [R("3/A", TRUE["P3"][0] + FAR[0], TRUE["P3"][1] + FAR[1], 13)]
+net4 = FakeDB().resolve_network(pids, chain, nb4)
+check(net4.status["P3"] == "conflict", f"wrong-only namesake flagged as conflict ({net4.status['P3']})")
+check(net4.status["P4"] in ("ambiguous", "no_link", "conflict"),
+      f"P4 cannot be matched through the bad P3 ({net4.status['P4']})")
+
+# Twins found by distance still need a human choice
+nb5 = dict(net_batch)
+nb5["P2"] = net_batch["P2"] + [R("9/Z", TRUE["P2"][0] + 0.3, TRUE["P2"][1], 99, h=1.1)]
+net5 = FakeDB().resolve_network(pids, chain, nb5)
+check(net5.status["P2"] == "identity" and "P2" in net5.known,
+      "twin at the matched location -> located, but user chooses the name")
+check(net5.status["P3"] == "matched", "matching continues past the twin point")
+
 print()
 print("ALL PASSED" if not check.failed else f"{check.failed} FAILED")
 sys.exit(1 if check.failed else 0)

@@ -1022,8 +1022,16 @@ class GeoLevelPlugin:
 
     @staticmethod
     def _resolve_measurement_file(fp: str, search_dirs) -> str:
-        """Return an existing path for *fp* or "" (absolute -> basename -> stem.*)."""
-        if fp and os.path.isfile(fp):
+        """Return an existing path for *fp* or "" (absolute -> basename -> stem.*).
+
+        Network (UNC) paths from the project file are never touched.
+        """
+        from geo_level_gpkg import is_network_path
+        if not isinstance(fp, str):
+            return ""
+        search_dirs = [d for d in search_dirs
+                       if isinstance(d, str) and d and not is_network_path(d)]
+        if fp and not is_network_path(fp) and os.path.isfile(fp):
             return fp
         base = os.path.basename(fp or "")
         stem = os.path.splitext(base)[0]
@@ -1045,15 +1053,27 @@ class GeoLevelPlugin:
 
     @staticmethod
     def _resolve_gpkg_ref(ref, glp_dir: str, output_dir: str) -> str:
-        if not ref:
+        """Resolve the .glp 'gpkg' entry to a local .gpkg file, or "".
+
+        Paths from the project file are untrusted: network (UNC) paths are
+        refused before any filesystem access (NTLM credential leak), and only
+        files with a .gpkg extension are accepted.
+        """
+        from geo_level_gpkg import is_network_path
+        if not ref or not isinstance(ref, str) or is_network_path(ref):
             return ""
         cands = [ref if os.path.isabs(ref) else os.path.join(glp_dir, ref),
                  os.path.join(glp_dir, os.path.basename(ref))]
-        if output_dir:
+        if output_dir and isinstance(output_dir, str) and not is_network_path(output_dir):
             cands.append(os.path.join(output_dir, os.path.basename(ref)))
         for c in cands:
+            c = os.path.normpath(c)
+            if is_network_path(c) or os.path.splitext(c)[1].lower() != ".gpkg":
+                continue
             if os.path.isfile(c):
-                return os.path.normpath(c)
+                real = os.path.realpath(c)
+                if not is_network_path(real):
+                    return real
         return ""
 
     def _gpkg_meta(self) -> dict:
@@ -1819,10 +1839,14 @@ class GeoLevelPlugin:
         Pipeline:
           1. Saved choices (from Point Settings / .glp) are applied first.
           2. Batch-fetch candidates for the rest, including < 1 m spatial twins.
-          3. Establish the field anchor from unambiguous measured points and
-             score every candidate (normal radius + measured line lengths).
-          4. Auto-approve only a single in-radius, length-consistent location
-             without differently named twins; everything else → dialog.
+          3. Network matching (BenchmarkDBManager.resolve_network): anchors are
+             points with ONE DB location; from them, duplicated names are
+             matched one by one by comparing DB distances with the distances
+             measured in the files, until nothing more can be matched.
+          4. Points still open (no anchor at all, ambiguous, not in DB,
+             conflicting, twins) → dialog.  The engineer may confirm only some
+             points and "Decide later" for the rest; matching then re-runs from
+             those choices (repeated rounds) until every point is decided.
 
         Returns True when loading should proceed, False when the user cancelled.
         DB not configured → returns True immediately.
@@ -1876,36 +1900,111 @@ class GeoLevelPlugin:
             for pid in pending:
                 db_mgr.forget(pid)
 
-            # 2-3. Candidates, anchor, scoring
+            # 2. Candidates (incl. < 1 m twins)
             batch = db_mgr.get_candidates_batch(pending)
-            db_mgr.establish_anchor(batch)
-            scored = self._score_batch(db_mgr, batch, new_lines)
-
-            needs_dialog: list = []
             for pid in pending:
                 self._point_origin.setdefault(pid, pid)
-                pick = db_mgr.pick_unambiguous(scored[pid])
-                if pick is not None:
-                    db_mgr.accept_record(pid, pick)
-                    continue
-                needs_dialog.append(pid)
 
-            QgsMessageLog.logMessage(
-                f"Point resolution: {len(pending) - len(needs_dialog)} auto-approved, "
-                f"{len(needs_dialog)} need confirmation: {needs_dialog or 'none'}",
-                "GeoLevel", level=Qgis.Info,
-            )
+            # 3-4. Network matching + dialog rounds
+            fixed: dict = {}          # pid -> BenchmarkRecord | None (estimate)
+            excluded_now: set = set()
+            merged = {"records": {}, "modes": {}, "manual": {}}
+            allow_defer = True
+            round_no = 0
+            auto_total = 0
+            from geo_level_point_resolution_dialog import GeoLevelPointResolutionDialog
 
-            if needs_dialog:
-                from geo_level_point_resolution_dialog import GeoLevelPointResolutionDialog
+            while True:
+                round_no += 1
+                net = db_mgr.resolve_network(pending, new_lines, batch,
+                                             fixed=fixed, exclude=excluded_now)
+                for pid in pending:
+                    if pid in fixed or pid in excluded_now:
+                        continue
+                    if net.status.get(pid) in ("anchor", "matched"):
+                        fixed[pid] = net.chosen[pid]
+                        db_mgr.accept_record(pid, net.chosen[pid])
+                        auto_total += 1
+
+                open_pids = [p for p in pending
+                             if p not in fixed and p not in excluded_now]
+                QgsMessageLog.logMessage(
+                    f"Point matching round {round_no}: {auto_total} matched automatically "
+                    f"by DB/field distances, {len(open_pids)} open: {open_pids or 'none'} "
+                    f"(network iterations: {net.iterations})",
+                    "GeoLevel", level=Qgis.Info,
+                )
+                if not open_pids:
+                    break
+
+                # Rank candidates against the located points for display
+                if net.known:
+                    db_mgr.establish_anchor({}, extra_coords=list(net.known.values()),
+                                            include_resolved=False)
+                else:
+                    db_mgr.establish_anchor(batch)
+                scored = {p: db_mgr.score_candidates(p, batch.get(p, []), new_lines,
+                                                     batch, known=net.known)
+                          for p in open_pids}
+                notes = {p: net.notes.get(p, "") for p in open_pids}
+                if not any(net.status.get(p) in ("anchor", "matched", "fixed")
+                           for p in pending) and round_no == 1:
+                    for p in open_pids:
+                        notes[p] = ("No anchor found (every point is duplicated) - "
+                                    "choose one or more points you are sure of. "
+                                    + notes[p]).strip()
+
                 dlg = GeoLevelPointResolutionDialog(
-                    needs_dialog, {p: scored[p] for p in needs_dialog},
-                    parent=self.iface.mainWindow(), mode="load",
+                    open_pids, scored, parent=self.iface.mainWindow(), mode="load",
+                    notes=notes, statuses={p: net.status.get(p, "") for p in open_pids},
+                    allow_defer=allow_defer, round_no=round_no,
                 )
                 if not dlg.exec_():
                     return False
-                applied = self._apply_resolution(db_mgr, dlg.get_resolved(),
-                                                 new_lines, edit_mode=False)
+                res = dlg.get_resolved()
+
+                progress = False
+                for pid in open_pids:
+                    mode = res["modes"].get(pid, "use_selected")
+                    rec = res["records"].get(pid)
+                    if mode == "defer":
+                        continue
+                    progress = True
+                    merged["modes"][pid] = mode
+                    merged["records"][pid] = rec
+                    if mode == "exclude":
+                        excluded_now.add(pid)
+                        continue
+                    if mode in ("estimate", "pkt_average"):
+                        fixed[pid] = None
+                        continue
+                    if pid in res.get("manual", {}):
+                        full = self._resolve_manual_name(db_mgr, pid, res["manual"][pid],
+                                                         new_lines)
+                        if full is not None:
+                            merged["records"][pid] = full
+                            fixed[pid] = full
+                        else:
+                            merged["manual"][pid] = res["manual"][pid]
+                            fixed[pid] = None
+                        continue
+                    if rec is None:
+                        # "(no DB match)" kept -> estimate from neighbours
+                        merged["modes"][pid] = "estimate"
+                        fixed[pid] = None
+                        continue
+                    fixed[pid] = rec
+                    db_mgr.accept_record(pid, rec)
+
+                # Everything deferred and nothing new -> next round must decide
+                allow_defer = progress
+                if round_no > len(pending) + 2:
+                    QgsMessageLog.logMessage("Point matching: round limit reached",
+                                             "GeoLevel", level=Qgis.Warning)
+                    break
+
+            if merged["modes"]:
+                applied = self._apply_resolution(db_mgr, merged, new_lines, edit_mode=False)
                 pid_remap.update(applied["remap"])
                 self._pending_excluded = set(applied["excluded"])
                 self._pending_marker_pids = applied["markers"]

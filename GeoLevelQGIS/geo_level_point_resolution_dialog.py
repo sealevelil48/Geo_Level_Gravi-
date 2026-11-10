@@ -71,6 +71,11 @@ class GeoLevelPointResolutionDialog(QDialog):
         current_selection: Field ID -> currently used BenchmarkRecord (edit mode).
         current_modes: Field ID -> current handling mode (edit mode), e.g.
             "estimate" for a point pinned as not-in-DB.
+        notes / statuses: Field ID -> reason text / network status keyword
+            from BenchmarkDBManager.resolve_network (shown in a Reason column).
+        allow_defer: offer "Decide later (match by distance)" so the user can
+            confirm only some anchors and let distance matching do the rest.
+        round_no: matching round shown in the title (load mode).
         search_fn: Callable(pid, query) -> list of scored BenchmarkRecord used
             by the per-row "Search DB" box (edit mode).
     """
@@ -84,6 +89,10 @@ class GeoLevelPointResolutionDialog(QDialog):
         current_selection: Optional[Dict[str, object]] = None,
         search_fn: Optional[Callable[[str, str], list]] = None,
         current_modes: Optional[Dict[str, str]] = None,
+        notes: Optional[Dict[str, str]] = None,
+        statuses: Optional[Dict[str, str]] = None,
+        allow_defer: bool = False,
+        round_no: int = 0,
     ) -> None:
         super().__init__(parent)
         self._mode = mode if mode in ("load", "edit") else "load"
@@ -91,6 +100,10 @@ class GeoLevelPointResolutionDialog(QDialog):
         self._candidate_map = {pid: list(candidate_map.get(pid, [])) for pid in target_points}
         self._current = current_selection or {}
         self._current_modes = current_modes or {}
+        self._notes = notes or {}
+        self._statuses = statuses or {}
+        self._allow_defer = allow_defer and mode != "edit"
+        self._round_no = round_no
         self._dirty: set = set()                          # rows the user touched
         self._search_fn = search_fn
         self._combos: Dict[str, QComboBox] = {}          # field ID -> DB candidate dropdown
@@ -102,7 +115,10 @@ class GeoLevelPointResolutionDialog(QDialog):
         if self._mode == "edit":
             self.setWindowTitle("Point Settings / הגדרות נקודה")
         else:
-            self.setWindowTitle("Point Verification / אימות נקודות")
+            title = "Point Verification / אימות נקודות"
+            if self._round_no > 1:
+                title += f"  —  matching round {self._round_no}"
+            self.setWindowTitle(title)
         self.setMinimumSize(1150, 500)
         self._setup_ui()
         self._populate()
@@ -137,6 +153,10 @@ class GeoLevelPointResolutionDialog(QDialog):
                 "<span style='background:#fff3cd'>&nbsp;Amber rows&nbsp;</span> hold "
                 "twin points (same location, different name / height) — you must "
                 "choose one explicitly.<br>"
+                "Points are matched automatically by comparing DB distances with the "
+                "distances measured in the files. If nothing could be anchored, pick "
+                "<b>one or more</b> points you are sure of and set the others to "
+                "<i>Decide later</i> — matching then continues from your choice.<br>"
                 "<i>No layers will be built and no calculations will run until you "
                 "confirm these points.</i>"
             )
@@ -146,6 +166,8 @@ class GeoLevelPointResolutionDialog(QDialog):
 
         self._columns = ["Field Point ID",
                          "DB Candidate  (Name | E | N | Height | Class | Locality | Distance)"]
+        if self._notes:
+            self._columns.append("Reason")
         if self._mode == "edit":
             self._columns.append("Search DB")
         self._columns += ["Manual Name Override", "Handling Option"]
@@ -192,6 +214,14 @@ class GeoLevelPointResolutionDialog(QDialog):
             self._fill_combo(pid)
             combo.currentIndexChanged.connect(lambda _i, p=pid: self._dirty.add(p))
 
+            if "Reason" in self._columns:
+                note = QTableWidgetItem(self._notes.get(pid, ""))
+                note.setFlags(Qt.ItemIsEnabled)
+                note.setToolTip(self._notes.get(pid, ""))
+                if self._statuses.get(pid) in ("not_in_db", "conflict"):
+                    note.setForeground(QBrush(QColor("#c62828")))
+                self._table.setItem(row, self._col("Reason"), note)
+
             if self._mode == "edit":
                 search = QLineEdit()
                 search.setPlaceholderText("name + Enter…")
@@ -210,6 +240,12 @@ class GeoLevelPointResolutionDialog(QDialog):
             handling_combo.addItem("Exclude from Project", "exclude")
             handling_combo.addItem("Point Not Found (Estimate)", "estimate")
             handling_combo.addItem("PKT (Average Neighbors)", "pkt_average")
+            if self._allow_defer:
+                handling_combo.addItem("Decide later (match by distance)", "defer")
+                if self._statuses.get(pid) in ("ambiguous", "no_link"):
+                    handling_combo.setCurrentIndex(handling_combo.count() - 1)
+            if self._statuses.get(pid) == "not_in_db" and not self._current_modes.get(pid):
+                handling_combo.setCurrentIndex(handling_combo.findData("estimate"))
             cur_mode = self._current_modes.get(pid)
             if cur_mode:
                 i = handling_combo.findData(cur_mode)
@@ -417,6 +453,7 @@ class GeoLevelPointResolutionDialog(QDialog):
           'exclude' — skip this point from the project
           'estimate' — point not found; ask engine to estimate from neighbors
           'pkt_average' — PKT point; use average of all neighbor positions
+          'defer' — not decided; continue distance matching from other choices
         """
         from geolevel_db_manager import BenchmarkRecord  # local import — avoids circular dep
 
@@ -428,7 +465,7 @@ class GeoLevelPointResolutionDialog(QDialog):
             mode = self._handling[pid].currentData()
             modes[pid] = mode
 
-            if mode == "exclude":
+            if mode in ("exclude", "defer"):
                 records[pid] = None
                 continue
 
