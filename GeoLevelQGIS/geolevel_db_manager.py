@@ -96,7 +96,6 @@ class BenchmarkRecord:
     twin_of: Optional[str] = None         # Name of the record this one is a spatial twin of
     twin_dist_m: Optional[float] = None   # Distance (m) to that twin
     dist_to_anchor_m: Optional[float] = None  # Distance to field anchor (m)
-    in_radius: Optional[bool] = None      # Inside the normal working radius?
     topo_ok: Optional[bool] = None        # Consistent with measured line lengths?
     topo_ratio: Optional[float] = None    # worst DB-distance / measured-length ratio
     topo_ref: Optional[str] = None        # partner point giving that ratio
@@ -110,8 +109,6 @@ class BenchmarkRecord:
         return f"{self.name}\x00{xs}\x00{ys}"
 
 
-# Default "normal working radius" around the field anchor (metres)
-DEFAULT_SEARCH_RADIUS_M = 15000.0
 # Two DB points closer than this are considered the same physical monument
 TWIN_TOLERANCE_M = 1.0
 # Topology bound: straight distance between line endpoints must not exceed
@@ -289,8 +286,6 @@ class BenchmarkDBManager:
         self._all_dat_point_names: List[str] = []
         # Cached result of _build_global_pool_centroid (built at most once per session)
         self._global_pool_centroid: Optional[Tuple[float, float]] = None
-        # "Normal working radius" around the field anchor (metres)
-        self._radius_m: float = DEFAULT_SEARCH_RADIUS_M
         # Field anchor established from unambiguous measured points
         self._anchor: Optional[Tuple[float, float]] = None
         # Cache of spatial-twin lookups keyed by record key
@@ -301,8 +296,7 @@ class BenchmarkDBManager:
     # ------------------------------------------------------------------ #
 
     def configure(self, host: str, port: int, dbname: str,
-                  user: str, table: str, authcfg: str,
-                  search_radius_km: Optional[float] = None) -> None:
+                  user: str, table: str, authcfg: str) -> None:
         """Store connection params and clear session cache."""
         self._params = {
             "host": host,
@@ -312,24 +306,9 @@ class BenchmarkDBManager:
             "table": table,
             "authcfg": authcfg,
         }
-        if search_radius_km is not None:
-            self.set_search_radius_km(search_radius_km)
         self.clear_session_cache()
-        logger.info("DB manager configured: %s@%s/%s table=%s radius=%.1f km",
-                    user, host, dbname, table, self._radius_m / 1000.0)
-
-    def set_search_radius_km(self, km: float) -> None:
-        """Set the normal working radius (km). Values ≤ 0 are ignored."""
-        try:
-            km = float(km)
-        except (TypeError, ValueError):
-            return
-        if km > 0:
-            self._radius_m = km * 1000.0
-
-    @property
-    def search_radius_m(self) -> float:
-        return self._radius_m
+        logger.info("DB manager configured: %s@%s/%s table=%s",
+                    user, host, dbname, table)
 
     @property
     def anchor(self) -> Optional[Tuple[float, float]]:
@@ -956,13 +935,12 @@ class BenchmarkDBManager:
 
         if not coords:
             self._anchor = None
-            logger.warning("establish_anchor: no coordinates available - radius filter disabled")
+            logger.warning("establish_anchor: no coordinates available - anchor unavailable")
             return None
 
         self._anchor = self._kmeans1_centroid(coords)
-        logger.info("Field anchor from %s (%d coords): E=%.1f N=%.1f, radius=%.1f km",
-                    source, len(coords), self._anchor[0], self._anchor[1],
-                    self._radius_m / 1000.0)
+        logger.info("Field anchor from %s (%d coords): E=%.1f N=%.1f",
+                    source, len(coords), self._anchor[0], self._anchor[1])
         return self._anchor
 
     def score_candidates(self, pid: str, recs: List[BenchmarkRecord],
@@ -974,14 +952,12 @@ class BenchmarkDBManager:
 
         Sets on every record:
           dist_to_anchor_m - distance to the field anchor (None if no anchor)
-          in_radius        - dist <= normal working radius (None if no anchor)
           topo_ok          - for every measured line pid<->partner whose partner
                              location is known, the straight distance from the
                              candidate to the partner is <= length*1.1 + 100 m.
                              None when no line can be checked.
 
-        Returns the records sorted: topology-consistent first, then in-radius,
-        then nearest to the anchor.
+        Returns the records sorted: topology-consistent first, then nearest to the anchor.
         """
         batch = batch or {}
         partners: List[Tuple[Tuple[float, float], float, str]] = []
@@ -1015,17 +991,14 @@ class BenchmarkDBManager:
         for r in recs:
             if r.x is None or r.y is None:
                 r.dist_to_anchor_m = None
-                r.in_radius = None
                 r.topo_ok = None
                 r.topo_ratio = None
                 r.topo_ref = None
                 continue
             if anchor is not None:
                 r.dist_to_anchor_m = _dist(r.x, r.y, anchor[0], anchor[1])
-                r.in_radius = r.dist_to_anchor_m <= self._radius_m
             else:
                 r.dist_to_anchor_m = None
-                r.in_radius = None
             if partners:
                 r.topo_ok = all(
                     _dist(r.x, r.y, px, py) <= length * TOPO_FACTOR + TOPO_SLACK_M
@@ -1044,7 +1017,6 @@ class BenchmarkDBManager:
         def _rank(r: BenchmarkRecord):
             return (
                 r.topo_ok is False,
-                r.in_radius is False,
                 r.x is None,
                 r.dist_to_anchor_m if r.dist_to_anchor_m is not None else float("inf"),
             )
@@ -1094,8 +1066,7 @@ class BenchmarkDBManager:
            collapse to one location (no duplicate elsewhere).
         2. Anchors are cross-checked against each other through the measured
            lines; an anchor that contradicts its measured neighbours is dropped
-           (status 'conflict').  A lone anchor with no verifying line that lies
-           outside the normal radius of the others is demoted ('unverified').
+           (status 'conflict').
         3. Propagation, repeated until no more progress: for every open point
            linked by a measured line to a known point, keep the candidate
            locations whose straight distance to every known neighbour is
@@ -1104,8 +1075,7 @@ class BenchmarkDBManager:
 
         Statuses: fixed, estimate, anchor, matched, identity (location known but
         twin/duplicate records need a human choice), ambiguous, conflict,
-        no_link (no measured line to a known point yet), not_in_db, no_coords,
-        unverified.
+        no_link (no measured line to a known point yet), not_in_db, no_coords.
         """
         fixed = fixed or {}
         exclude = set(exclude or ())
@@ -1181,41 +1151,6 @@ class BenchmarkDBManager:
                 notes[p] = ("The only DB location contradicts the measured distance to "
                             + ", ".join(bad_nb) + " - wrong namesake or point missing in DB")
 
-        if len(seeds) > 1:
-            # Group anchors by area (single linkage within the normal radius)
-            groups: List[List[str]] = []
-            for p in seeds:
-                home = None
-                for g in groups:
-                    if any(_dist(*seeds[p], *seeds[q]) <= self._radius_m for q in g):
-                        if home is None:
-                            home = g
-                            g.append(p)
-                        else:
-                            home.extend(g)
-                            g.clear()
-                groups = [g for g in groups if g]
-                if home is None:
-                    groups.append([p])
-
-            def _support(g):
-                cx = sum(seeds[q][0] for q in g) / len(g)
-                cy = sum(seeds[q][1] for q in g) / len(g)
-                near = sum(1 for pid, rs in cands.items()
-                           if any(_dist(r.x, r.y, cx, cy) <= self._radius_m for r in rs))
-                return (near, len(g)), (cx, cy)
-
-            ranked = sorted(groups, key=lambda g: _support(g)[0], reverse=True)
-            main = ranked[0]
-            main_c = _support(main)[1]
-            for g in ranked[1:]:
-                for p in g:
-                    loc = seeds.pop(p)
-                    status[p] = "unverified"
-                    notes[p] = ("Only one DB location, but it is %.1f km from the project "
-                                "area - must be confirmed by a measured line"
-                                % (_dist(loc[0], loc[1], main_c[0], main_c[1]) / 1000.0))
-
         for p, loc in seeds.items():
             known[p] = loc
             cl = _clusters(p)[0]
@@ -1238,9 +1173,8 @@ class BenchmarkDBManager:
                 cons = [(known[nb], L, nb) for nb, L in edges.get(pid, {}).items()
                         if nb in known]
                 if not cons:
-                    if status.get(pid) != "unverified":
-                        status[pid] = "no_link"
-                        notes[pid] = "No measured line to a known point yet"
+                    status[pid] = "no_link"
+                    notes[pid] = "No measured line to a known point yet"
                     continue
                 fit = [cl for cl in _clusters(pid) if self._fits(self._cluster_center(cl), cons)]
                 via = ", ".join(sorted({n for _p, _L, n in cons}))
@@ -1279,7 +1213,7 @@ class BenchmarkDBManager:
     def pick_unambiguous(recs: List[BenchmarkRecord]) -> Optional[BenchmarkRecord]:
         """Return the one acceptable candidate, or None if the user must choose.
 
-        Acceptable = has coordinates, not out of radius, not topology-inconsistent.
+        Acceptable = has coordinates, not topology-inconsistent.
         Exactly ONE < 1 m cluster may remain, and it must not mix different
         names (a 250/A + 849/L twin always goes to the user) nor different
         heights (duplicate rows of one monument).  Candidates without
@@ -1288,7 +1222,7 @@ class BenchmarkDBManager:
         # Any candidate without coordinates cannot be ruled out spatially.
         if any(r.x is None or r.y is None for r in recs):
             return None
-        ok = [r for r in recs if r.in_radius is not False and r.topo_ok is not False]
+        ok = [r for r in recs if r.topo_ok is not False]
         if not ok:
             return None
         clusters = group_twins(ok)
@@ -1354,10 +1288,8 @@ class BenchmarkDBManager:
     def _resolve_by_proximity(self, candidates: List[BenchmarkRecord],
                                key: str) -> Optional[BenchmarkRecord]:
         """
-        Select the candidate nearest to the field anchor, restricted to the
-        normal working radius.  Candidates outside the radius are only used
-        (with a WARNING) when nothing lies inside it, so the call never
-        returns None for a non-empty candidate list.
+        Select the candidate nearest to the field anchor (or project centroid).
+        Never returns None for a non-empty candidate list.
         Updates _resolved_coords with the winner's (Easting, Northing).
         """
         spatial = [r for r in candidates if r.x is not None and r.y is not None]
@@ -1376,20 +1308,7 @@ class BenchmarkDBManager:
         def d(r):
             return _dist(r.x, r.y, cx, cy)
 
-        inside = [r for r in spatial if d(r) <= self._radius_m]
-        if inside:
-            winner = min(inside, key=d)
-            dropped = len(spatial) - len(inside)
-            if dropped:
-                logger.info("'%s': %d candidate(s) outside %.1f km radius ignored",
-                            key, dropped, self._radius_m / 1000.0)
-        else:
-            winner = min(spatial, key=d)
-            logger.warning(
-                "'%s': no candidate within %.1f km of the field anchor - "
-                "nearest is '%s' at %.1f km. Verify this point in Point Settings.",
-                key, self._radius_m / 1000.0, winner.name, d(winner) / 1000.0,
-            )
+        winner = min(spatial, key=d)
 
         self._resolved_coords[key] = (winner.x, winner.y)
         logger.debug(
@@ -1587,7 +1506,6 @@ def get_db_manager() -> BenchmarkDBManager:
                     user=params.get("user", ""),
                     table=params.get("table", ""),
                     authcfg=params.get("authcfg", ""),
-                    search_radius_km=params.get("search_radius_km"),
                 )
         except Exception as exc:
             logger.warning("Could not auto-load DB params from settings: %s", exc)

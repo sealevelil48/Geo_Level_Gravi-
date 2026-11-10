@@ -81,18 +81,6 @@ class GeoLevelDBSettingsDialog(QDialog):
         self.edit_table.setPlaceholderText("benchmark table name (required)")
         form.addRow("Table name:", self.edit_table)
 
-        self.spin_radius = QDoubleSpinBox()
-        self.spin_radius.setRange(1.0, 100.0)
-        self.spin_radius.setDecimals(1)
-        self.spin_radius.setSingleStep(1.0)
-        self.spin_radius.setSuffix(" km")
-        self.spin_radius.setValue(15.0)
-        self.spin_radius.setToolTip(
-            "Normal working radius around the field anchor. DB candidates "
-            "farther than this are marked 'out of radius' and never auto-picked."
-        )
-        form.addRow("Search radius / רדיוס חיפוש:", self.spin_radius)
-
         root.addWidget(grp)
 
         # ── Test Connection row ───────────────────────────────────────
@@ -163,10 +151,6 @@ class GeoLevelDBSettingsDialog(QDialog):
         self.edit_dbname.setText(params.get("dbname", ""))
         self.edit_user.setText(params.get("user", ""))
         self.edit_table.setText(params.get("table", ""))
-        try:
-            self.spin_radius.setValue(float(params.get("search_radius_km", 15.0)))
-        except (TypeError, ValueError):
-            pass
 
         authcfg = params.get("authcfg", "")
         if authcfg:
@@ -191,7 +175,6 @@ class GeoLevelDBSettingsDialog(QDialog):
             "user":    self.edit_user.text().strip(),
             "table":   self.edit_table.text().strip(),
             "authcfg": self._get_authcfg(),
-            "search_radius_km": self.spin_radius.value(),
         }
 
     # ------------------------------------------------------------------ #
@@ -244,7 +227,6 @@ class GeoLevelDBSettingsDialog(QDialog):
                 user=params["user"],
                 table=params["table"],
                 authcfg=params["authcfg"],
-                search_radius_km=params["search_radius_km"],
             )
             from geolevel_db_manager import get_db_manager
             get_db_manager().configure(**params)

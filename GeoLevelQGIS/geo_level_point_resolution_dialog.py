@@ -38,8 +38,6 @@ from qgis.PyQt.QtWidgets import (
 )
 
 _TWIN_BG = QColor("#fff3cd")       # amber — forced choice between twins
-_OUT_BG = QColor("#fde0dc")        # light red — nothing inside the radius
-_WARN_FG = QColor("#b26a00")       # orange text — out-of-radius candidate
 _BAD_FG = QColor("#9e9e9e")        # grey text — topology-inconsistent candidate
 
 _CHOOSE_PLACEHOLDER = "— choose one: twin points at the same location —"
@@ -54,7 +52,6 @@ def _row_needs_forced_choice(records: list) -> bool:
         return any(getattr(r, "twin_of", None) for r in records)
     ok = [r for r in records
           if r.x is not None and r.y is not None
-          and getattr(r, "in_radius", None) is not False
           and getattr(r, "topo_ok", None) is not False]
     if not ok:
         return False
@@ -139,16 +136,15 @@ class GeoLevelPointResolutionDialog(QDialog):
             text = (
                 "<b>Re-select the database benchmark used for each point.</b><br>"
                 "Candidates are sorted by distance to the field anchor (the area "
-                "measured in the loaded files). <span style='color:#b26a00'>⚠ out of "
-                "radius</span> = outside the normal working radius; "
+                "measured in the loaded files). "
                 "<b>≈ twin</b> = a differently named DB point at the same spot "
                 "(&lt; 1 m).<br>Use <i>Search DB</i> to look up any other name. "
                 "<i>Applying re-builds the map from memory — files are not reloaded.</i>"
             )
         else:
             text = (
-                "<b>Some field point IDs were not found, have multiple matches, lie "
-                "outside the working radius, or coincide with another DB point.</b><br>"
+                "<b>Some field point IDs were not found, have multiple matches, "
+                "or coincide with another DB point.</b><br>"
                 "Select the correct benchmark from the dropdown (coordinates shown) or "
                 "type the exact database name in the override column.<br>"
                 "<span style='background:#fff3cd'>&nbsp;Amber rows&nbsp;</span> hold "
@@ -289,8 +285,6 @@ class GeoLevelPointResolutionDialog(QDialog):
                 idx = combo.count() - 1
                 if getattr(rec, "topo_ok", None) is False:
                     combo.setItemData(idx, QBrush(_BAD_FG), Qt.ForegroundRole)
-                elif getattr(rec, "in_radius", None) is False:
-                    combo.setItemData(idx, QBrush(_WARN_FG), Qt.ForegroundRole)
                 tip = self._format_tooltip(rec)
                 if tip:
                     # DB text (hearot etc.) must never be parsed as rich text
@@ -310,15 +304,12 @@ class GeoLevelPointResolutionDialog(QDialog):
 
         # Row highlight
         row = self._target_points.index(pid)
-        all_out = bool(records) and all(getattr(r, "in_radius", None) is False for r in records)
-        bg = _TWIN_BG if forced else (_OUT_BG if all_out else None)
+        bg = _TWIN_BG if forced else None
         item = self._table.item(row, 0)
         if item is not None:
             item.setBackground(QBrush(bg) if bg is not None else QBrush())
             if forced:
                 item.setToolTip("Twin points at the same location — choose one explicitly")
-            elif all_out:
-                item.setToolTip("No DB candidate lies inside the normal working radius")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -356,8 +347,6 @@ class GeoLevelPointResolutionDialog(QDialog):
         if d is not None:
             parts.append(f"d={d / 1000.0:.1f} km")
         flags = []
-        if getattr(rec, "in_radius", None) is False:
-            flags.append("⚠ out of radius")
         if getattr(rec, "topo_ok", None) is False:
             flags.append("⚠ line-length mismatch")
         twin = getattr(rec, "twin_of", None)
