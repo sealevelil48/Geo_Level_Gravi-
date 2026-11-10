@@ -17,6 +17,7 @@ the field anchor and warnings (⚠ out of radius, ⚠ length mismatch,
 """
 from __future__ import annotations
 
+import html
 from typing import Callable, Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt
@@ -217,7 +218,7 @@ class GeoLevelPointResolutionDialog(QDialog):
             if "Reason" in self._columns:
                 note = QTableWidgetItem(self._notes.get(pid, ""))
                 note.setFlags(Qt.ItemIsEnabled)
-                note.setToolTip(self._notes.get(pid, ""))
+                note.setToolTip(html.escape(self._notes.get(pid, "")))
                 if self._statuses.get(pid) in ("not_in_db", "conflict"):
                     note.setForeground(QBrush(QColor("#c62828")))
                 self._table.setItem(row, self._col("Reason"), note)
@@ -292,7 +293,9 @@ class GeoLevelPointResolutionDialog(QDialog):
                     combo.setItemData(idx, QBrush(_WARN_FG), Qt.ForegroundRole)
                 tip = self._format_tooltip(rec)
                 if tip:
-                    combo.setItemData(idx, tip, Qt.ToolTipRole)
+                    # DB text (hearot etc.) must never be parsed as rich text
+                    combo.setItemData(idx, html.escape(tip).replace(chr(10), "<br>"),
+                                      Qt.ToolTipRole)
 
         # Default selection: current record (edit) → otherwise first real item
         sel = 0

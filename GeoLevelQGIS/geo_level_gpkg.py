@@ -445,8 +445,11 @@ def is_network_path(p) -> bool:
     """
     if not p:
         return False
-    s = str(p).strip()
-    if s.startswith(("\\\\", "//")):
+    # Unify separators first so mixed forms like '\/server' or '/\server'
+    # cannot slip past the prefix test.
+    s = str(p).strip().replace("/", "\\")
+    if s.startswith("\\\\"):
         return True
-    drive = os.path.splitdrive(s)[0]
-    return drive.startswith(("\\\\", "//"))
+    import ntpath
+    drive = ntpath.splitdrive(s)[0]
+    return bool(drive) and not (len(drive) == 2 and drive[1] == ":" and drive[0].isalpha())
