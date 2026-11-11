@@ -1048,9 +1048,6 @@ class GeoLevelPlugin:
         self._val_results = []
         self._point_origin = {}
         self._gpkg_path = ""
-        # For the legacy DAT parse path: only set _glp_path after successful load
-        # (leaves it empty until confirmed, prevents stale path if load fails)
-        self._glp_path = ""
         self._point_overrides = overrides
         # Saved renames (e.g. '2599B' -> '2599/ב') must reach the FIRST
         # process_geodetic_data pass too, independent of whether point
@@ -1064,9 +1061,17 @@ class GeoLevelPlugin:
         except Exception:
             pass
         self._remove_result_layers()
-        self._process_files(resolved_files, cls, output_dir)
-        # Load succeeded: now commit the .glp path
-        self._glp_path = os.path.abspath(path)
+        # Preserve prior _glp_path in case the load fails
+        old_glp_path = self._glp_path
+        self._glp_path = ""
+        try:
+            self._process_files(resolved_files, cls, output_dir)
+            # Load succeeded: now commit the .glp path
+            self._glp_path = os.path.abspath(path)
+        except Exception:
+            # Restore prior state on failure
+            self._glp_path = old_glp_path
+            raise
 
     # ------------------------------------------------------------------
     # GeoPackage persistence
@@ -1418,11 +1423,13 @@ class GeoLevelPlugin:
                 db_mgr.accept_record(pid, rec_obj)
                 restored_count += 1
             except (TypeError, ValueError, KeyError) as e:
-                # Sanitize pid for error message (truncate long strings, hide non-string types)
+                # Sanitize pid and error message for logging
                 pid_safe = str(pid)[:50] if isinstance(pid, str) else f"{type(pid).__name__}"
                 failed_pids.append(pid_safe)
+                # Log only a generic message without embedding exception details
+                # (prevents information leaks from untrusted input)
                 QgsMessageLog.logMessage(
-                    f"Point cache validation failed for '{pid_safe}': {e}",
+                    f"Point cache validation failed for '{pid_safe}'",
                     "GeoLevelPlugin", level=Qgis.Warning)
 
         if failed_pids:
