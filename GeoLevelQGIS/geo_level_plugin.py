@@ -957,6 +957,8 @@ class GeoLevelPlugin:
                                             duration=5)
 
     def _load_project(self):
+        # Clear stale state at the start to prevent leaking between loads
+        self._glp_path = ""
         path, _ = QFileDialog.getOpenFileName(
             self.iface.mainWindow(), "Load Project",
             _PROJECTS_DIR,
@@ -1049,6 +1051,7 @@ class GeoLevelPlugin:
         self._point_origin = {}
         self._gpkg_path = ""
         # The GPKG written by _process_files is recorded back into this .glp
+        # (Set explicitly here for the legacy DAT parse path)
         self._glp_path = os.path.abspath(path)
         self._point_overrides = overrides
         # Saved renames (e.g. '2599B' -> '2599/ב') must reach the FIRST
@@ -1382,13 +1385,41 @@ class GeoLevelPlugin:
         """Rebuild the DB session cache exactly as it was when the GPKG was
         saved (in memory only - no DB query): every point's DB record, or None
         for estimated points, then the Point Settings choices on top.  This is
-        what keeps untouched points in place when Edit Point rebuilds layers."""
+        what keeps untouched points in place when Edit Point rebuilds layers.
+
+        Resolved_points is untrusted input from a received GeoPackage, so
+        validate that each record after reconstruction matches expected types.
+        """
         try:
             from geolevel_db_manager import get_db_manager
             db_mgr = get_db_manager()
             db_mgr.clear_session_cache()
+            restored_count = 0
             for pid, rec in (resolved_points or {}).items():
-                db_mgr.accept_record(pid, self._record_from_dict(rec) if rec else None)
+                if rec is None:
+                    db_mgr.accept_record(pid, None)
+                    restored_count += 1
+                    continue
+                rec_obj = self._record_from_dict(rec)
+                # Validate: reconstructed BenchmarkRecord must have numeric coords or None
+                if rec_obj is not None:
+                    assert isinstance(rec_obj.x, (float, type(None))), \
+                        f"BenchmarkRecord.x={rec_obj.x!r} not float/None for {pid}"
+                    assert isinstance(rec_obj.y, (float, type(None))), \
+                        f"BenchmarkRecord.y={rec_obj.y!r} not float/None for {pid}"
+                    if rec_obj.x is not None and rec_obj.y is not None:
+                        import math
+                        assert math.isfinite(rec_obj.x) and math.isfinite(rec_obj.y), \
+                            f"BenchmarkRecord coords not finite for {pid}"
+                db_mgr.accept_record(pid, rec_obj)
+                restored_count += 1
+            if restored_count > 0:
+                QgsMessageLog.logMessage(
+                    f"Restored {restored_count} point(s) from saved project cache",
+                    "GeoLevelPlugin", level=Qgis.Info)
+        except (AssertionError, AttributeError) as exc:
+            QgsMessageLog.logMessage(f"Point cache validation failed: {exc}",
+                                     "GeoLevelPlugin", level=Qgis.Warning)
         except Exception:
             QgsMessageLog.logMessage("Restoring point cache failed: " + traceback.format_exc(),
                                      "GeoLevelPlugin", level=Qgis.Warning)

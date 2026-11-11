@@ -207,18 +207,28 @@ def rows_to_project(line_rows, setup_rows):
             dists = [_finite(s.get(k)) for k in ("distance_back", "distance_fore")]
             if any(x is None for x in rdgs + dists):
                 continue  # Skip malformed setup
+            # Validate string fields BEFORE using them
+            from_pt = s.get("from_point")
+            to_pt = s.get("to_point")
+            if not (isinstance(from_pt, (str, type(None))) and isinstance(to_pt, (str, type(None)))):
+                continue  # Skip malformed setup
+            # Validate optional float fields
+            temp = _finite(s.get("temperature"))
+            dh = _finite(s.get("height_diff"))
+            cumh = _finite(s.get("cumulative_height"))
+            # Use VALIDATED values, not raw dict access
             setups.append(StationSetup(
-                setup_number=s["setup_number"],
-                from_point=s["from_point"],
-                to_point=s["to_point"],
-                backsight_reading=s["backsight_reading"],
-                foresight_reading=s["foresight_reading"],
-                distance_back=s["distance_back"],
-                distance_fore=s["distance_fore"],
-                temperature=s["temperature"],
-                height_diff=s["height_diff"],
-                cumulative_height=s["cumulative_height"],
-                is_used=bool(s["is_used"]),
+                setup_number=setup_num,
+                from_point=from_pt or "",
+                to_point=to_pt or "",
+                backsight_reading=rdgs[0],
+                foresight_reading=rdgs[1],
+                distance_back=dists[0],
+                distance_fore=dists[1],
+                temperature=temp,
+                height_diff=dh,
+                cumulative_height=cumh,
+                is_used=bool(s.get("is_used", 1)),
             ))
         fn = r.get("filename")
         if not isinstance(fn, str) or not fn.strip():
