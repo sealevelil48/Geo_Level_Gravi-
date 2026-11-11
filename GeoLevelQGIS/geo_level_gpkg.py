@@ -228,7 +228,8 @@ def rows_to_project(line_rows, setup_rows):
                 temperature=temp,
                 height_diff=dh,
                 cumulative_height=cumh,
-                is_used=bool(s.get("is_used", 1)),
+                is_used=(bool(s.get("is_used")) if "is_used" in s
+                         and isinstance(s["is_used"], (bool, int)) else True),
             ))
         fn = r.get("filename")
         if not isinstance(fn, str) or not fn.strip():
@@ -267,7 +268,8 @@ def rows_to_project(line_rows, setup_rows):
             misclosure=_finite(r.get("misclosure")),
             status=status,
             validation_errors=errors,
-            is_used=bool(r.get("is_used", 1)),
+            is_used=(bool(r.get("is_used")) if "is_used" in r
+                     and isinstance(r["is_used"], (bool, int)) else True),
             original_direction=str(r.get("original_direction") or "BF"),
             manager_override=bool(r.get("manager_override")),
         )
