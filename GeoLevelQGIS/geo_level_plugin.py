@@ -388,6 +388,8 @@ class GeoLevelPlugin:
         self._point_origin = {}
         # GeoPackage holding the current project's layers + line/setup tables
         self._gpkg_path = ""
+        # .glp file that points at _gpkg_path ("" = none / opened .gpkg directly)
+        self._glp_path = ""
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -489,6 +491,11 @@ class GeoLevelPlugin:
         self.dock.enhanced_lsa_requested.connect(self._run_enhanced_lsa)
         self.dock.override_changed.connect(self._on_override_changed)
         self.dock.edit_points_requested.connect(self._edit_points)
+        # GeoPackage-first: every in-place line edit is written straight to
+        # the project GPKG (override/use toggles arrive via override_changed,
+        # connected after _on_override_changed so the layer commit runs first).
+        self.dock.override_changed.connect(lambda *_: self._autosave_gpkg())
+        self.dock.line_modified.connect(lambda *_: self._autosave_gpkg())
 
     def _show_dock(self):
         if self.dock:
@@ -612,6 +619,7 @@ class GeoLevelPlugin:
         self._pending_excluded = set()
         if not self._check_point_resolution(new_lines, base_remap=load_remap):
             self._lines = self._lines[:n_prev]
+            self._val_results = self._val_results[:n_prev]
             self._pending_pid_remap = {}
             return
 
@@ -940,6 +948,7 @@ class GeoLevelPlugin:
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        self._glp_path = os.path.abspath(path)
         msg = f"Project saved: {path}"
         if not gpkg:
             msg += "  (GeoPackage could not be written - reload will re-parse files)"
@@ -950,19 +959,46 @@ class GeoLevelPlugin:
     def _load_project(self):
         path, _ = QFileDialog.getOpenFileName(
             self.iface.mainWindow(), "Load Project",
-            _PROJECTS_DIR, "Geo Level Project (*.glp)"
+            _PROJECTS_DIR,
+            "Geo Level Project (*.glp *.gpkg);;Project file (*.glp);;"
+            "Project GeoPackage (*.gpkg)"
         )
-        if not path or not os.path.exists(path):
+        if not path:
             return
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        from geo_level_gpkg import is_network_path
+        if is_network_path(path) or not os.path.isfile(path):
+            return
+
+        # -- Direct GeoPackage open: the GPKG is the whole project --------
+        if os.path.splitext(path)[1].lower() == ".gpkg":
+            real = os.path.realpath(path)
+            if is_network_path(real) or not self._load_project_from_gpkg(
+                    real, None, "", {}):
+                QMessageBox.warning(
+                    self.iface.mainWindow(), "Load Project",
+                    "This file is not a Geo Level project GeoPackage\n"
+                    "(the lv_lines / lv_setups / lv_meta tables are missing or empty).")
+                return
+            self._glp_path = ""
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("project file is not a JSON object")
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self.iface.mainWindow(), "Load Project",
+                                f"Cannot read project file:\n{exc}")
+            return
         files      = data.get("files", [])
         cls        = data.get("class", "H3")
         output_dir = data.get("output_dir", "")
         glp_dir    = os.path.dirname(os.path.abspath(path))
+        if cls not in ("H1", "H2", "H3", "H4", "H5", "H6"):
+            cls = None            # untrusted: let the GPKG meta / default decide
         # Paths inside the .glp are untrusted: never write to / read from a
         # network (UNC) location named by the project file.
-        from geo_level_gpkg import is_network_path
         if not isinstance(output_dir, str) or is_network_path(output_dir):
             output_dir = ""
         if not isinstance(files, list):
@@ -974,7 +1010,9 @@ class GeoLevelPlugin:
         # -- Fast path: everything is in the project GeoPackage ----------
         gpkg = self._resolve_gpkg_ref(data.get("gpkg"), glp_dir, output_dir)
         if gpkg and self._load_project_from_gpkg(gpkg, cls, output_dir, overrides):
+            self._glp_path = os.path.abspath(path)
             return
+        cls = cls or "H3"
 
         # -- Legacy path: re-parse the measurement files ------------------
         # Resolve each file: absolute path, then the .glp folder and the
@@ -1010,6 +1048,8 @@ class GeoLevelPlugin:
         self._val_results = []
         self._point_origin = {}
         self._gpkg_path = ""
+        # The GPKG written by _process_files is recorded back into this .glp
+        self._glp_path = os.path.abspath(path)
         self._point_overrides = overrides
         # Saved renames (e.g. '2599B' -> '2599/ב') must reach the FIRST
         # process_geodetic_data pass too, independent of whether point
@@ -1098,12 +1138,37 @@ class GeoLevelPlugin:
         return ""
 
     def _gpkg_meta(self) -> dict:
+        """Project metadata for lv_meta: everything needed to rebuild the
+        session (class, Point Settings, renames, exact DB point picks)."""
         cls = self.dock.get_selected_class() if self.dock else self._last_class
+        cls = cls or self._last_class or "H3"
+        # {raw field ID: current name} - from the live origin map plus any
+        # rename recorded in the saved Point Settings overrides.
+        pid_remap = dict(self._remap_from_overrides(self._point_overrides))
+        for cur, origin in (self._point_origin or {}).items():
+            if isinstance(origin, str) and isinstance(cur, str) and origin != cur:
+                pid_remap.setdefault(origin, cur)
+        # Exact DB record (or None = estimated) used for every point, so a
+        # reload / Edit Point never re-picks untouched points from the DB.
+        resolved = {}
+        try:
+            from geolevel_db_manager import get_db_manager
+            snap = get_db_manager().session_snapshot(self._unique_points(self._lines))
+            resolved = {pid: (self._record_to_dict(rec) if rec is not None else None)
+                        for pid, rec in snap.items()}
+        except Exception:
+            QgsMessageLog.logMessage("Point snapshot for GeoPackage failed: "
+                                     + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
         return {
-            "class": cls or self._last_class or "H3",
+            "leveling_class": cls,
+            "class": cls,                       # schema-1 readers
             "output_dir": self._last_output_dir,
+            "dat_files": [self._line_src_path(ln) for ln in self._lines],
             "point_overrides": self._point_overrides,
             "point_origin": self._point_origin,
+            "pid_remap": pid_remap,
+            "resolved_points": resolved,
             "saved_utc": datetime.utcnow().isoformat(timespec="seconds"),
         }
 
@@ -1167,11 +1232,13 @@ class GeoLevelPlugin:
         stem, ext = os.path.splitext(default)
         candidates = [self._gpkg_path or default]
         candidates += [f"{stem}_{n}{ext}" for n in range(1, 50)]
+        meta = self._gpkg_meta()
+        previous = self._gpkg_path
         written = ""
         for cand in candidates:
             try:
                 written = gp.write_project_gpkg(cand, mem_lines, mem_pts,
-                                                self._lines, self._gpkg_meta())
+                                                self._lines, meta, self._val_results)
                 break
             except PermissionError:
                 continue          # still locked by Windows - try the next name
@@ -1190,7 +1257,59 @@ class GeoLevelPlugin:
             self._add_result_layers(mem_lines, mem_pts)
         QgsMessageLog.logMessage(f"Project GeoPackage written: {written}",
                                  "GeoLevelPlugin", level=Qgis.Info)
+        same = bool(previous) and (os.path.normcase(os.path.abspath(previous))
+                                   == os.path.normcase(os.path.abspath(written)))
+        if not same:
+            self._repoint_glp(written)
         return written
+
+    def _repoint_glp(self, gpkg: str) -> None:
+        """Keep the open .glp pointing at the GPKG actually holding the project
+        (a locked file makes _persist_to_gpkg fall back to *_N.gpkg)."""
+        glp = self._glp_path
+        if not glp or not os.path.isfile(glp):
+            return
+        try:
+            with open(glp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            try:
+                ref = os.path.relpath(gpkg, os.path.dirname(glp))
+            except ValueError:            # different drive on Windows
+                ref = os.path.abspath(gpkg)
+            if data.get("gpkg") == ref:
+                return
+            data["gpkg"] = ref
+            data["version"] = max(2, data.get("version", 2)
+                                  if isinstance(data.get("version"), int) else 2)
+            with open(glp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            self.iface.messageBar().pushMessage(
+                "Geo Level Gravi",
+                f"Project file updated to use {os.path.basename(gpkg)}",
+                level=Qgis.Info, duration=5)
+        except (OSError, ValueError):
+            QgsMessageLog.logMessage("Updating .glp GeoPackage pointer failed: "
+                                     + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+
+    def _autosave_gpkg(self) -> None:
+        """GeoPackage-first autosave: rewrite lv_lines / lv_setups / lv_meta in
+        place after an in-memory edit.  Never raises; does nothing until the
+        map reads from the project GPKG (it is written on first processing)."""
+        gpkg = self._gpkg_path
+        if not self._lines or not gpkg or not os.path.isfile(gpkg):
+            return
+        if not self._layers_use_gpkg(gpkg):
+            return
+        try:
+            import geo_level_gpkg as gp
+            gp.write_attribute_tables(gpkg, self._lines, self._gpkg_meta(),
+                                      self._val_results)
+        except Exception:
+            QgsMessageLog.logMessage("GeoPackage autosave failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
 
     def _refresh_gpkg_tables(self) -> str:
         """Bring the GeoPackage up to date before saving the .glp.
@@ -1203,7 +1322,8 @@ class GeoLevelPlugin:
         if gpkg and os.path.isfile(gpkg) and self._layers_use_gpkg(gpkg):
             try:
                 import geo_level_gpkg as gp
-                gp.write_attribute_tables(gpkg, self._lines, self._gpkg_meta())
+                gp.write_attribute_tables(gpkg, self._lines, self._gpkg_meta(),
+                                          self._val_results)
                 return gpkg
             except Exception:
                 QgsMessageLog.logMessage("GeoPackage table update failed, rewriting file: "
@@ -1258,13 +1378,30 @@ class GeoLevelPlugin:
             QgsMessageLog.logMessage("Re-validation failed: " + traceback.format_exc(),
                                      "GeoLevelPlugin", level=Qgis.Warning)
 
-    def _replay_point_overrides(self) -> None:
+    def _restore_point_cache(self, resolved_points: dict) -> None:
+        """Rebuild the DB session cache exactly as it was when the GPKG was
+        saved (in memory only - no DB query): every point's DB record, or None
+        for estimated points, then the Point Settings choices on top.  This is
+        what keeps untouched points in place when Edit Point rebuilds layers."""
+        try:
+            from geolevel_db_manager import get_db_manager
+            db_mgr = get_db_manager()
+            db_mgr.clear_session_cache()
+            for pid, rec in (resolved_points or {}).items():
+                db_mgr.accept_record(pid, self._record_from_dict(rec) if rec else None)
+        except Exception:
+            QgsMessageLog.logMessage("Restoring point cache failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+        self._replay_point_overrides(clear=False)
+
+    def _replay_point_overrides(self, clear: bool = True) -> None:
         """Put the saved Point Settings choices back into the DB session cache
         (in memory only - no DB query) so later edits rebuild consistently."""
         try:
             from geolevel_db_manager import get_db_manager
             db_mgr = get_db_manager()
-            db_mgr.clear_session_cache()
+            if clear:
+                db_mgr.clear_session_cache()
             for pid, ov in (self._point_overrides or {}).items():
                 ov = ov or {}
                 if ov.get("mode") in ("estimate", "pkt_average"):
@@ -1279,15 +1416,21 @@ class GeoLevelPlugin:
             QgsMessageLog.logMessage("Replaying point overrides failed: " + traceback.format_exc(),
                                      "GeoLevelPlugin", level=Qgis.Warning)
 
-    def _load_project_from_gpkg(self, gpkg: str, cls: str, output_dir: str,
+    def _load_project_from_gpkg(self, gpkg: str, cls, output_dir: str,
                                 overrides: dict) -> bool:
         """Restore a project from its GeoPackage: no file parsing, no DB query,
-        no point-resolution dialog.  Returns False to fall back to the files."""
+        no point-resolution dialog.  Returns False to fall back to the files.
+
+        cls / output_dir / overrides come from the .glp (None / "" / {} when
+        the .gpkg is opened directly); lv_meta fills in whatever is missing.
+        Line statuses and validation results are restored exactly as saved.
+        """
         try:
             import geo_level_gpkg as gp
             if not gp.has_project_tables(gpkg):
                 return False
-            lines, meta = gp.read_attribute_tables(gpkg)
+            lines, saved_vrs, raw_meta = gp.read_project_tables(gpkg)
+            meta = gp.sanitize_meta(raw_meta)
         except Exception:
             QgsMessageLog.logMessage("Reading project GeoPackage failed: " + traceback.format_exc(),
                                      "GeoLevelPlugin", level=Qgis.Warning)
@@ -1295,17 +1438,35 @@ class GeoLevelPlugin:
         if not lines:
             return False
 
+        from geo_level_gpkg import is_network_path
+        # GeoPackage-first: NEVER trust output_dir from the file. Always use
+        # dirname(gpkg) to keep exports and fallback GPKGs in the project folder.
+        # (Untrusted input could redirect files to any local folder via path
+        # traversal, and .glp could be later pointed at malicious projects.)
+        if not output_dir or is_network_path(output_dir):
+            output_dir = ""
         if not output_dir or not os.path.isdir(output_dir):
             output_dir = os.path.dirname(gpkg)
-        self._last_class = cls or meta.get("class") or "H3"
+
+        # Fresh session state (nothing from a previous project may leak in)
+        self._pending_marker_pids = {}
+        self._pending_excluded = set()
+        self._pending_unuse = set()
+        if self.dock:
+            self.dock.clear_all()
+
+        self._last_class = cls or meta["leveling_class"]
         self._last_output_dir = output_dir
         self._lines = lines
         self._val_results = []
-        saved = meta.get("point_overrides") if isinstance(meta.get("point_overrides"), dict) else {}
-        self._point_overrides = overrides or dict(saved)
-        origin = meta.get("point_origin")
-        self._point_origin = dict(origin) if isinstance(origin, dict) else {}
-        self._replay_point_overrides()
+        self._point_overrides = dict(overrides) if overrides else dict(meta["point_overrides"])
+        self._point_origin = dict(meta["point_origin"])
+        # Renames for files appended later ({raw field ID: verified name})
+        self._pending_pid_remap = (dict(meta["pid_remap"])
+                                   or self._remap_from_overrides(self._point_overrides))
+        for old, new in self._pending_pid_remap.items():
+            self._point_origin.setdefault(new, old)
+        self._restore_point_cache(meta["resolved_points"])
 
         self._remove_result_layers()
         self._gpkg_path = gpkg
@@ -1323,7 +1484,7 @@ class GeoLevelPlugin:
 
         if self.dock and hasattr(self.dock, "class_combo"):
             self.dock.class_combo.setCurrentText(self._last_class)
-        self._revalidate_all(self._last_class)
+        changed = self._restore_saved_validation(saved_vrs)
         self._sync_map_statuses()
         self._show_dock()
         if self.dock:
@@ -1334,12 +1495,48 @@ class GeoLevelPlugin:
                 ext.scale(1.1)
                 self.iface.mapCanvas().setExtent(ext)
         self.iface.mapCanvas().refresh()
+        msg = (f"Project loaded from GeoPackage - {len(self._lines)} line(s) "
+               f"({os.path.basename(gpkg)})")
+        if changed:
+            msg += (f"  |  {len(changed)} line(s) kept their saved status although "
+                    f"the current class rules differ: {', '.join(changed[:8])}"
+                    + (" …" if len(changed) > 8 else ""))
         self.iface.messageBar().pushMessage(
-            "Geo Level Gravi",
-            f"Project loaded from GeoPackage - {len(self._lines)} line(s) "
-            f"({os.path.basename(gpkg)})",
-            level=Qgis.Success, duration=5)
+            "Geo Level Gravi", msg,
+            level=Qgis.Warning if changed else Qgis.Success,
+            duration=10 if changed else 5)
         return True
+
+    def _restore_saved_validation(self, saved_vrs) -> list:
+        """'Saved status wins': restore validation exactly as stored.
+
+        Schema >= 2 GeoPackages carry every ValidationResult -> used verbatim,
+        no validator run.  Older files: validate with the current rules for the
+        Validation tab, then force each line back to its saved status, flagging
+        the disagreement on that line.  Returns filenames whose status differs
+        from what the current rules would give (old files only).
+        """
+        if saved_vrs:
+            self._val_results = list(saved_vrs)
+            return []
+        saved = [(ln, ln.status) for ln in self._lines]
+        self._revalidate_all(self._last_class)
+        if not self._val_results:
+            from core_logic.config.models import ValidationResult
+            self._val_results = [(ln, ValidationResult(is_valid=True)) for ln in self._lines]
+        vr_by_line = {id(l): vr for l, vr in self._val_results}
+        changed = []
+        for ln, status in saved:
+            now = ln.status
+            if now != status:
+                vr = vr_by_line.get(id(ln))
+                if vr is not None:
+                    vr.add_warning(
+                        f"Status restored from saved project ({status.value}); "
+                        f"current class rules give {now.value}.")
+                ln.status = status
+                changed.append(ln.filename)
+        return changed
 
     def _new_project(self):
         """Clear all loaded data and start a fresh session."""
@@ -1370,6 +1567,8 @@ class GeoLevelPlugin:
         self._point_overrides = {}
         self._point_origin = {}
         self._gpkg_path = ""
+        self._glp_path = ""
+        self._pending_pid_remap = {}
 
         # Remove the QGIS map layers (lines + points)
         self._remove_result_layers()
@@ -2523,7 +2722,10 @@ class GeoLevelPlugin:
 
                 # Push the EXCLUDED statuses to the QGIS map instantly
                 self._sync_map_statuses()
+                self._autosave_gpkg()
         except Exception as exc:
+            # Validation failure: discard stale val_results (paired with old line objects)
+            self._val_results = []
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)
             QMessageBox.critical(self.iface.mainWindow(), "Point Exclusion -- Error", str(exc))
@@ -2555,7 +2757,10 @@ class GeoLevelPlugin:
                         self._val_results = bv.validate_batch(self._lines)
                         self.dock.load_lines(self._lines, self._val_results)
                     except Exception:
-                        pass
+                        # Re-validation failed: discard stale results (paired with old class)
+                        self._val_results = []
+                    self._sync_map_statuses()
+                    self._autosave_gpkg()
                 self.iface.messageBar().pushMessage(
                     "Settings",
                     "Class parameters updated and saved to settings.json",

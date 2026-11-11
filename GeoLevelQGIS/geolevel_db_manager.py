@@ -894,6 +894,19 @@ class BenchmarkDBManager:
         else:
             self._resolved_coords.pop(key, None)
 
+    def session_snapshot(self, point_names) -> Dict[str, Optional[BenchmarkRecord]]:
+        """Return {name: cached record or None} for every name already resolved
+        this session.  Names never looked up are omitted (no DB query is made).
+        Used to persist the exact point picks into the project GeoPackage."""
+        out: Dict[str, Optional[BenchmarkRecord]] = {}
+        for name in point_names or []:
+            if not isinstance(name, str) or not name.strip():
+                continue
+            key = name.strip().upper()
+            if key in self._cache:
+                out[name] = self._cache[key]
+        return out
+
     def forget(self, point_name: str) -> None:
         """Drop any unconfirmed auto-pick for *point_name* (cache + anchor pool)."""
         key = point_name.strip().upper()

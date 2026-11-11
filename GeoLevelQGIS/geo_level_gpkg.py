@@ -21,7 +21,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LINES_LAYER = "geo_lines"
 POINTS_LAYER = "geo_points"
 DEFAULT_GPKG_NAME = "geo_level_results.gpkg"
@@ -43,6 +43,7 @@ _LINE_COLS = [
     ("is_used", "INTEGER"),
     ("original_direction", "TEXT"),
     ("manager_override", "INTEGER"),
+    ("validation", "TEXT"),          # JSON ValidationResult (schema >= 2)
 ]
 
 _SETUP_COLS = [
@@ -69,8 +70,53 @@ def _enum_val(v):
     return v.value if hasattr(v, "value") else v
 
 
-def lines_to_rows(lines):
-    """LevelingLine list -> (line_rows, setup_rows) as lists of dicts."""
+_VR_FLAGS = ("endpoint_valid", "naming_valid", "tolerance_valid", "data_complete")
+
+
+def validation_to_dict(vr):
+    """ValidationResult -> plain dict (JSON-serialisable)."""
+    if vr is None:
+        return None
+    d = {"is_valid": bool(vr.is_valid),
+         "errors": [str(e) for e in (vr.errors or [])],
+         "warnings": [str(w) for w in (vr.warnings or [])]}
+    for k in _VR_FLAGS:
+        d[k] = bool(getattr(vr, k, True))
+    return d
+
+
+def validation_from_dict(d):
+    """Inverse of validation_to_dict; None for anything malformed."""
+    from core_logic.config.models import ValidationResult
+    if not isinstance(d, dict) or not isinstance(d.get("is_valid"), bool):
+        return None
+
+    def _strs(v):
+        return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+    vr = ValidationResult(is_valid=d["is_valid"],
+                          errors=_strs(d.get("errors")),
+                          warnings=_strs(d.get("warnings")))
+    for k in _VR_FLAGS:
+        v = d.get(k, True)
+        setattr(vr, k, v if isinstance(v, bool) else True)
+    return vr
+
+
+def lines_to_rows(lines, val_results=None):
+    """LevelingLine list -> (line_rows, setup_rows) as lists of dicts.
+
+    val_results: optional [(line, ValidationResult)] as returned by
+    BatchValidator.validate_batch; stored per line in the 'validation' column
+    (matched by object identity, so a stale list simply stores nothing).
+    """
+    vr_by_line = {}
+    for item in (val_results or []):
+        try:
+            ln_obj, vr = item
+        except (TypeError, ValueError):
+            continue
+        vr_by_line[id(ln_obj)] = vr
     line_rows, setup_rows = [], []
     for i, ln in enumerate(lines):
         date = getattr(ln, "date", None)
@@ -94,6 +140,9 @@ def lines_to_rows(lines):
             "is_used": int(bool(getattr(ln, "is_used", True))),
             "original_direction": getattr(ln, "original_direction", "BF"),
             "manager_override": int(bool(getattr(ln, "manager_override", False))),
+            "validation": (json.dumps(validation_to_dict(vr_by_line[id(ln)]),
+                                      ensure_ascii=False)
+                           if vr_by_line.get(id(ln)) is not None else None),
         })
         for s in ln.setups:
             setup_rows.append({
@@ -115,17 +164,49 @@ def lines_to_rows(lines):
 
 def rows_to_lines(line_rows, setup_rows):
     """Inverse of lines_to_rows -> list of LevelingLine."""
+    return rows_to_project(line_rows, setup_rows)[0]
+
+
+def rows_to_project(line_rows, setup_rows):
+    """Inverse of lines_to_rows -> (lines, val_results or None).
+
+    val_results is None unless every line row carries a stored result
+    (schema 1 files have no 'validation' column). Untrusted input: every
+    numeric column is coerced to finite float/int; non-compliant rows are
+    silently skipped (a GeoPackage from someone else can have corrupted data).
+    """
     from core_logic.config.models import LevelingLine, StationSetup, LineStatus
+
+    def _safe_int(v, key):
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return None
 
     by_line = {}
     for r in setup_rows:
-        by_line.setdefault(r["line_idx"], []).append(r)
+        line_idx = r.get("line_idx")
+        if line_idx is None:
+            continue
+        by_line.setdefault(line_idx, []).append(r)
 
-    lines = []
-    for r in sorted(line_rows, key=lambda x: x["line_idx"]):
+    lines, vrs = [], []
+    for r in sorted(line_rows, key=lambda x: x.get("line_idx", -1)):
+        line_idx = _safe_int(r.get("line_idx"), "line_idx")
+        if line_idx is None:
+            continue
         setups = []
-        for s in sorted(by_line.get(r["line_idx"], []),
-                        key=lambda x: x["setup_number"]):
+        setup_list = by_line.get(line_idx, [])
+        for s in sorted(setup_list, key=lambda x: x.get("setup_number", 0)):
+            setup_num = _safe_int(s.get("setup_number"), "setup_number")
+            if setup_num is None:
+                continue
+            rdgs = [_finite(s.get(k)) for k in ("backsight_reading", "foresight_reading")]
+            dists = [_finite(s.get(k)) for k in ("distance_back", "distance_fore")]
+            if any(x is None for x in rdgs + dists):
+                continue  # Skip malformed setup
             setups.append(StationSetup(
                 setup_number=s["setup_number"],
                 from_point=s["from_point"],
@@ -139,40 +220,60 @@ def rows_to_lines(line_rows, setup_rows):
                 cumulative_height=s["cumulative_height"],
                 is_used=bool(s["is_used"]),
             ))
-        date = r["date"]
+        fn = r.get("filename")
+        if not isinstance(fn, str) or not fn.strip():
+            continue  # Require filename
+        sp = r.get("start_point")
+        ep = r.get("end_point")
+        if not (isinstance(sp, (str, type(None))) and isinstance(ep, (str, type(None)))):
+            continue
+        date = r.get("date")
         if date:
             try:
-                date = datetime.fromisoformat(date)
-            except ValueError:
-                pass
+                date = datetime.fromisoformat(str(date))
+            except (ValueError, TypeError):
+                date = None
         try:
-            status = LineStatus(r["status"])
-        except ValueError:
+            status = LineStatus(r.get("status", "valid"))
+        except (ValueError, KeyError):
             status = LineStatus.VALID
+        vr_text = r.get("validation_errors")
         try:
-            errors = json.loads(r["validation_errors"] or "[]")
-        except ValueError:
+            errors = (json.loads(vr_text) if isinstance(vr_text, str)
+                      else (vr_text if isinstance(vr_text, list) else []))
+            errors = [str(e) for e in errors]
+        except (ValueError, TypeError):
             errors = []
         ln = LevelingLine(
-            filename=r["filename"],
-            start_point=r["start_point"],
-            end_point=r["end_point"],
+            filename=fn.strip(),
+            start_point=sp or "",
+            end_point=ep or "",
             setups=setups,
-            method=r["method"] or "BF",
-            date=date or None,
-            instrument_id=r["instrument_id"],
-            total_distance=r["total_distance"] or 0.0,
-            total_height_diff=r["total_height_diff"] or 0.0,
-            misclosure=r["misclosure"],
+            method=str(r.get("method") or "BF"),
+            date=date,
+            instrument_id=r.get("instrument_id") or None,
+            total_distance=_finite(r.get("total_distance")) or 0.0,
+            total_height_diff=_finite(r.get("total_height_diff")) or 0.0,
+            misclosure=_finite(r.get("misclosure")),
             status=status,
             validation_errors=errors,
-            is_used=bool(r["is_used"]),
-            original_direction=r["original_direction"] or "BF",
-            manager_override=bool(r["manager_override"]),
+            is_used=bool(r.get("is_used", 1)),
+            original_direction=str(r.get("original_direction") or "BF"),
+            manager_override=bool(r.get("manager_override")),
         )
-        ln.source_path = r["source_path"]
+        ln.source_path = r.get("source_path")
         lines.append(ln)
-    return lines
+        vr = None
+        raw = r.get("validation")
+        if raw:
+            try:
+                vr = validation_from_dict(json.loads(raw))
+            except (TypeError, ValueError):
+                vr = None
+        vrs.append(vr)
+    if lines and all(v is not None for v in vrs):
+        return lines, list(zip(lines, vrs))
+    return lines, None
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +329,9 @@ def _write_table(conn, name, cols, rows):
     )
 
 
-def write_attribute_tables(path, lines, meta):
+def write_attribute_tables(path, lines, meta, val_results=None):
     """(Re)write lv_lines / lv_setups / lv_meta inside the GeoPackage."""
-    line_rows, setup_rows = lines_to_rows(lines)
+    line_rows, setup_rows = lines_to_rows(lines, val_results)
     meta = dict(meta or {})
     meta["schema_version"] = SCHEMA_VERSION
     meta_rows = [{"key": k, "value": json.dumps(v, ensure_ascii=False)}
@@ -265,6 +366,15 @@ def has_project_tables(path):
 
 def read_attribute_tables(path):
     """Return (lines, meta) rebuilt from the GeoPackage attribute tables."""
+    lines, _vrs, meta = read_project_tables(path)
+    return lines, meta
+
+
+def read_project_tables(path):
+    """Return (lines, val_results or None, meta) from the GeoPackage tables.
+
+    *meta* is returned raw; pass it through sanitize_meta() before use.
+    """
     conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
@@ -278,7 +388,113 @@ def read_attribute_tables(path):
                 meta[r["key"]] = r["value"]
     finally:
         conn.close()
-    return rows_to_lines(line_rows, setup_rows), meta
+    lines, vrs = rows_to_project(line_rows, setup_rows)
+    return lines, vrs, meta
+
+
+# ---------------------------------------------------------------------------
+# lv_meta sanitising (a GeoPackage received from someone else is untrusted)
+# ---------------------------------------------------------------------------
+
+CLASSES = ("H1", "H2", "H3", "H4", "H5", "H6")
+RECORD_KEYS = ("ot_nekuda", "mispar_nekuda", "name", "gova_ort", "shem_darga_gova",
+               "taarih_gova_ort", "ot_nekuda_kfula", "mispar_nekuda_kfula",
+               "x", "y", "kfar_aher_name", "objectid", "hearot")
+_RECORD_FLOAT = {"gova_ort", "x", "y"}
+_RECORD_INT = {"mispar_nekuda", "mispar_nekuda_kfula", "objectid"}
+
+
+def _finite(v):
+    import math
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    return v if math.isfinite(v) else None
+
+
+def sanitize_record(d):
+    """Keep only persistent BenchmarkRecord keys with sane types (else None)."""
+    if not isinstance(d, dict):
+        return None
+    out = {}
+    for k in RECORD_KEYS:
+        v = d.get(k)
+        if k in _RECORD_FLOAT:
+            v = _finite(v)
+        elif k in _RECORD_INT:
+            v = v if isinstance(v, int) and not isinstance(v, bool) else None
+        elif v is not None and not isinstance(v, str):
+            v = None
+        out[k] = v
+    return out
+
+
+def _str_map(v):
+    if not isinstance(v, dict):
+        return {}
+    return {k: x for k, x in v.items()
+            if isinstance(k, str) and k.strip() and isinstance(x, str) and x.strip()}
+
+
+def sanitize_meta(meta):
+    """Type-check the lv_meta values read from a GeoPackage.
+
+    Returns a dict that always holds every key below with the right type:
+    leveling_class/class (H1..H6), point_overrides {str: dict},
+    point_origin/pid_remap {str: str}, dat_files [str],
+    resolved_points {str: record-dict | None}, output_dir str, schema_version int.
+    """
+    meta = meta if isinstance(meta, dict) else {}
+    out = {}
+    cls = meta.get("leveling_class", meta.get("class"))
+    out["leveling_class"] = cls if cls in CLASSES else "H3"
+    out["class"] = out["leveling_class"]
+
+    overrides = {}
+    ov = meta.get("point_overrides")
+    if isinstance(ov, dict):
+        for k, v in ov.items():
+            if not (isinstance(k, str) and k.strip() and isinstance(v, dict)):
+                continue
+            if v.get("mode") is not None and not isinstance(v.get("mode"), str):
+                continue
+            v = dict(v)
+            if "record" in v:
+                rec = sanitize_record(v.get("record"))
+                if rec is None:
+                    v.pop("record")
+                else:
+                    v["record"] = rec
+            if v.get("name") is not None and not isinstance(v.get("name"), str):
+                v.pop("name")
+            overrides[k] = v
+    out["point_overrides"] = overrides
+    out["point_origin"] = _str_map(meta.get("point_origin"))
+    out["pid_remap"] = _str_map(meta.get("pid_remap"))
+
+    files = meta.get("dat_files")
+    out["dat_files"] = ([f for f in files if isinstance(f, str)]
+                        if isinstance(files, list) else [])
+
+    resolved = {}
+    rp = meta.get("resolved_points")
+    if isinstance(rp, dict):
+        for k, v in rp.items():
+            if not (isinstance(k, str) and k.strip()):
+                continue
+            if v is None:
+                resolved[k] = None
+            else:
+                rec = sanitize_record(v)
+                if rec is not None:
+                    resolved[k] = rec
+    out["resolved_points"] = resolved
+
+    od = meta.get("output_dir")
+    out["output_dir"] = od if isinstance(od, str) else ""
+    sv = meta.get("schema_version")
+    out["schema_version"] = sv if isinstance(sv, int) and not isinstance(sv, bool) else 1
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +605,7 @@ def write_vector_layer(layer, path, layer_name, overwrite_file):
         raise IOError(f"GeoPackage write failed for '{layer_name}': {msg}")
 
 
-def write_project_gpkg(path, lines_layer, points_layer, lines, meta):
+def write_project_gpkg(path, lines_layer, points_layer, lines, meta, val_results=None):
     """Write the full project GeoPackage at *path* (overwrites the file).
 
     Writes to a sibling temp file first and then moves it into place, so a
@@ -415,7 +631,7 @@ def write_project_gpkg(path, lines_layer, points_layer, lines, meta):
             first = False
         if points_layer is not None:
             write_vector_layer(points_layer, tmp, POINTS_LAYER, overwrite_file=first)
-        write_attribute_tables(tmp, lines, meta)
+        write_attribute_tables(tmp, lines, meta, val_results)
         os.replace(tmp, path)
     except BaseException:
         _cleanup()

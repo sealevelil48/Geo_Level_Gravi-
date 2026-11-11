@@ -52,6 +52,8 @@ class GeoLevelDockWidget(QDockWidget):
     override_changed      = pyqtSignal(str, str)  # (filename, new_status_value)
     # Point Settings: list of point IDs to edit ([] = every point in the project)
     edit_points_requested = pyqtSignal(list)
+    # A line object was edited in place (e.g. direction toggled) -> autosave
+    line_modified         = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__("Geo Level Gravi", parent)
@@ -566,6 +568,7 @@ class GeoLevelDockWidget(QDockWidget):
         self.populate_line_details(line)
         self._refresh_val_table()
         self.log("Toggled direction: " + line.filename)
+        self.line_modified.emit(idx)
 
     # ------------------------------------------------------------------ #
     # Helpers — label text and list-item colour

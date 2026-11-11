@@ -22,7 +22,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "GeoLevelQGIS"))
 
 import geo_level_gpkg as gp  # noqa: E402
-from core_logic.config.models import LevelingLine, StationSetup, LineStatus  # noqa: E402
+from core_logic.config.models import (  # noqa: E402
+    LevelingLine, StationSetup, LineStatus, ValidationResult)
 
 FAILS = []
 
@@ -103,6 +104,103 @@ def test_tables(tmpdir):
     check(len(back) == 1, "old rows removed")
     check(back[0].status == LineStatus.INVALID_ENDPOINT and not back[0].manager_override,
           "edited status/override persisted")
+
+
+def make_vrs(lines):
+    v1 = ValidationResult(is_valid=False)
+    v1.add_error("סגירה חורגת מהסבולת")
+    v1.add_warning("only 2 setups")
+    v1.tolerance_valid = False
+    v1.naming_valid = False
+    v2 = ValidationResult(is_valid=True)
+    v2.data_complete = False
+    return [(lines[0], v1), (lines[1], v2)]
+
+
+def test_validation_and_meta(tmpdir):
+    print("[2b] validation results + GeoPackage-first meta")
+    lines = make_lines()
+    vrs = make_vrs(lines)
+    path = os.path.join(tmpdir, "v2.gpkg")
+    meta = {
+        "leveling_class": "H4", "class": "H4",
+        "dat_files": [r"C:\survey\day1\L101.DAT", r"C:\survey\ב\L102.DAT"],
+        "pid_remap": {"2599B": "2599/ב", "250A": "250/A"},
+        "point_origin": {"2599/ב": "2599B"},
+        "point_overrides": {"2599B": {"mode": "use_selected",
+                                      "record": {"name": "2599/ב", "x": 200000.5,
+                                                 "y": 600000.25, "gova_ort": 12.345,
+                                                 "objectid": 77, "evil": "<script>"}}},
+        "resolved_points": {"2599/ב": {"name": "2599/ב", "x": 200000.5, "y": 600000.25,
+                                       "gova_ort": 12.345, "objectid": 77},
+                            "PKT1": None},
+    }
+    gp.write_attribute_tables(path, lines, meta, vrs)
+    back, back_vrs, raw = gp.read_project_tables(path)
+    check(back_vrs is not None and len(back_vrs) == 2, "validation results read back")
+    if back_vrs:
+        for i, ((la, va), (lb, vb)) in enumerate(zip(vrs, back_vrs)):
+            check(lb is back[i] and vars(va) == vars(vb),
+                  f"ValidationResult for {la.filename} identical and paired")
+    m = gp.sanitize_meta(raw)
+    check(m["leveling_class"] == "H4" and m["class"] == "H4", "leveling_class")
+    check(m["dat_files"] == meta["dat_files"], "dat_files (Hebrew path)")
+    check(m["pid_remap"] == meta["pid_remap"], "pid_remap")
+    check(m["point_origin"] == meta["point_origin"], "point_origin")
+    rp = m["resolved_points"]
+    check(rp.get("PKT1", "missing") is None, "estimated point kept as None")
+    check(rp.get("2599/ב", {}).get("x") == 200000.5 and rp["2599/ב"].get("objectid") == 77,
+          "resolved record round-trip")
+    rec = m["point_overrides"]["2599B"]["record"]
+    check("evil" not in rec and rec["name"] == "2599/ב", "override record keys filtered")
+    check(m["schema_version"] == gp.SCHEMA_VERSION == 2, "schema_version 2")
+
+    # Stale val_results (other line objects) store nothing -> None on read
+    gp.write_attribute_tables(path, lines, meta, make_vrs(make_lines()))
+    _, none_vrs, _ = gp.read_project_tables(path)
+    check(none_vrs is None, "validation from other line objects not stored")
+
+    print("[2c] schema-1 GeoPackage still loads")
+    old = os.path.join(tmpdir, "v1.gpkg")
+    gp.write_attribute_tables(old, lines, {"class": "H2"}, vrs)
+    conn = sqlite3.connect(old)
+    with conn:
+        cols = [c for c, _ in gp._LINE_COLS if c not in ("validation", "manager_override",
+                                                          "original_direction")]
+        conn.execute("CREATE TABLE t AS SELECT fid, " + ", ".join(cols) + " FROM lv_lines")
+        conn.execute("DROP TABLE lv_lines")
+        conn.execute("ALTER TABLE t RENAME TO lv_lines")
+        conn.execute("UPDATE lv_meta SET value='1' WHERE key='schema_version'")
+    conn.close()
+    back1, vrs1, raw1 = gp.read_project_tables(old)
+    m1 = gp.sanitize_meta(raw1)
+    check(len(back1) == 2 and vrs1 is None, "v1 file: lines read, no validation")
+    check(back1[0].status == LineStatus.VALID_BY_MANAGER, "v1 file: status kept")
+    check(m1["leveling_class"] == "H2" and m1["schema_version"] == 1
+          and m1["resolved_points"] == {} and m1["dat_files"] == [], "v1 meta defaults")
+
+    print("[2d] sanitize_meta rejects junk from untrusted files")
+    junk = {
+        "leveling_class": "H9; DROP", "point_overrides": {"a": "str", "": {"mode": "x"},
+                                                          "b": {"mode": 5},
+                                                          "c": {"mode": "rename", "name": 3}},
+        "point_origin": {"x": 1, "y": "Y"}, "pid_remap": ["not", "a", "dict"],
+        "dat_files": "C:\\x.dat",
+        "resolved_points": {"p": {"x": float("nan"), "y": "600000", "name": 7},
+                            "q": "bad", "": None},
+        "output_dir": 12, "schema_version": True,
+    }
+    j = gp.sanitize_meta(junk)
+    check(j["leveling_class"] == "H3", "bad class -> H3")
+    check(list(j["point_overrides"]) == ["c"] and "name" not in j["point_overrides"]["c"],
+          "bad overrides dropped")
+    check(j["point_origin"] == {"y": "Y"} and j["pid_remap"] == {}, "bad maps dropped")
+    check(j["dat_files"] == [] and j["output_dir"] == "" and j["schema_version"] == 1,
+          "bad scalars defaulted")
+    p = j["resolved_points"].get("p") or {}
+    check(set(j["resolved_points"]) == {"p"} and p.get("x") is None and p.get("y") is None
+          and p.get("name") is None, "NaN / str coords and bad entries dropped")
+    check(gp.sanitize_meta("nope")["leveling_class"] == "H3", "non-dict meta handled")
 
 
 def test_spatial(tmpdir):
@@ -189,6 +287,13 @@ def test_spatial(tmpdir):
         back, meta = gp.read_attribute_tables(path)
         check(len(back) == 1 and meta.get("class") == "H4",
               "in-place table rewrite while layer open")
+        # Autosave path: validation results written in place while open
+        gp.write_attribute_tables(path, lines, {"leveling_class": "H5"}, make_vrs(lines))
+        back, vrs, raw = gp.read_project_tables(path)
+        check(len(back) == 2 and vrs is not None
+              and gp.sanitize_meta(raw)["leveling_class"] == "H5",
+              "in-place autosave with validation while layer open")
+        check(gl.featureCount() == 2, "spatial layer intact after autosave")
         del gl, gpt
     finally:
         app.exitQgis()
@@ -197,6 +302,7 @@ def test_spatial(tmpdir):
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_tables(d)
+        test_validation_and_meta(d)
         test_spatial(d)
     print()
     if FAILS:
