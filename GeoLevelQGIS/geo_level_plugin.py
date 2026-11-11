@@ -1061,17 +1061,15 @@ class GeoLevelPlugin:
         except Exception:
             pass
         self._remove_result_layers()
-        # Preserve prior _glp_path in case the load fails
-        old_glp_path = self._glp_path
+        # Clear _glp_path before attempting load (no prior state to restore)
         self._glp_path = ""
         try:
             self._process_files(resolved_files, cls, output_dir)
-            # Load succeeded: now commit the .glp path
-            self._glp_path = os.path.abspath(path)
         except Exception:
-            # Restore prior state on failure
-            self._glp_path = old_glp_path
+            # Load failed: _glp_path remains empty (safe state)
             raise
+        # Load succeeded only after _process_files returns: now commit the .glp path
+        self._glp_path = os.path.abspath(path)
 
     # ------------------------------------------------------------------
     # GeoPackage persistence
