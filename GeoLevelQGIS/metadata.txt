@@ -1,0 +1,11 @@
+[general]
+name=Geo Level Gravi
+qgisMinimumVersion=3.0
+description=Geodetic leveling calculations compliant with Israeli Survey Regulations (Directive ג2, 2021)
+version=1.1
+author=sealevelil48
+email=
+about=Automates geodetic leveling calculations, validation (H1-H6), LSA network adjustment, and GeoJSON export for QGIS.
+tracker=https://github.com/sealevelil48/Geo_Level_Gravi-/issues
+repository=https://github.com/sealevelil48/Geo_Level_Gravi-
+hasProcessingProvider=no

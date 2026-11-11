@@ -195,9 +195,9 @@ class GeoJSONExporter:
                         'coordinates': [coords[0], coords[1], coords[2]]
                     },
                     'properties': {
-                        'point_id': point_id,
-                        'height': coords[2],
-                        'is_benchmark': not point_id.isdigit()
+                        'point_id': str(point_id),
+                        'height': float(coords[2]) if coords[2] is not None else 0.0,
+                        'is_benchmark': not str(point_id).isdigit()
                     }
                 }
                 point_features.append(point_feature)

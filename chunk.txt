@@ -1,0 +1,12 @@
+oop(s):\n"]
+                for i, loop in enumerate(loops, 1):
+                    ok, mis_mm, tol_mm = loop.check_tolerance()
+                    path_str = " -> ".join(loop.points)
+                    mark = chr(0x2705) if ok else chr(0x274c)
+                    parts.append(
+                        f"  {i}. {path_str}
+"
+                        f"     Misclosure: {mis_mm:.2f} mm  |  "
+                        f"Tolerance: +/-{tol_mm:.2f} mm  {mark}"
+                    )}\n"
+                        f" 
