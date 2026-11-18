@@ -1,26 +1,38 @@
 """
 Least Squares Adjustment Module
 
-Implements least squares adjustment for leveling networks.
+Implements least squares adjustment for leveling networks using the 3-vector formulation
+with proper directional convention for fixed point contributions.
 
 Provides two adjustment methods:
 1. Parametric (Observation Equation) Method: V = A*X - L
 2. Conditional (Condition Equation) Method: Bv + w = 0
 
-Parametric Method (Ax+L):
-    V = A*X - L
+Parametric Method with 3-Vector Formulation (Ax+L):
+
+    Three vectors:
+        Lb = raw measured height differences (constant)
+        L0 = fixed point contributions with directional convention (constant)
+        L = Lb - L0 (reduced observations, constant)
 
     Where:
-        V = residuals vector
-        A = design matrix (coefficients)
-        X = parameter vector (unknown heights)
-        L = observation vector (measured height differences)
+        L0[i] directional convention:
+            - If FROM is fixed, TO is unknown: L0[i] = -H_fixed_from
+            - If TO is fixed, FROM is unknown: L0[i] = +H_fixed_to
+            - If both are fixed: L0[i] = H_to_fixed - H_from_fixed
+            - If neither is fixed: L0[i] = 0
+
+    Residuals:
+        V = A*X - L
 
     Normal equations:
         N*X = U
         where N = A.T @ P @ A
               U = A.T @ P @ L
               P = weight matrix (diagonal, weights = 1/distance)
+              X = corrections to approximate heights
+
+    Key: L is computed ONCE before iteration and remains constant.
 
 Conditional Method (Bv+W):
     Bv + w = 0
@@ -171,48 +183,85 @@ class LeastSquaresAdjuster:
             if pid not in current_heights:
                 current_heights[pid] = mean_fixed
         
-        # Iterative adjustment
+        # ========================================================================
+        # STEP 3: Construct 3-Vector Formulation: L = Lb - L0
+        # ========================================================================
+        # Lb: Raw measured height differences (constant across iterations)
+        Lb = np.zeros(n_obs)
+
+        # L0: Fixed point contributions (constant across iterations)
+        # Direction convention:
+        #   - If FROM is fixed, TO is unknown: L0[i] = -H_fixed_from
+        #   - If TO is fixed, FROM is unknown: L0[i] = +H_fixed_to
+        #   - If both are fixed: L0[i] = H_to_fixed - H_from_fixed
+        #   - If neither is fixed: L0[i] = 0
+        L0 = np.zeros(n_obs)
+
+        # Build weight matrix P (diagonal, weight = 1/distance in km)
+        # Note: P is also constant across iterations
+        P = np.zeros((n_obs, n_obs))
+
+        for i, obs in enumerate(observations):
+            from_pt = obs.from_point
+            to_pt = obs.to_point
+
+            # 1. Extract raw measured height difference (Lb)
+            Lb[i] = obs.height_diff
+
+            # 2. Calculate L0 (fixed point contributions) with direction convention
+            from_is_fixed = from_pt in fixed_ids
+            to_is_fixed = to_pt in fixed_ids
+
+            if from_is_fixed and to_is_fixed:
+                # Both fixed: L0 = H_to_fixed - H_from_fixed
+                L0[i] = fixed_points[to_pt] - fixed_points[from_pt]
+            elif from_is_fixed and not to_is_fixed:
+                # FROM is fixed, TO is unknown: L0 = -H_from_fixed (negated)
+                L0[i] = -fixed_points[from_pt]
+            elif not from_is_fixed and to_is_fixed:
+                # TO is fixed, FROM is unknown: L0 = +H_to_fixed (positive)
+                L0[i] = fixed_points[to_pt]
+            else:
+                # Neither is fixed: L0 = 0
+                L0[i] = 0.0
+
+            # Weight (inverse of distance in km)
+            dist_km = obs.distance / 1000.0
+            if dist_km > 0:
+                P[i, i] = 1.0 / dist_km
+            else:
+                P[i, i] = 1.0
+
+        # 3. Compute reduced observations L = Lb - L0 ONCE (constant across iterations)
+        L = Lb - L0
+
+        # Build design matrix A (constant across iterations)
+        # A is (n_obs x n_unknowns) — one observation per row, one unknown per column
+        A = np.zeros((n_obs, n_unknowns))
+
+        for i, obs in enumerate(observations):
+            from_pt = obs.from_point
+            to_pt = obs.to_point
+
+            # Design matrix coefficients
+            # dH = H_to - H_from
+            # Partial derivative w.r.t. H_to = +1
+            # Partial derivative w.r.t. H_from = -1
+
+            if to_pt in point_index:
+                A[i, point_index[to_pt]] = 1.0
+
+            if from_pt in point_index:
+                A[i, point_index[from_pt]] = -1.0
+
+        # ========================================================================
+        # STEP 4: Iterative adjustment with CONSTANT L vector
+        # ========================================================================
+        # Since L = Lb - L0 is constant and does NOT depend on current_heights,
+        # we do NOT need to recompute L in each iteration. The residuals V = A@X - L
+        # will converge as X approaches its optimal value.
+
         for iteration in range(1, self.max_iterations + 1):
-            # Build design matrix A (n_obs x n_unknowns)
-            A = np.zeros((n_obs, n_unknowns))
-            
-            # Build observation vector L (observed - computed)
-            L = np.zeros(n_obs)
-            
-            # Build weight matrix P (diagonal, weight = 1/distance in km)
-            P = np.zeros((n_obs, n_obs))
-            
-            for i, obs in enumerate(observations):
-                from_pt = obs.from_point
-                to_pt = obs.to_point
-                
-                # Observed height difference
-                observed_dh = obs.height_diff
-                
-                # Computed height difference
-                computed_dh = current_heights.get(to_pt, 0) - current_heights.get(from_pt, 0)
-                
-                # Misclosure
-                L[i] = observed_dh - computed_dh
-                
-                # Design matrix coefficients
-                # dH = H_to - H_from
-                # Partial derivative w.r.t. H_to = +1
-                # Partial derivative w.r.t. H_from = -1
-                
-                if to_pt in point_index:
-                    A[i, point_index[to_pt]] = 1.0
-                
-                if from_pt in point_index:
-                    A[i, point_index[from_pt]] = -1.0
-                
-                # Weight (inverse of distance in km)
-                dist_km = obs.distance / 1000.0
-                if dist_km > 0:
-                    P[i, i] = 1.0 / dist_km
-                else:
-                    P[i, i] = 1.0
-            
             # Use AdjustmentComputations for solving with stability checking
             try:
                 adj_result = self.adj_comp.run_linear_adjustment(
@@ -231,20 +280,22 @@ class LeastSquaresAdjuster:
             except Exception as e:
                 logger.error(f"Error solving normal equations: {e}")
                 raise
-            
+
             # Apply corrections
             max_correction = 0.0
             for j, pid in enumerate(unknown_list):
                 correction = dX[j]
                 current_heights[pid] += correction
                 max_correction = max(max_correction, abs(correction))
-            
+
             # Check convergence
             if max_correction < self.tolerance:
                 logger.info(f"Converged after {iteration} iterations")
                 break
-        
-        # Calculate residuals
+
+        # Calculate residuals: v = A @ X - L
+        # This follows the standard parametric adjustment formula where L is
+        # the reduced observation vector (L = Lb - L0)
         V = A @ dX - L
         
         # Calculate M.S.E. of unit weight
