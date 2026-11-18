@@ -1,0 +1,9 @@
+# REZ Summary File - test_project
+# Generated: 2026-11-18T12:00:00
+#==============================================================================
+
+From        To          Height Diff    Distance   Setups  Status        Source File
+--------------------------------------------
+5793MPI     5792MPI         0.12345        100.00        5     valid         test.DAT
+5792MPI     5791MPI        -0.08765         85.50        4     valid         test.DAT
+5791MPI     5790MPI         0.05432         90.25        3     valid         test.DAT

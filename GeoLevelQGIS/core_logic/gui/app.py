@@ -3179,9 +3179,11 @@ Special Requirements:"""
     def _open_files(self):
         """Open file dialog to select files."""
         filetypes = [
-            ("All supported", "*.DAT *.dat *.RAW *.raw *.GSI *.gsi"),
+            ("All supported", "*.DAT *.dat *.RAW *.raw *.GSI *.gsi *.rez *.REZ *.FA0 *.fa0"),
             ("Trimble DAT", "*.DAT *.dat"),
             ("Leica RAW", "*.RAW *.raw"),
+            ("Rez Summary", "*.rez *.REZ"),
+            ("FA0 Input", "*.FA0 *.fa0"),
             ("All files", "*.*")
         ]
         
@@ -3196,11 +3198,13 @@ Special Requirements:"""
     def _open_folder(self):
         """Open folder and load all supported files."""
         folder = filedialog.askdirectory(title="Select folder with leveling files")
-        
+
         if folder:
             folder_path = Path(folder)
             files = list(folder_path.glob("*.DAT")) + list(folder_path.glob("*.dat"))
             files += list(folder_path.glob("*.RAW")) + list(folder_path.glob("*.raw"))
+            files += list(folder_path.glob("*.rez")) + list(folder_path.glob("*.REZ"))
+            files += list(folder_path.glob("*.FA0")) + list(folder_path.glob("*.fa0"))
             
             if files:
                 self._load_files([str(f) for f in files])

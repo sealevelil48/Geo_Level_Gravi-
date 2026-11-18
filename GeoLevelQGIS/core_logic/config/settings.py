@@ -18,6 +18,8 @@ class FileFormat(Enum):
     """Supported file formats."""
     TRIMBLE_DAT = "trimble_dat"
     LEICA_GSI = "leica_gsi"
+    REZ = "rez"
+    FA0 = "fa0"
     UNKNOWN = "unknown"
 
 

@@ -540,7 +540,7 @@ class GeoLevelDockWidget(QDockWidget):
     def _on_add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select Measurement Files", "",
-            "Geodetic Files (*.DAT *.dat *.RAW *.raw *.GSI *.gsi);;All Files (*)"
+            "Geodetic Files (*.DAT *.dat *.RAW *.raw *.GSI *.gsi *.rez *.REZ *.FA0 *.fa0);;All Files (*)"
         )
         if files:
             cls = self.class_combo.currentText()

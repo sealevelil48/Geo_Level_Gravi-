@@ -163,34 +163,48 @@ def detect_file_format(filepath: str) -> FileFormat:
         return FileFormat.TRIMBLE_DAT
     if ext in ['.raw', '.gsi', '.RAW', '.GSI']:
         return FileFormat.LEICA_GSI
-    
+    if ext in ['.rez', '.REZ']:
+        return FileFormat.REZ
+    if ext in ['.fa0', '.FA0']:
+        return FileFormat.FA0
+
     # Check filename patterns
     if '_dat' in filename or 'dat' in filename:
         return FileFormat.TRIMBLE_DAT
     if '_raw' in filename or 'raw' in filename:
         return FileFormat.LEICA_GSI
-    
+    if '_rez' in filename or 'rez' in filename:
+        return FileFormat.REZ
+    if '_fa0' in filename or 'fa0' in filename:
+        return FileFormat.FA0
+
     return FileFormat.UNKNOWN
 
 
 def create_parser(filepath: str) -> Optional[BaseParser]:
     """
     Factory function to create appropriate parser for a file.
-    
+
     Args:
         filepath: Path to the file
-        
+
     Returns:
         Appropriate parser instance or None if format not recognized
     """
     file_format = detect_file_format(filepath)
-    
+
     if file_format == FileFormat.TRIMBLE_DAT:
         from core_logic.parsers.trimble_parser import TrimbleParser
         return TrimbleParser()
     elif file_format == FileFormat.LEICA_GSI:
         from core_logic.parsers.leica_parser import LeicaParser
         return LeicaParser()
+    elif file_format == FileFormat.REZ:
+        from core_logic.parsers.rez_parser import RezParser
+        return RezParser()
+    elif file_format == FileFormat.FA0:
+        from core_logic.parsers.fa0_parser import FA0Parser
+        return FA0Parser()
     else:
         logger.warning(f"Unknown file format for {filepath}")
         return None
