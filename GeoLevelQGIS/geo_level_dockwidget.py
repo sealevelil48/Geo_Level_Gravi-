@@ -48,7 +48,6 @@ class GeoLevelDockWidget(QDockWidget):
     files_added           = pyqtSignal(list, str, str)
     double_runs_requested = pyqtSignal()
     loops_requested       = pyqtSignal()
-    enhanced_lsa_requested = pyqtSignal()
     override_changed      = pyqtSignal(str, str)  # (filename, new_status_value)
     # Point Settings: list of point IDs to edit ([] = every point in the project)
     edit_points_requested = pyqtSignal(list)
@@ -177,11 +176,6 @@ class GeoLevelDockWidget(QDockWidget):
         self.btn_adjust_line.clicked.connect(self._on_adjust_line)
         btn_row.addWidget(self.btn_adjust_line)
 
-        self.btn_lsa = QPushButton("LSA -- Full Network Adjustment")
-        self.btn_lsa.setEnabled(False)
-        self.btn_lsa.clicked.connect(self.lsa_requested.emit)
-        btn_row.addWidget(self.btn_lsa)
-
         self.btn_edit_points = QPushButton("Edit Points… / הגדרות נקודה")
         self.btn_edit_points.setToolTip(
             "Point Settings: re-select the database benchmark for any point "
@@ -265,9 +259,6 @@ class GeoLevelDockWidget(QDockWidget):
         btn_lsa.clicked.connect(self.lsa_requested.emit)
         btn_row.addWidget(btn_lsa)
 
-        btn_elsa = QPushButton("Enhanced LSA")
-        btn_elsa.clicked.connect(self.enhanced_lsa_requested.emit)
-        btn_row.addWidget(btn_elsa)
         vbox.addLayout(btn_row)
 
         # Results sub-tabs

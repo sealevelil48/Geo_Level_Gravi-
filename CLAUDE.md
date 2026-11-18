@@ -72,7 +72,8 @@ There is no test runner framework (pytest/unittest CLI); tests are run as standa
 | `geo_level_dockwidget.py` | `GeoLevelDockWidget` — main dock panel (list + 3 tabs) |
 | `geo_level_dialog.py` | Legacy popup `QDialog` for file/class/output selection |
 | `geo_level_settings_dialog.py` | `GeoLevelSettingsDialog` — editable H1-H6 parameters table |
-| `geo_level_lsa_dialog.py` | `GeoLevelLSADialog` — LSA results viewer with PDF export button |
+| `geo_level_enhanced_lsa_dialog.py` | `GeoLevelEnhancedLSADialog` — Enhanced LSA results viewer with dual methods (Parametric/Conditional) |
+| `geo_level_lsa_dialog.py` | Legacy support file (kept for compatibility) |
 | `geo_level_reporter.py` | `GeoLevelReporter` — PDF report generator via QPrinter |
 | `core_logic/` | Full copy of the geodetic engine (parsers, validators, engine, gis) |
 
@@ -91,7 +92,7 @@ State: `_lines: List[LevelingLine]`, `_val_results`, `_layer: QgsVectorLayer`, `
 | `_prepare_layer_signals(layer)` | Connects `selectionChanged` on "Geodetic Results" layers |
 | `_sync_dock_to_map(layer)` | Map feature selection → dock list highlight via `feat["filename"]` |
 | `_zoom_to_line_feature(idx)` | Filters line geometries, scales bbox 1.2×, sets canvas extent |
-| `_run_lsa()` | Input dialog for fixed points → `LeastSquaresAdjuster` → `GeoLevelLSADialog` → `_apply_lsa_to_layer` |
+| `_run_lsa()` | Launch Enhanced LSA dialog (`GeoLevelEnhancedLSADialog`) with support for Parametric and Conditional adjustment methods → `_apply_lsa_to_layer` |
 | `_apply_lsa_to_layer(result)` | Adds `adj_height` QgsField to point features, populates from `result.adjusted_heights` |
 | `_save_project()` / `_load_project()` | Serialise/deserialise `.glp` JSON in `GeoLevelQGIS/projects/` |
 | `_show_class_settings()` | Opens `GeoLevelSettingsDialog`, re-runs validation after save |
@@ -107,25 +108,31 @@ Menu structure:
 ├── Analysis / ניתוח
 │   ├── Validate All Lines
 │   ├── Detect Loops / Double-Runs
-│   ├── Network Adjustment (LSA)…
-│   └── Adjust Selected Line
+│   ├── Line Adjustment…
+│   ├── Network Adjustment (LSA)…  [Enhanced LSA engine]
+│   └── Merge Line Segments…
 ├── Settings / הגדרות
 │   ├── Class Parameters…
-│   └── Encoding…
+│   ├── Encoding…
+│   ├── Point Exclusion…
+│   └── Database Connection…
 └── Help / עזרה
     └── About Geo Level Gravi
 ```
+
+**Note**: "Network Adjustment (LSA)" is now unified with the Enhanced LSA engine (supports both Parametric and Conditional adjustment methods). The legacy standard LSA implementation has been deprecated.
 
 ### `GeoLevelDockWidget` (`geo_level_dockwidget.py`)
 
 Left panel: `QListWidget` (colour-coded green/red by validation) + class combo + `+ Add Files` button.
 
-Right panel: `QTabWidget` with 3 tabs:
+Right panel: `QTabWidget` with 4 tabs:
 - **Line Details** — 6-col `QTableWidget`: #, From, To, Backsight (m), Foresight (m), Distance (m)
 - **Validation** — status label + error/warning `QTextEdit`
-- **Adjustment** — Adjust This Line + LSA buttons + result `QTextEdit`
+- **Analysis** — Double-Runs, Loops, and Network Adjustment (LSA) buttons
+- **Log** — read-only log messages
 
-Signals: `line_selected(int)`, `adjust_line_requested(int)`, `lsa_requested()`, `run_requested(list,str,str)`, `files_added(list,str,str)`
+Signals: `line_selected(int)`, `adjust_line_requested(int)`, `lsa_requested()`, `files_added(list,str,str)`, `double_runs_requested()`, `loops_requested()`
 
 Key methods: `load_lines(lines, val_results)`, `populate_line_details(line)`, `update_validation_tab(line)`, `show_adjustment_result(text)`, `select_line_by_filename(filename)`, `get_current_index()`, `get_selected_class()`
 
@@ -212,6 +219,7 @@ Reset to Defaults: calls `mgr.reset_to_defaults()` + `importlib.reload(israel_su
 - Live registry patching: `GeoLevelSettingsDialog` patches `CLASS_REGISTRY_BY_NAME` objects in-memory so validators immediately use new k values without QGIS restart.
 - Validation re-run after settings change: plugin re-runs `BatchValidator` and calls `dock.load_lines` to refresh dock list colours.
 - `select_line_by_filename` blocks signals during programmatic selection to avoid re-triggering zoom.
+- **Network Adjustment (LSA) Consolidation** (v1.1 November 2026): The legacy standard LSA implementation has been completely removed in favor of the unified Enhanced LSA engine (`GeoLevelEnhancedLSADialog`). All UI triggers (menu, dock buttons, signals) now route to a single `_run_lsa()` method that launches the Enhanced LSA dialog. The Enhanced LSA engine supports both Parametric (Ax+L) and Conditional (Bv+W) adjustment methods with automatic method selection, database integration, and comprehensive results display (adjusted heights, residuals, matrix diagnostics). Users no longer see separate "Network Adjustment (LSA)" and "Network Adjustment (Enhanced)" options — only the unified "Network Adjustment (LSA)" entry point, which opens the full-featured Enhanced LSA dialog.
 
 ---
 

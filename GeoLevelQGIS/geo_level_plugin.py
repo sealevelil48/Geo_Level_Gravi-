@@ -428,7 +428,6 @@ class GeoLevelPlugin:
         anal_menu.addSeparator()
         anal_menu.addAction("Line Adjustment...").triggered.connect(self._adjust_current_line)
         anal_menu.addAction("Network Adjustment (LSA)...").triggered.connect(self._run_lsa)
-        anal_menu.addAction("Network Adjustment (Enhanced)...").triggered.connect(self._run_enhanced_lsa)
         anal_menu.addSeparator()
         anal_menu.addAction("Merge Line Segments...").triggered.connect(self._open_merge_dialog)
 
@@ -488,7 +487,6 @@ class GeoLevelPlugin:
         self.dock.files_added.connect(self._process_files)
         self.dock.double_runs_requested.connect(self._detect_double_runs)
         self.dock.loops_requested.connect(self._detect_loops)
-        self.dock.enhanced_lsa_requested.connect(self._run_enhanced_lsa)
         self.dock.override_changed.connect(self._on_override_changed)
         self.dock.edit_points_requested.connect(self._edit_points)
         # GeoPackage-first: every in-place line edit is written straight to
@@ -2510,72 +2508,6 @@ class GeoLevelPlugin:
         canvas.setExtent(extent)
         canvas.refresh()
 
-    def _run_lsa(self):
-        if not self._lines:
-            QMessageBox.information(self.iface.mainWindow(), "LSA Adjustment",
-                                    "No lines loaded.")
-            return
-        try:
-            # ── Step 1: collect eligible lines (VALID or manager-overridden) ──
-            from core_logic.config.models import LineStatus
-            eligible_lines = [
-                ln for ln in self._lines
-                if getattr(ln, "is_used", True) and (
-                    ln.status == LineStatus.VALID
-                    or getattr(ln, "manager_override", False)
-                )
-            ]
-            if not eligible_lines:
-                QMessageBox.warning(self.iface.mainWindow(), "LSA Adjustment",
-                                    "No valid lines available for adjustment.\n"
-                                    "Use 'Force Valid (Manager Override)' on lines you wish to include.")
-                return
-
-            # ── Step 2: fixed-points table dialog (replaces bare QInputDialog) ──
-            input_dlg = GeoLevelLSAInputDialog(eligible_lines, self.iface.mainWindow())
-            if not input_dlg.exec_():
-                return
-            fixed_points = input_dlg.fixed_points
-            if not fixed_points:
-                return
-
-            from core_logic.engine.least_squares import LeastSquaresAdjuster
-            result = LeastSquaresAdjuster().adjust_from_lines(eligible_lines, fixed_points)
-
-            # ── Show results dialog ───────────────────────────────────
-            from geo_level_lsa_dialog import GeoLevelLSADialog
-            dlg = GeoLevelLSADialog(result, fixed_points, self.iface.mainWindow())
-            dlg.exec_()
-
-            # ── Update map layer with adj_height on point features ────
-            self._apply_lsa_to_layer(result)
-
-            # ── Summary in dock ───────────────────────────────────────
-            dof = max(0, len(result.residuals) - (
-                len(result.adjusted_heights) - len(fixed_points)
-            ))
-            summary = (
-                f"LSA complete — {result.iteration} iteration(s)\n"
-                f"σ₀² = {result.mse_unit_weight**2:.6f} m²  |  "
-                f"σ₀ = {result.mse_unit_weight*1000:.3f} mm  |  "
-                f"DoF = {dof}\n"
-                f"K = {result.k_coefficient:.4f}  |  "
-                f"Total dist = {result.total_distance_km:.3f} km\n\n"
-                "Adjusted Heights:\n"
-            )
-            for pid, h in sorted(result.adjusted_heights.items()):
-                sigma = result.mse_heights.get(pid, 0.0) * 1000
-                summary += f"  {pid:20s}  {h:.5f} m  ±{sigma:.3f} mm\n"
-            QgsMessageLog.logMessage(summary, "GeoLevelPlugin", level=Qgis.Info)
-            if self.dock:
-                self.dock.show_analysis_result(summary)
-                self.dock.log("LSA completed.")
-
-        except Exception as exc:
-            QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
-                                     level=Qgis.Critical)
-            QMessageBox.critical(self.iface.mainWindow(), "LSA Adjustment — Error", str(exc))
-
     def _apply_lsa_to_layer(self, result):
         """Add/update adj_height field on point features in the active layer."""
         if not self._layer or not self._layer.isValid():
@@ -2628,9 +2560,9 @@ class GeoLevelPlugin:
                                      level=Qgis.Critical)
             QMessageBox.critical(self.iface.mainWindow(), "Adjust Line -- Error", str(exc))
 
-    def _run_enhanced_lsa(self):
+    def _run_lsa(self):
         if not self._lines:
-            QMessageBox.information(self.iface.mainWindow(), "Enhanced LSA",
+            QMessageBox.information(self.iface.mainWindow(), "Network Adjustment (LSA)",
                                     "No lines loaded.")
             return
         try:
@@ -2644,7 +2576,7 @@ class GeoLevelPlugin:
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)
-            QMessageBox.critical(self.iface.mainWindow(), "Enhanced LSA -- Error", str(exc))
+            QMessageBox.critical(self.iface.mainWindow(), "Network Adjustment (LSA) -- Error", str(exc))
 
     def _open_merge_dialog(self):
         if not self._lines:
