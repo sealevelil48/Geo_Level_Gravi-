@@ -330,7 +330,6 @@ class GeoLevelDockWidget(QDockWidget):
             self.line_list.item(i).setForeground(self._list_item_color(i))
 
         if lines:
-            self.btn_lsa.setEnabled(True)
             self.line_list.setCurrentRow(0)
         self.btn_edit_points.setEnabled(bool(lines))
 
@@ -888,7 +887,6 @@ class GeoLevelDockWidget(QDockWidget):
         self.line_info_lbl.setText("No line selected")
         self.setup_table.setRowCount(0)
         self.btn_adjust_line.setEnabled(False)
-        self.btn_lsa.setEnabled(False)
         self.btn_edit_points.setEnabled(False)
 
         # Tab 1 — Validation

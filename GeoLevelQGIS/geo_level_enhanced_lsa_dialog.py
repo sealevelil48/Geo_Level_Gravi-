@@ -411,8 +411,10 @@ class GeoLevelEnhancedLSADialog(QDialog):
         for ln, vr in self._val_results:
             if ln is line:
                 return vr.is_valid
-        # Line not found in val_results — treat as valid (safety fallback)
-        return True
+        # Line not found in val_results — fail-closed (security: exclude by default)
+        import logging
+        logging.warning(f"Line {getattr(line, 'filename', '?')} not found in validation results; excluding from adjustment")
+        return False
 
     def _run_adjustment(self):
         fixed_points = self._collect_fixed_points()
