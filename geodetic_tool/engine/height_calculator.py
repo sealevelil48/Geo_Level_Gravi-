@@ -8,11 +8,8 @@ from pathlib import Path
 import numpy as np
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from ..config.models import LevelingLine, StationSetup, MeasurementSummary
-from ..config.settings import calculate_tolerance
+from geodetic_tool.config.models import LevelingLine, StationSetup, MeasurementSummary
+from geodetic_tool.config.settings import calculate_tolerance
 
 
 logger = logging.getLogger(__name__)
@@ -50,17 +47,17 @@ def calculate_line_totals(line: LevelingLine) -> Tuple[float, float]:
     total_height_diff = 0.0
     
     for setup in line.setups:
-        # Average distance for each setup
-        setup_dist = (setup.distance_back + setup.distance_fore) / 2
+        # Total distance per setup = backsight distance + foresight distance
+        setup_dist = (setup.distance_back + setup.distance_fore)
         total_distance += setup_dist
-        
+
         # Height difference
         if setup.height_diff is not None:
             total_height_diff += setup.height_diff
         elif setup.backsight_reading and setup.foresight_reading:
             dh = calculate_height_diff(setup.backsight_reading, setup.foresight_reading)
             total_height_diff += dh
-    
+
     return total_distance, total_height_diff
 
 
@@ -138,7 +135,7 @@ def distribute_misclosure(
             return [0.0] * n_setups
         
         for setup in line.setups:
-            setup_dist = (setup.distance_back + setup.distance_fore) / 2
+            setup_dist = (setup.distance_back + setup.distance_fore)
             proportion = setup_dist / total_distance
             correction = -misclosure * proportion
             corrections.append(correction)

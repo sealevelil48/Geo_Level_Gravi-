@@ -7,12 +7,9 @@ from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from ..config.models import LevelingLine, Benchmark, AdjustmentResult
-from ..config.settings import calculate_tolerance
-from .height_calculator import (
+from geodetic_tool.config.models import LevelingLine, Benchmark, AdjustmentResult
+from geodetic_tool.config.settings import calculate_tolerance
+from geodetic_tool.engine.height_calculator import (
     calculate_misclosure,
     distribute_misclosure,
     apply_corrections

@@ -1,525 +1,335 @@
 """
-Least Squares Adjustment Module
+Least Squares Adjustment of leveling networks.
 
-Implements least squares adjustment for leveling networks.
+Two equivalent methods are provided; for the same observations, weights and
+fixed points they give identical heights (tested in geodetic_tool/tests).
 
-Provides two adjustment methods:
-1. Parametric (Observation Equation) Method: V = A*X - L
-2. Conditional (Condition Equation) Method: Bv + w = 0
+1. Parametric (observation equations)      V = A X - L
+   ---------------------------------------------------
+   Lb : measured height differences (constant)
+   L0 : contribution of the fixed heights, by direction of measurement
+          FROM fixed, TO unknown : L0 = -H_from
+          TO fixed, FROM unknown : L0 = +H_to
+          both fixed             : L0 = H_to - H_from
+          neither                : L0 = 0
+   L  = Lb - L0                       (built once)
+   N  = A' P A,   U = A' P L,   X = N^-1 U      (X = adjusted heights)
+   V  = A X - L,  sigma0^2 = V' P V / (n - u),  Sxx = sigma0^2 N^-1
 
-Parametric Method (Ax+L):
-    V = A*X - L
+   Leveling observations are linear in the heights, so X is obtained in one
+   direct solution (no iteration).  The approximate heights from Step 2 are
+   reported, and corrections = X - approximate.
 
-    Where:
-        V = residuals vector
-        A = design matrix (coefficients)
-        X = parameter vector (unknown heights)
-        L = observation vector (measured height differences)
+2. Conditional (condition equations)       B v + w = 0
+   ---------------------------------------------------
+   r = n_loops + (n_fixed - 1) per connected group, built from the
+   fundamental loops of a spanning forest (always independent).
+   w = B Lb - c,   M = B P^-1 B',   k = -M^-1 w,   v = P^-1 B' k
+   adjusted dH = Lb + v; heights carried from the fixed points.
 
-    Normal equations:
-        N*X = U
-        where N = A.T @ P @ A
-              U = A.T @ P @ L
-              P = weight matrix (diagonal, weights = 1/distance)
-
-Conditional Method (Bv+W):
-    Bv + w = 0
-
-    Where:
-        v = residuals vector
-        B = condition matrix
-        w = misclosure vector
-
-    Normal equations:
-        N*k = u
-        where N = B * P^-1 * B^T
-              u = -w
-              k = correlates (Lagrange multipliers)
+Before either method runs, every connected group of points must contain a
+fixed point (datum check) - otherwise a clear NetworkDatumError is raised.
 """
-from typing import List, Dict, Optional, Tuple
-from pathlib import Path
-import numpy as np
+from typing import Dict, List, Optional, Sequence, Tuple
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import numpy as np
 
-from ..config.models import (
-    LevelingLine, Benchmark, AdjustmentResult, MeasurementSummary
+from geodetic_tool.config.models import LevelingLine, AdjustmentResult, MeasurementSummary
+from geodetic_tool.engine.ADJwarnings import SingularMatrixError, InsufficientObservationsError
+from geodetic_tool.engine.network_prep import (
+    NetworkDatumError, approximate_heights, check_datum, independent_conditions,
+    observation_weight, tolerance_mm, _obs_fields,
 )
-from ..config.settings import calculate_tolerance
-from .adjustment_computations import AdjustmentComputations
-from .ADJwarnings import (
-    SingularMatrixError,
-    InsufficientObservationsError,
-    ConvergenceError
-)
-
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["LeastSquaresAdjuster", "ConditionalAdjuster", "NetworkDatumError",
+           "simple_adjustment", "lines_to_observations"]
+
+
+def lines_to_observations(lines: Sequence[LevelingLine]) -> List[MeasurementSummary]:
+    """LevelingLine list -> MeasurementSummary list (one per line)."""
+    out = []
+    for ln in lines:
+        out.append(MeasurementSummary(
+            from_point=ln.start_point, to_point=ln.end_point,
+            height_diff=ln.total_height_diff, distance=ln.total_distance,
+            num_setups=ln.num_setups, bf_diff=0.0, year_month="",
+            source_file=ln.filename,
+        ))
+    return out
+
+
+def _clean(observations: Sequence) -> list:
+    keep = []
+    for o in observations:
+        f, t, *_ = _obs_fields(o)
+        if not f or not t:
+            logger.warning("Skipping observation with a missing end point: %s", o)
+        elif f == t:
+            logger.warning("Skipping observation from a point to itself: %s", f)
+        else:
+            keep.append(o)
+    return keep
+
+
+def _k_coefficient(v_m: np.ndarray, total_km: float) -> Tuple[float, float]:
+    total_diff_mm = float(np.sum(np.abs(v_m)) * 1000.0)
+    k = total_diff_mm / np.sqrt(total_km) if total_km > 0 else 0.0
+    return total_diff_mm, float(k)
+
+
+def _benchmark_misclosures(observations, fixed_points, leveling_class) -> List[Dict]:
+    """Misclosure between each pair of fixed points along the spanning tree
+    (for a single line between two benchmarks this is the line misclosure f)."""
+    rows = []
+    for c in independent_conditions(observations, fixed_points):
+        if c.kind != "benchmark":
+            continue
+        measured = sum(s * _obs_fields(observations[i])[2] for i, s in c.terms)
+        length = sum(_obs_fields(observations[i])[3] for i, _ in c.terms)
+        f_mm = (measured - c.constant) * 1000.0
+        allowed = tolerance_mm(length, leveling_class)
+        rows.append({"from": c.points[0], "to": c.points[1],
+                     "measured_dh": measured, "known_dh": c.constant,
+                     "misclosure_mm": f_mm, "length_m": length,
+                     "allowed_mm": allowed, "ok": abs(f_mm) <= allowed})
+    return rows
+
 
 class LeastSquaresAdjuster:
-    """
-    Least Squares Adjustment for leveling networks.
+    """Parametric least-squares adjustment (V = A X - L)."""
 
-    Implements the parametric method (Ax+L) with distance-based weighting
-    and matrix stability checking.
-    """
-
-    def __init__(
-        self,
-        max_iterations: int = 10,
-        tolerance: float = 1e-6,
-        check_stability: bool = True
-    ):
-        """
-        Initialize the adjuster.
-
-        Args:
-            max_iterations: Maximum number of iterations
-            tolerance: Convergence tolerance (meters)
-            check_stability: Whether to perform matrix stability checks
-        """
-        self.max_iterations = max_iterations
-        self.tolerance = tolerance
+    def __init__(self, max_iterations: int = 1, tolerance: float = 1e-6,
+                 check_stability: bool = True, weight_mode: str = "distance",
+                 leveling_class=3, **_ignored):
+        # max_iterations / tolerance are kept for backward compatibility only:
+        # the leveling model is linear and is solved directly.
         self.check_stability = check_stability
-        self.a0 = 0.001  # Reference standard error (mm/sqrt(km))
-        self.adj_comp = AdjustmentComputations(
-            max_iterations=max_iterations,
-            tolerance=tolerance
-        )
-    
-    def adjust(
-        self,
-        observations: List[MeasurementSummary],
-        fixed_points: Dict[str, float],
-        approximate_heights: Optional[Dict[str, float]] = None
-    ) -> AdjustmentResult:
-        """
-        Perform least squares adjustment.
-        
-        Args:
-            observations: List of measurement summaries (observed height diffs)
-            fixed_points: Dictionary of fixed benchmark heights {point_id: height}
-            approximate_heights: Initial approximate heights for unknown points
-            
-        Returns:
-            AdjustmentResult with adjusted heights and statistics
-        """
+        self.weight_mode = weight_mode
+        self.leveling_class = leveling_class
+
+    def adjust(self, observations: Sequence, fixed_points: Dict[str, float],
+               approximate_heights_in: Optional[Dict[str, float]] = None,
+               known_heights: Optional[Dict[str, float]] = None,
+               **_ignored) -> AdjustmentResult:
+        observations = _clean(observations)
         if not observations:
             raise ValueError("No observations provided")
-        
         if not fixed_points:
-            raise ValueError("At least one fixed point required")
-        
-        # Get all unique points
-        all_points = set()
-        for obs in observations:
-            all_points.add(obs.from_point)
-            all_points.add(obs.to_point)
-        
-        # Separate fixed and unknown points
-        fixed_ids = set(fixed_points.keys())
-        unknown_ids = all_points - fixed_ids
-        unknown_list = sorted(unknown_ids)
-        
-        n_obs = len(observations)
-        n_unknowns = len(unknown_list)
-        
-        if n_unknowns == 0:
+            raise ValueError("At least one fixed point is required")
+        fixed_points = {str(k).strip(): float(v) for k, v in fixed_points.items()}
+
+        check_datum(observations, fixed_points)
+
+        points = sorted({p for o in observations for p in _obs_fields(o)[:2]})
+        unknowns = [p for p in points if p not in fixed_points]
+        if not unknowns:
             raise ValueError("All points are fixed - nothing to adjust")
-        
-        # Create point index mapping
-        point_index = {pid: i for i, pid in enumerate(unknown_list)}
-        
-        # Initialize approximate heights
-        if approximate_heights is None:
-            approximate_heights = {}
-        
-        # Estimate approximate heights for unknowns
-        current_heights = dict(fixed_points)
-        for pid in unknown_list:
-            if pid in approximate_heights:
-                current_heights[pid] = approximate_heights[pid]
-            else:
-                current_heights[pid] = 0.0  # Will be updated iteratively
-        
-        # Iterative adjustment
-        for iteration in range(1, self.max_iterations + 1):
-            # Build design matrix A (n_obs x n_unknowns)
-            A = np.zeros((n_obs, n_unknowns))
-            
-            # Build observation vector L (observed - computed)
-            L = np.zeros(n_obs)
-            
-            # Build weight matrix P (diagonal, weight = 1/distance in km)
-            P = np.zeros((n_obs, n_obs))
-            
-            for i, obs in enumerate(observations):
-                from_pt = obs.from_point
-                to_pt = obs.to_point
-                
-                # Observed height difference
-                observed_dh = obs.height_diff
-                
-                # Computed height difference
-                computed_dh = current_heights.get(to_pt, 0) - current_heights.get(from_pt, 0)
-                
-                # Misclosure
-                L[i] = observed_dh - computed_dh
-                
-                # Design matrix coefficients
-                # dH = H_to - H_from
-                # Partial derivative w.r.t. H_to = +1
-                # Partial derivative w.r.t. H_from = -1
-                
-                if to_pt in point_index:
-                    A[i, point_index[to_pt]] = 1.0
-                
-                if from_pt in point_index:
-                    A[i, point_index[from_pt]] = -1.0
-                
-                # Weight (inverse of distance in km)
-                dist_km = obs.distance / 1000.0
-                if dist_km > 0:
-                    P[i, i] = 1.0 / dist_km
-                else:
-                    P[i, i] = 1.0
-            
-            # Use AdjustmentComputations for solving with stability checking
-            try:
-                adj_result = self.adj_comp.run_linear_adjustment(
-                    A, L, P, check_stability=self.check_stability
-                )
-                dX = adj_result['X']
+        col = {p: j for j, p in enumerate(unknowns)}
+        n, u = len(observations), len(unknowns)
 
-                # Store additional info for final iteration
-                if iteration == self.max_iterations or True:  # Always store for last
-                    sigma_0_final = adj_result.get('sigma_0', None)
-                    stability_info = adj_result.get('stability_info', None)
+        approx = approximate_heights(observations, fixed_points, known_heights)
+        approx_h = {p: a.height for p, a in approx.items()}
+        if approximate_heights_in:
+            approx_h.update({k: float(v) for k, v in approximate_heights_in.items()
+                             if k in col})
 
-            except SingularMatrixError as e:
-                logger.error(f"Singular matrix in iteration {iteration}: {e}")
-                raise ValueError(f"Singular normal equation matrix: {e}")
-            except Exception as e:
-                logger.error(f"Error solving normal equations: {e}")
-                raise
-            
-            # Apply corrections
-            max_correction = 0.0
-            for j, pid in enumerate(unknown_list):
-                correction = dX[j]
-                current_heights[pid] += correction
-                max_correction = max(max_correction, abs(correction))
-            
-            # Check convergence
-            if max_correction < self.tolerance:
-                logger.info(f"Converged after {iteration} iterations")
-                break
-        
-        # Calculate residuals
-        V = A @ dX - L
-        
-        # Calculate M.S.E. of unit weight
-        degrees_of_freedom = n_obs - n_unknowns
-        if degrees_of_freedom > 0:
-            vtpv = V.T @ P @ V
-            mse_unit_weight = np.sqrt(vtpv / degrees_of_freedom)
-        else:
-            mse_unit_weight = 0.0
-        
-        # Calculate M.S.E. of adjusted heights
-        try:
-            Qxx = np.linalg.inv(N)
-            mse_heights = {}
-            for j, pid in enumerate(unknown_list):
-                mse_heights[pid] = mse_unit_weight * np.sqrt(Qxx[j, j])
-        except:
-            mse_heights = {pid: 0.0 for pid in unknown_list}
-        
-        # Calculate classification coefficient K
-        total_dist_km = sum(obs.distance for obs in observations) / 1000.0
-        total_diff_mm = sum(abs(V[i]) * 1000 for i in range(n_obs))
-        
-        if total_dist_km > 0:
-            k_coefficient = total_diff_mm / np.sqrt(total_dist_km)
-        else:
-            k_coefficient = 0.0
-        
-        # Build residuals dictionary
-        residuals = {}
-        for i, obs in enumerate(observations):
-            key = f"{obs.from_point}-{obs.to_point}"
-            residuals[key] = V[i] * 1000  # Convert to mm
-        
-        # Build result
-        result = AdjustmentResult(
-            iteration=iteration,
-            mse_unit_weight=mse_unit_weight,
-            adjusted_heights=current_heights,
-            residuals=residuals,
-            mse_heights=mse_heights,
-            total_distance_km=total_dist_km,
-            total_diff_mm=total_diff_mm,
-            k_coefficient=k_coefficient
+        # --- Lb, L0, L, A, P (all built once) ---
+        Lb = np.zeros(n)
+        L0 = np.zeros(n)
+        A = np.zeros((n, u))
+        p = np.zeros(n)
+        for i, o in enumerate(observations):
+            f, t, dh, _d, *_ = _obs_fields(o)
+            Lb[i] = dh
+            ff, tf = f in fixed_points, t in fixed_points
+            if ff and tf:
+                L0[i] = fixed_points[t] - fixed_points[f]
+            elif ff:
+                L0[i] = -fixed_points[f]
+            elif tf:
+                L0[i] = fixed_points[t]
+            if t in col:
+                A[i, col[t]] = 1.0
+            if f in col:
+                A[i, col[f]] = -1.0
+            p[i] = observation_weight(o, self.weight_mode)
+        L = Lb - L0
+
+        N = A.T @ (p[:, None] * A)
+        U = A.T @ (p * L)
+        rank = np.linalg.matrix_rank(N)
+        if rank < u:
+            raise SingularMatrixError(
+                f"Normal matrix is singular (rank {rank} < {u} unknowns).")
+        cond = float(np.linalg.cond(N))
+        if self.check_stability and cond > 1e12:
+            logger.warning("Normal matrix is ill-conditioned (cond = %.2e)", cond)
+
+        X = np.linalg.solve(N, U)
+        V = A @ X - L
+        dof = n - u
+        vtpv = float(V @ (p * V))
+        sigma0 = float(np.sqrt(vtpv / dof)) if dof > 0 else 0.0
+        Qxx = np.linalg.inv(N)
+
+        heights = dict(fixed_points)
+        heights.update({pid: float(X[col[pid]]) for pid in unknowns})
+        mse = {pid: float(sigma0 * np.sqrt(Qxx[col[pid], col[pid]])) for pid in unknowns}
+        for pid in fixed_points:
+            if pid in points:
+                mse[pid] = 0.0
+        corrections = {pid: heights[pid] - approx_h.get(pid, heights[pid]) for pid in unknowns}
+
+        total_km = sum(_obs_fields(o)[3] for o in observations) / 1000.0
+        total_diff_mm, k = _k_coefficient(V, total_km)
+        residuals, table = {}, []
+        for i, o in enumerate(observations):
+            f, t, dh, d, *_ = _obs_fields(o)
+            residuals[f"{f}-{t}"] = float(V[i] * 1000.0)
+            table.append({"from": f, "to": t, "measured_dh": dh, "distance": d,
+                          "weight": float(p[i]), "residual_mm": float(V[i] * 1000.0),
+                          "adjusted_dh": dh + float(V[i]),
+                          "n_runs": getattr(o, "n_runs", 1),
+                          "num_setups": getattr(o, "num_setups", 0),
+                          "source": getattr(o, "source_file", "")})
+
+        logger.info("Parametric LSA: n=%d u=%d dof=%d sigma0=%.3f mm/sqrt(km)",
+                    n, u, dof, sigma0 * 1000)
+        return AdjustmentResult(
+            iteration=1, mse_unit_weight=sigma0, adjusted_heights=heights,
+            residuals=residuals, mse_heights=mse, total_distance_km=total_km,
+            total_diff_mm=total_diff_mm, k_coefficient=k,
+            method="parametric", approximate_heights=approx_h,
+            corrections=corrections, fixed_points=dict(fixed_points),
+            degrees_of_freedom=dof, observations=table,
+            benchmark_misclosures=_benchmark_misclosures(
+                observations, fixed_points, self.leveling_class),
+            weight_mode=self.weight_mode,
         )
-        
-        return result
-    
-    def adjust_from_lines(
-        self,
-        lines: List[LevelingLine],
-        fixed_points: Dict[str, float]
-    ) -> AdjustmentResult:
-        """
-        Perform adjustment directly from LevelingLine objects.
-        
-        Args:
-            lines: List of LevelingLine objects
-            fixed_points: Dictionary of fixed benchmark heights
-            
-        Returns:
-            AdjustmentResult
-        """
-        # Convert lines to observations
-        observations = []
-        for line in lines:
-            obs = MeasurementSummary(
-                from_point=line.start_point,
-                to_point=line.end_point,
-                height_diff=line.total_height_diff,
-                distance=line.total_distance,
-                num_setups=line.num_setups,
-                bf_diff=0.0,
-                year_month="",
-                source_file=line.filename
-            )
-            observations.append(obs)
-        
-        return self.adjust(observations, fixed_points)
+
+    def adjust_from_lines(self, lines: List[LevelingLine],
+                          fixed_points: Dict[str, float]) -> AdjustmentResult:
+        return self.adjust(lines_to_observations(lines), fixed_points)
 
 
 class ConditionalAdjuster:
-    """
-    Conditional Adjustment (Bv+W method) for leveling networks.
+    """Conditional least-squares adjustment (B v + w = 0)."""
 
-    Implements the conditional equation method where:
-        Bv + w = 0
-
-    This method is suitable for:
-    - Loop networks (each loop provides one condition)
-    - Networks with redundant observations
-    - Cases where conditions are more natural than parameters
-
-    The adjustment minimizes v^T * P * v subject to the conditions.
-    """
-
-    def __init__(
-        self,
-        check_stability: bool = True,
-        condition_number_threshold: float = 1e10
-    ):
-        """
-        Initialize conditional adjuster.
-
-        Args:
-            check_stability: Whether to perform matrix stability checks
-            condition_number_threshold: Threshold for ill-conditioned warning
-        """
+    def __init__(self, check_stability: bool = True, weight_mode: str = "distance",
+                 leveling_class=3, condition_number_threshold: float = 1e12,
+                 **_ignored):
         self.check_stability = check_stability
-        self.adj_comp = AdjustmentComputations(
-            condition_number_threshold=condition_number_threshold
-        )
+        self.weight_mode = weight_mode
+        self.leveling_class = leveling_class
+        self.cond_threshold = condition_number_threshold
 
-    def adjust_loops(
-        self,
-        lines: List[LevelingLine],
-        loops: List[List[int]],
-        fixed_points: Optional[Dict[str, float]] = None
-    ) -> AdjustmentResult:
-        """
-        Perform conditional adjustment on a loop network.
+    def adjust(self, observations: Sequence, fixed_points: Dict[str, float],
+               known_heights: Optional[Dict[str, float]] = None) -> AdjustmentResult:
+        observations = _clean(observations)
+        if not observations:
+            raise ValueError("No observations provided")
+        if not fixed_points:
+            raise ValueError("At least one fixed point is required")
+        fixed_points = {str(k).strip(): float(v) for k, v in fixed_points.items()}
+        check_datum(observations, fixed_points)
 
-        Args:
-            lines: List of LevelingLine objects
-            loops: List of loops, where each loop is a list of line indices
-            fixed_points: Optional dictionary of fixed benchmark heights
+        conds = independent_conditions(observations, fixed_points)
+        n = len(observations)
+        Lb = np.array([_obs_fields(o)[2] for o in observations])
+        p = np.array([observation_weight(o, self.weight_mode) for o in observations])
+        points = sorted({q for o in observations for q in _obs_fields(o)[:2]})
+        unknowns = [q for q in points if q not in fixed_points]
 
-        Returns:
-            AdjustmentResult with adjusted heights and statistics
-        """
-        # Convert lines to observations
-        observations = []
-        for line in lines:
-            obs = MeasurementSummary(
-                from_point=line.start_point,
-                to_point=line.end_point,
-                height_diff=line.total_height_diff,
-                distance=line.total_distance,
-                num_setups=line.num_setups,
-                bf_diff=0.0,
-                year_month="",
-                source_file=line.filename
-            )
-            observations.append(obs)
+        if conds:
+            B = np.zeros((len(conds), n))
+            c = np.zeros(len(conds))
+            for r, cd in enumerate(conds):
+                for i, s in cd.terms:
+                    B[r, i] += s
+                c[r] = cd.constant
+            w = B @ Lb - c
+            Pinv = 1.0 / p
+            M = B @ (Pinv[:, None] * B.T)
+            if np.linalg.matrix_rank(M) < len(conds):
+                raise SingularMatrixError("Condition matrix M is singular.")
+            if self.check_stability and np.linalg.cond(M) > self.cond_threshold:
+                logger.warning("Condition matrix M is ill-conditioned")
+            k = -np.linalg.solve(M, w)
+            v = Pinv * (B.T @ k)
+        else:
+            # No redundancy (open traverse from one fixed point)
+            v = np.zeros(n)
+        r = len(conds)
+        sigma0 = float(np.sqrt(float(v @ (p * v)) / r)) if r > 0 else 0.0
+        L_adj = Lb + v
 
-        n_obs = len(observations)
-        n_conditions = len(loops)
-
-        # Build weight matrix P (diagonal, weight = 1/distance in km)
-        P = np.zeros((n_obs, n_obs))
-        for i, obs in enumerate(observations):
-            dist_km = obs.distance / 1000.0
-            if dist_km > 0:
-                P[i, i] = 1.0 / dist_km
-            else:
-                P[i, i] = 1.0
-
-        # Build condition matrix B and misclosure vector w
-        B = np.zeros((n_conditions, n_obs))
-        w = np.zeros(n_conditions)
-
-        for loop_idx, loop in enumerate(loops):
-            loop_misclosure = 0.0
-            for line_idx in loop:
-                if 0 <= line_idx < n_obs:
-                    # Coefficient is +1 or -1 depending on direction
-                    # For now, assume all positive (can be enhanced)
-                    B[loop_idx, line_idx] = 1.0
-                    loop_misclosure += observations[line_idx].height_diff
-
-            w[loop_idx] = loop_misclosure
-
-        # Perform conditional adjustment
-        try:
-            adj_result = self.adj_comp.run_conditional_adjustment(
-                B, w, P, check_stability=self.check_stability
-            )
-
-            v = adj_result['v']  # Residuals
-            k = adj_result['k']  # Correlates
-            sigma_0 = adj_result['sigma_0']
-
-        except SingularMatrixError as e:
-            logger.error(f"Singular matrix in conditional adjustment: {e}")
-            raise ValueError(f"Cannot perform conditional adjustment: {e}")
-        except InsufficientObservationsError as e:
-            logger.error(f"Insufficient observations: {e}")
-            raise ValueError(f"Insufficient observations for adjustment: {e}")
-
-        # Calculate adjusted observations
+        # Heights carried from the fixed points with the adjusted dH
         adjusted_obs = []
-        for i, obs in enumerate(observations):
-            adjusted_dh = obs.height_diff + v[i]
-            adjusted_obs.append({
-                'from_point': obs.from_point,
-                'to_point': obs.to_point,
-                'observed_dh': obs.height_diff,
-                'adjusted_dh': adjusted_dh,
-                'residual': v[i],
-                'distance': obs.distance
-            })
+        for i, o in enumerate(observations):
+            f, t, _dh, d, *_ = _obs_fields(o)
+            adjusted_obs.append(MeasurementSummary(
+                from_point=f, to_point=t, height_diff=float(L_adj[i]), distance=d,
+                num_setups=0, bf_diff=0.0, year_month="", source_file=""))
+        carried = approximate_heights(adjusted_obs, fixed_points)
+        heights = dict(fixed_points)
+        heights.update({q: carried[q].height for q in unknowns})
 
-        # Calculate heights if fixed points provided
-        if fixed_points:
-            heights = self._calculate_heights_from_adjusted(
-                adjusted_obs, fixed_points
-            )
-        else:
-            heights = {}
+        # Height precision: same cofactors as the parametric solution
+        col = {q: j for j, q in enumerate(unknowns)}
+        A = np.zeros((n, len(unknowns)))
+        for i, o in enumerate(observations):
+            f, t, *_ = _obs_fields(o)
+            if t in col:
+                A[i, col[t]] = 1.0
+            if f in col:
+                A[i, col[f]] = -1.0
+        mse = {q: 0.0 for q in fixed_points if q in points}
+        if unknowns:
+            Qxx = np.linalg.inv(A.T @ (p[:, None] * A))
+            mse.update({q: float(sigma0 * np.sqrt(Qxx[col[q], col[q]])) for q in unknowns})
 
-        # Build residuals dictionary
-        residuals = {}
-        for i, obs in enumerate(observations):
-            key = f"{obs.from_point}-{obs.to_point}"
-            residuals[key] = v[i] * 1000  # Convert to mm
-
-        # Calculate statistics
-        total_dist_km = sum(obs.distance for obs in observations) / 1000.0
-        total_diff_mm = sum(abs(v[i]) * 1000 for i in range(n_obs))
-
-        if total_dist_km > 0:
-            k_coefficient = total_diff_mm / np.sqrt(total_dist_km)
-        else:
-            k_coefficient = 0.0
-
-        # Build result
-        result = AdjustmentResult(
-            iteration=1,  # Conditional adjustment is non-iterative
-            mse_unit_weight=sigma_0,
-            adjusted_heights=heights,
-            residuals=residuals,
-            mse_heights={},  # Can be calculated if needed
-            total_distance_km=total_dist_km,
-            total_diff_mm=total_diff_mm,
-            k_coefficient=k_coefficient
+        approx = {q: a.height for q, a in approximate_heights(observations, fixed_points,
+                                                             known_heights).items()}
+        total_km = sum(_obs_fields(o)[3] for o in observations) / 1000.0
+        total_diff_mm, kc = _k_coefficient(v, total_km)
+        residuals, table = {}, []
+        for i, o in enumerate(observations):
+            f, t, dh, d, *_ = _obs_fields(o)
+            residuals[f"{f}-{t}"] = float(v[i] * 1000.0)
+            table.append({"from": f, "to": t, "measured_dh": dh, "distance": d,
+                          "weight": float(p[i]), "residual_mm": float(v[i] * 1000.0),
+                          "adjusted_dh": float(L_adj[i]),
+                          "n_runs": getattr(o, "n_runs", 1),
+                          "num_setups": getattr(o, "num_setups", 0),
+                          "source": getattr(o, "source_file", "")})
+        logger.info("Conditional LSA: n=%d r=%d sigma0=%.3f mm/sqrt(km)",
+                    n, r, sigma0 * 1000)
+        return AdjustmentResult(
+            iteration=1, mse_unit_weight=sigma0, adjusted_heights=heights,
+            residuals=residuals, mse_heights=mse, total_distance_km=total_km,
+            total_diff_mm=total_diff_mm, k_coefficient=kc,
+            method="conditional", approximate_heights=approx,
+            corrections={q: heights[q] - approx.get(q, heights[q]) for q in unknowns},
+            fixed_points=dict(fixed_points), degrees_of_freedom=r,
+            observations=table,
+            benchmark_misclosures=_benchmark_misclosures(
+                observations, fixed_points, self.leveling_class),
+            weight_mode=self.weight_mode,
         )
 
-        return result
-
-    def _calculate_heights_from_adjusted(
-        self,
-        adjusted_obs: List[Dict],
-        fixed_points: Dict[str, float]
-    ) -> Dict[str, float]:
-        """
-        Calculate heights from adjusted observations using least squares.
-
-        After conditional adjustment adjusts the observations,
-        we can calculate heights using the adjusted observations.
-        """
-        # Use parametric adjuster with adjusted observations
-        summaries = []
-        for obs in adjusted_obs:
-            summary = MeasurementSummary(
-                from_point=obs['from_point'],
-                to_point=obs['to_point'],
-                height_diff=obs['adjusted_dh'],
-                distance=obs['distance'],
-                num_setups=1,
-                bf_diff=0.0,
-                year_month="",
-                source_file=""
-            )
-            summaries.append(summary)
-
-        adjuster = LeastSquaresAdjuster(check_stability=False)
-        result = adjuster.adjust(summaries, fixed_points)
-
-        return result.adjusted_heights
+    def adjust_loops(self, lines: List[LevelingLine], loops=None,
+                     fixed_points: Optional[Dict[str, float]] = None) -> AdjustmentResult:
+        """Backward-compatible entry point: conditions are now always built
+        internally from an independent loop basis (*loops* is ignored)."""
+        return self.adjust(lines_to_observations(lines), fixed_points or {})
 
 
-def simple_adjustment(
-    observations: List[Dict],
-    fixed_points: Dict[str, float]
-) -> Dict[str, float]:
-    """
-    Simple convenience function for least squares adjustment.
-
-    Args:
-        observations: List of dicts with keys: from_point, to_point, height_diff, distance
-        fixed_points: Dictionary of fixed heights
-
-    Returns:
-        Dictionary of adjusted heights
-    """
-    # Convert to MeasurementSummary
-    summaries = []
-    for obs in observations:
-        summary = MeasurementSummary(
-            from_point=obs['from_point'],
-            to_point=obs['to_point'],
-            height_diff=obs['height_diff'],
-            distance=obs['distance'],
-            num_setups=obs.get('num_setups', 1),
-            bf_diff=0.0,
-            year_month="",
-            source_file=""
-        )
-        summaries.append(summary)
-
-    adjuster = LeastSquaresAdjuster()
-    result = adjuster.adjust(summaries, fixed_points)
-
-    return result.adjusted_heights
+def simple_adjustment(observations: List[Dict], fixed_points: Dict[str, float]) -> Dict[str, float]:
+    summaries = [MeasurementSummary(
+        from_point=o["from_point"], to_point=o["to_point"], height_diff=o["height_diff"],
+        distance=o["distance"], num_setups=o.get("num_setups", 1), bf_diff=0.0,
+        year_month="", source_file="") for o in observations]
+    return LeastSquaresAdjuster().adjust(summaries, fixed_points).adjusted_heights

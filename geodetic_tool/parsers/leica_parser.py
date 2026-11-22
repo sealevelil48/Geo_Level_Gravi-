@@ -30,12 +30,9 @@ from typing import List, Optional, Dict, Tuple, Any
 from datetime import datetime
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from parsers.base_parser import BaseParser
-from config.models import LevelingLine, StationSetup, LineStatus
-from config.settings import get_settings, is_benchmark
+from geodetic_tool.parsers.base_parser import BaseParser
+from geodetic_tool.config.models import LevelingLine, StationSetup, LineStatus
+from geodetic_tool.config.settings import get_settings, is_benchmark
 
 
 logger = logging.getLogger(__name__)

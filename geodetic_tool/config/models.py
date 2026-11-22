@@ -26,6 +26,7 @@ class LineStatus(Enum):
     EXCLUDED_FROM_MERGE = "excluded_from_merge"  # Original line merged into another (Phase 3, Item 14)
     MERGED = "merged"  # Resulting merged line (Item 14)
     EXCLUDED = "excluded"  # General exclusion (manual or point-based)
+    VALID_BY_MANAGER = "valid_by_manager"  # Manager override: include despite validation failure
 
 
 @dataclass
@@ -70,6 +71,12 @@ class LevelingLine:
     # NEW: Export control and direction management
     is_used: bool = True  # Flag to include/exclude entire line in exports
     original_direction: str = "BF"  # Track original direction for reversal
+    manager_override: bool = False  # Manager override: treat as valid despite validation failure
+    source_path: Optional[str] = None  # Absolute path of the measurement file it was parsed from
+    # True for lines read from a summary file (.FA0 / .FA1 / .rez): one row of
+    # the file = one line; its setups are evenly split placeholders that keep
+    # the setup count, so setup-level field checks are not applied.
+    is_summary: bool = False
     
     @property
     def num_setups(self) -> int:
@@ -82,9 +89,17 @@ class LevelingLine:
         return self.total_distance / 1000.0
     
     def calculate_totals(self):
-        """Calculate total distance and height difference from setups."""
+        """Calculate total distance and height difference from setups.
+
+        total_distance is the full traverse length of the line (sum of every
+        backsight leg + foresight leg for every setup).  This is the 'L' that
+        enters the tolerance formula T = k·√L (Directive ג2, Appendix B §4.1).
+        Do NOT divide by 2 — that would give an average sight distance, not the
+        line length, and would cause tolerance checks to use √(L/2) instead of
+        √L.
+        """
         self.total_distance = sum(
-            (s.distance_back + s.distance_fore) / 2 for s in self.setups
+            s.distance_back + s.distance_fore for s in self.setups
         )
         self.total_height_diff = sum(
             s.height_diff for s in self.setups if s.height_diff is not None
@@ -184,7 +199,16 @@ class AdjustmentResult:
     total_distance_km: float
     total_diff_mm: float
     k_coefficient: float                # Classification coefficient
-    
+    # --- Extended results (filled by the adjusters; all optional) ---
+    method: str = ""                                              # 'parametric' / 'conditional'
+    approximate_heights: Dict[str, float] = field(default_factory=dict)
+    corrections: Dict[str, float] = field(default_factory=dict)  # adjusted - approximate (m)
+    fixed_points: Dict[str, float] = field(default_factory=dict)
+    degrees_of_freedom: int = 0
+    observations: List[Dict] = field(default_factory=list)       # per-observation table
+    benchmark_misclosures: List[Dict] = field(default_factory=list)
+    weight_mode: str = "distance"
+
     def to_dataframe(self) -> pd.DataFrame:
         """Convert adjusted heights to DataFrame."""
         data = []
@@ -293,6 +317,7 @@ class ProjectData:
                 'HeightDiff': line.total_height_diff,
                 'Method': line.method,
                 'Status': line.status.value,
-                'IsUsed': line.is_used  # NEW
+                'IsUsed': line.is_used,
+                'ManagerOverride': line.manager_override
             })
         return pd.DataFrame(data)

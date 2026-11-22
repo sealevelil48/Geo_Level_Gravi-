@@ -39,6 +39,7 @@ class SettingsManager:
         self.settings_file = settings_file or SETTINGS_FILE
         self.settings_dir = self.settings_file.parent
         self._ensure_settings_dir()
+        self._seed_from_default_config()
 
     def _ensure_settings_dir(self):
         """Create settings directory if it doesn't exist."""
@@ -47,6 +48,45 @@ class SettingsManager:
             logger.info(f"Settings directory verified: {self.settings_dir}")
         except Exception as e:
             logger.error(f"Failed to create settings directory: {e}")
+
+    def _seed_from_default_config(self) -> None:
+        """Auto-seed DB credentials from the packaged default_db_config.json.
+
+        Only runs when no host has been stored yet in the local profile, so an
+        engineer who has already configured a real server is never overwritten.
+        Password is intentionally ignored — it must be set via QgsAuthManager.
+        """
+        existing = self.get_db_connection()
+        if existing.get("host"):
+            return  # already configured — nothing to do
+
+        # Resolve path relative to this file: .../geodetic_tool/config/ → .../resources/
+        default_cfg_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "resources"
+            / "default_db_config.json"
+        )
+        if not default_cfg_path.exists():
+            return
+
+        try:
+            with open(default_cfg_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            db = data.get("db_connection", {})
+            self.set_db_connection(
+                host=db.get("host", "localhost"),
+                port=int(db.get("port", 5432)),
+                dbname=db.get("dbname", "survey_db"),
+                user=db.get("user", "cp_read"),
+                table=db.get("table", "benchmarks"),
+                authcfg=db.get("authcfg", ""),
+            )
+            print(
+                f"[SettingsManager] Auto-seeded database credentials from "
+                f"{default_cfg_path.name}"
+            )
+        except Exception as exc:
+            logger.warning("Failed to auto-seed DB config: %s", exc)
 
     def save_class_parameters(self, class_params_dict: Dict[str, Dict[str, Any]]) -> bool:
         """
@@ -128,6 +168,22 @@ class SettingsManager:
         except Exception as e:
             logger.error(f"Failed to load settings: {e}")
             return None
+
+    def update_class_parameters(self, class_name: str, params: Dict[str, Any]) -> bool:
+        """
+        Update parameters for a single class and persist to disk.
+
+        Args:
+            class_name : "H1"–"H6"
+            params     : dict of field-name → value to merge into that class
+
+        Returns:
+            True if save successful, False otherwise
+        """
+        existing = self.load_class_parameters() or {}
+        existing.setdefault(class_name, {})
+        existing[class_name].update(params)
+        return self.save_class_parameters(existing)
 
     def reset_to_defaults(self) -> bool:
         """
@@ -224,6 +280,45 @@ class SettingsManager:
             return True
         except Exception as e:
             logger.error(f"Failed to save default class: {e}")
+            return False
+
+    def get_db_connection(self) -> Dict[str, Any]:
+        """
+        Return the stored DB connection parameters dict.
+
+        Keys: host, port, dbname, user, table, authcfg.
+        Password is NEVER stored here — it lives in QgsAuthManager.
+
+        Returns:
+            dict with connection params, or {} if not configured.
+        """
+        return self._load_settings_file().get("db_connection", {})
+
+    def set_db_connection(self, host: str, port: int, dbname: str,
+                          user: str, table: str, authcfg: str) -> bool:
+        """
+        Persist non-sensitive DB connection params and authcfg ID to settings.json.
+        Password is NEVER written here.
+
+        Returns:
+            True on success, False on failure.
+        """
+        settings = self._load_settings_file()
+        settings["db_connection"] = {
+            "host":    host,
+            "port":    int(port),
+            "dbname":  dbname,
+            "user":    user,
+            "table":   table,
+            "authcfg": authcfg,
+        }
+        try:
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+            logger.info("DB connection params saved to %s", self.settings_file)
+            return True
+        except Exception as e:
+            logger.error("Failed to save DB connection params: %s", e)
             return False
 
     def get_settings_info(self) -> Dict[str, Any]:

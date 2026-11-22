@@ -3,17 +3,15 @@ Base Parser Module
 
 Abstract base class for all file format parsers.
 """
+import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional, List, Tuple
 import pandas as pd
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from config.models import LevelingLine, StationSetup, MeasurementDirection
-from config.settings import get_settings, FileFormat
+from geodetic_tool.config.models import LevelingLine, StationSetup, MeasurementDirection
+from geodetic_tool.config.settings import get_settings, FileFormat
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +31,9 @@ class BaseParser(ABC):
         self.encoding = encoding or self.settings.encoding.default_encoding
         self.errors: List[str] = []
         self.warnings: List[str] = []
+        # Known heights found in the file ({point_id: height}); summary
+        # files (.FA0 / .FA1) carry them, field files do not.
+        self.benchmarks = {}
     
     @abstractmethod
     def parse(self, filepath: str) -> LevelingLine:
@@ -60,6 +61,11 @@ class BaseParser(ABC):
         """
         pass
     
+    def parse_many(self, filepath: str) -> List[LevelingLine]:
+        """Parse a file that may hold several lines (summary files).
+        Field files (.DAT / .RAW) hold exactly one line."""
+        return [self.parse(filepath)]
+
     def read_file(self, filepath: str) -> List[str]:
         """
         Read file with automatic encoding detection.
@@ -134,6 +140,15 @@ def detect_file_format(filepath: str) -> FileFormat:
     ext = path.suffix.lower()
     filename = path.name.lower()
     
+    # Summary files are identified by extension only: their numeric rows
+    # can look like Leica GSI words to the content sniffer below.
+    if ext == '.rez':
+        return FileFormat.REZ
+    if ext == '.fa0':
+        return FileFormat.FA0
+    if ext == '.fa1':
+        return FileFormat.FA1
+
     # Try content-based detection first
     try:
         with open(filepath, 'r', encoding='latin-1') as f:
@@ -165,34 +180,53 @@ def detect_file_format(filepath: str) -> FileFormat:
         return FileFormat.TRIMBLE_DAT
     if ext in ['.raw', '.gsi', '.RAW', '.GSI']:
         return FileFormat.LEICA_GSI
-    
+    if ext in ['.rez', '.REZ']:
+        return FileFormat.REZ
+    if ext in ['.fa0', '.FA0']:
+        return FileFormat.FA0
+
     # Check filename patterns
     if '_dat' in filename or 'dat' in filename:
         return FileFormat.TRIMBLE_DAT
     if '_raw' in filename or 'raw' in filename:
         return FileFormat.LEICA_GSI
-    
+    if '_rez' in filename or 'rez' in filename:
+        return FileFormat.REZ
+    if '_fa0' in filename or 'fa0' in filename:
+        return FileFormat.FA0
+    if '_fa1' in filename or 'fa1' in filename:
+        return FileFormat.FA1
+
     return FileFormat.UNKNOWN
 
 
 def create_parser(filepath: str) -> Optional[BaseParser]:
     """
     Factory function to create appropriate parser for a file.
-    
+
     Args:
         filepath: Path to the file
-        
+
     Returns:
         Appropriate parser instance or None if format not recognized
     """
     file_format = detect_file_format(filepath)
-    
+
     if file_format == FileFormat.TRIMBLE_DAT:
-        from parsers.trimble_parser import TrimbleParser
+        from geodetic_tool.parsers.trimble_parser import TrimbleParser
         return TrimbleParser()
     elif file_format == FileFormat.LEICA_GSI:
-        from parsers.leica_parser import LeicaParser
+        from geodetic_tool.parsers.leica_parser import LeicaParser
         return LeicaParser()
+    elif file_format == FileFormat.REZ:
+        from geodetic_tool.parsers.rez_parser import RezParser
+        return RezParser()
+    elif file_format == FileFormat.FA0:
+        from geodetic_tool.parsers.fa0_parser import FA0Parser
+        return FA0Parser()
+    elif file_format == FileFormat.FA1:
+        from geodetic_tool.parsers.fa1_parser import FA1Parser
+        return FA1Parser()
     else:
         logger.warning(f"Unknown file format for {filepath}")
         return None

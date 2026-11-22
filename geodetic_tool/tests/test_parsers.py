@@ -4,17 +4,21 @@ Test Script for Geodetic Tool
 Tests parsers and validators with sample data from the project.
 """
 import sys
+import unittest
+import tempfile
+import os
 from pathlib import Path
 
 # Add parent to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from parsers import create_parser, detect_file_format
-from parsers.base_parser import FileFormat
-from parsers.trimble_parser import TrimbleParser
-from parsers.leica_parser import LeicaParser
-from validators import validate_line, LevelingValidator
-from config.settings import is_benchmark, is_turning_point
+from geodetic_tool.parsers import create_parser, detect_file_format
+from geodetic_tool.parsers.base_parser import FileFormat
+from geodetic_tool.parsers.trimble_parser import TrimbleParser
+from geodetic_tool.parsers.leica_parser import LeicaParser
+from geodetic_tool.validators import validate_line, LevelingValidator
+from geodetic_tool.config.settings import is_benchmark, is_turning_point
+from geodetic_tool.config.models import LevelingLine, StationSetup, LineStatus
 
 
 def test_trimble_parser():
@@ -173,16 +177,23 @@ def main():
     print("\n" + "=" * 60)
     print("GEODETIC TOOL TEST SUITE")
     print("=" * 60)
-    
+
     test_benchmark_detection()
     test_format_detection()
     test_trimble_parser()
     test_leica_parser()
-    
+
     print("\n" + "=" * 60)
     print("TEST SUITE COMPLETE")
     print("=" * 60 + "\n")
 
 
+# Summary-file readers (.FA0 / .FA1 / .rez) are tested in test_summary_import.py
+
+
 if __name__ == '__main__':
+    # Run unittest tests
+    unittest.main(exit=False, verbosity=2)
+
+    # Also run legacy test functions
     main()

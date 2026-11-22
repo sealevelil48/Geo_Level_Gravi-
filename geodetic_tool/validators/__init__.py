@@ -9,16 +9,13 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from ..config.models import (
+from geodetic_tool.config.models import (
     LevelingLine, ValidationResult, LineStatus, StationSetup
 )
-from ..config.settings import (
-    get_settings, is_benchmark, is_turning_point, calculate_tolerance
+from geodetic_tool.config.settings import (
+    get_settings, is_benchmark, is_turning_point, calculate_tolerance, validate_point_name
 )
-from ..config.israel_survey_regulations import (
+from geodetic_tool.config.israel_survey_regulations import (
     get_class_parameters, calculate_new_tolerance, MeasurementType,
     get_default_class, get_class_parameters_by_name
 )
@@ -83,21 +80,56 @@ class LevelingValidator:
         # New regulation-based checks (if enabled)
         if self.use_new_regulations and self.class_params:
             self._check_line_length(line, result)
-            self._check_sight_distances(line, result)
-            self._check_measurement_method(line, result)
-            self._check_distance_balance(line, result)
+            if getattr(line, "is_summary", False):
+                # Imported from .FA0/.FA1/.rez: no staff readings / sight
+                # lengths / method in the file - field-level checks were
+                # done when the summary was produced.
+                result.add_warning("Summary line (imported from a summary file): "
+                                   "setup-level field checks not applicable.")
+            else:
+                self._check_sight_distances(line, result)
+                self._check_measurement_method(line, result)
+                self._check_distance_balance(line, result)
 
         # Tolerance check (uses new formula if available)
         result.tolerance_valid = self._check_tolerance(line, result)
+
+        # CRITICAL FIX: Ensure line.status reflects the final validation truth
+        # so the QGIS map renderer does not falsely paint invalid lines green.
+        # The regulation checks (line length, sight distances, method, balance)
+        # only set result.is_valid=False via add_error and never touch line.status,
+        # so a line failing only those keeps the default LineStatus.VALID.
+        if not result.is_valid and line.status == LineStatus.VALID:
+            line.status = LineStatus.EXCEEDED_TOLERANCE
 
         return result
     
     def _check_endpoint(self, line: LevelingLine, result: ValidationResult) -> bool:
         """Check if end point is a valid benchmark."""
+        # Surveyor error: start and end point are the same — a line cannot be its
+        # own return. Flagged as INVALID_ENDPOINT so Manager Override can still
+        # force it to VALID_BY_MANAGER if explicitly required.
+        if line.start_point and line.end_point and line.start_point == line.end_point:
+            result.add_error(
+                f"Surveyor Error: Start point and End point are identical "
+                f"({line.start_point}). A leveling line cannot start and end "
+                f"on the same benchmark."
+            )
+            line.status = LineStatus.INVALID_ENDPOINT
+            return False
+
         if not line.end_point:
             result.add_error("No end point defined")
             return False
-        
+
+        # Per Directive ג2 (2021): numeric-only IDs up to 8 chars are valid station
+        # IDs ("numbers instead of letters"). Validate against the station-ID pattern
+        # first — if it passes, accept immediately without the old turning-point check.
+        name_valid, _ = validate_point_name(line.end_point)
+        if name_valid:
+            return True
+
+        # For IDs that fail the format check, fall back to legacy heuristics.
         if is_turning_point(line.end_point):
             result.add_error(
                 f"End point '{line.end_point}' is a turning point (numeric). "
@@ -105,12 +137,12 @@ class LevelingValidator:
             )
             line.status = LineStatus.INVALID_ENDPOINT
             return False
-        
+
         if not is_benchmark(line.end_point):
             result.add_warning(
                 f"End point '{line.end_point}' may not be a valid benchmark name"
             )
-        
+
         return True
     
     def _check_naming(self, line: LevelingLine, result: ValidationResult) -> bool:
@@ -214,20 +246,15 @@ class LevelingValidator:
         measurement_type = MeasurementType.GEOMETRIC
 
         all_valid = True
-        max_violations = 5  # Limit error messages
 
         for i, setup in enumerate(line.setups):
-            if i >= max_violations:
-                result.add_warning(f"... and {len(line.setups) - i} more setups not checked")
-                break
-
             # Check backsight distance
             if setup.distance_back is not None:
                 is_valid, message = self.class_params.validate_sight_distance(
                     setup.distance_back, measurement_type
                 )
                 if not is_valid:
-                    result.add_error(f"Setup {setup.setup_number} backsight: {message}")
+                    result.add_error("Setup " + str(setup.setup_number) + " backsight: " + message)
                     all_valid = False
 
             # Check foresight distance
@@ -236,7 +263,7 @@ class LevelingValidator:
                     setup.distance_fore, measurement_type
                 )
                 if not is_valid:
-                    result.add_error(f"Setup {setup.setup_number} foresight: {message}")
+                    result.add_error("Setup " + str(setup.setup_number) + " foresight: " + message)
                     all_valid = False
 
         return all_valid
@@ -421,6 +448,8 @@ class BatchValidator:
         Returns:
             Dictionary with summary statistics
         """
+        # accept validate_batch() output [(line, result)] as well
+        results = [r[1] if isinstance(r, tuple) else r for r in results]
         total = len(results)
         valid = sum(1 for r in results if r.is_valid)
         invalid = total - valid

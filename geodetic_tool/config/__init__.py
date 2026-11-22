@@ -3,7 +3,7 @@ Config Package
 
 Configuration and data models for the geodetic tool.
 """
-from .settings import (
+from geodetic_tool.config.settings import (
     get_settings,
     Settings,
     is_benchmark,
@@ -13,7 +13,7 @@ from .settings import (
     MeasurementMethod
 )
 
-from .models import (
+from geodetic_tool.config.models import (
     LevelingLine,
     StationSetup,
     Benchmark,

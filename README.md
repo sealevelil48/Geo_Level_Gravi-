@@ -49,6 +49,25 @@ A comprehensive Python application for automating geodetic leveling calculations
 
 ## 🆕 What's New in v1.1
 
+### November 2026 — engine shared with the QGIS plugin
+
+- **Correct LSA engine** (`geodetic_tool/engine/least_squares.py`, `network_prep.py`):
+  parametric V = Ax − L with L = Lb − L0 solved directly (the old loop added the
+  solution 10 times); conditional Bv + W = 0 with an independent set of loop and
+  benchmark conditions; clear error when a group of points has no fixed point.
+  Verified against the condition-adjustment exercise (RFH-95/96/97).
+- **Step 1**: forward/return runs averaged once, discrepancy checked against
+  k·√L with the one-direction length. **Step 2**: approximate heights table.
+- **Line length fix**: a line's length is the sum of back + fore sights (it was halved).
+- **Import .FA0 / .FA1 / .rez**: every row becomes its own editable line; known
+  heights in the file are offered as fixed points.
+- **One adjustment window** (Analysis ▸ Network Adjustment (LSA), Ctrl+Shift+N, and
+  "Adjust This Line"): lines to include, fixed points, Steps 1–2, parametric /
+  conditional, single-line adjustment (Directive G2 App. C), export FA0 / FA1 / PDF.
+- **Position estimation** (`geodetic_tool/gis/topo_estimator.py`): Dijkstra on
+  measured lengths for points without coordinates, also through chains of points.
+
+
 ### Latest Updates (February 2026)
 
 #### **Default Class Selector (H1-H6)** 🎯
