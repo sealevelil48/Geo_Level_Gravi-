@@ -66,7 +66,6 @@ geodetic_tool/
 ├── cli/                  # Command-line interface
 │   └── main.py           # CLI entry point
 │
-├── gui/                  # Graphical interface
 │   └── app.py            # Tkinter GUI application
 │
 ├── tests/                # Test suite
@@ -116,9 +115,7 @@ python3 cli/main.py info KMA58_DAT.txt
 
 ### Graphical Interface
 
-```bash
-python3 gui/app.py
-```
+Inside QGIS: the Geo Level Gravi plugin. Standalone Tkinter application: `main` branch (`python run_gui.py`).
 
 ### Python API
 

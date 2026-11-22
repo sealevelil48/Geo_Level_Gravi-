@@ -88,13 +88,12 @@ A Python-based software application for automating geodetic leveling calculation
 
 ---
 
-### 6. **InterfaceAgents** (`cli/`, `gui/`)
+### 6. **InterfaceAgents** (`cli/`; the QGIS plugin UI lives in the plugin root, the Tkinter app only on the `main` branch)
 **Responsibility:** User interfaces.
 
 | Module | Description |
 |--------|-------------|
 | `cli/main.py` | Command-line interface |
-| `gui/tkinter_app.py` | Tkinter GUI application |
 
 ---
 
@@ -207,5 +206,5 @@ pandas>=1.5.0
 numpy>=1.23.0
 scipy>=1.9.0  # For Least Squares
 geojson>=2.5.0
-tkinter (stdlib)
+(no GUI toolkit - the plugin UI uses QGIS/PyQt)
 ```
