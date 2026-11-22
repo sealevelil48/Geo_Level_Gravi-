@@ -161,7 +161,9 @@ class ProjectManager:
             'source_projects': project.source_projects,
             'created': datetime.now().isoformat(),
             'lines': [],
-            'benchmarks': {}
+            'benchmarks': {},
+            'point_overrides': getattr(project, 'point_overrides', {}) or {},
+            'point_origin': getattr(project, 'point_origin', {}) or {},
         }
 
         # Serialize lines
@@ -222,6 +224,12 @@ class ProjectManager:
             source_projects=data.get('source_projects', []),
             project_path=str(filepath)
         )
+        po = data.get('point_overrides')
+        project.point_overrides = {str(k): v for k, v in po.items()
+                                   if isinstance(v, dict)} if isinstance(po, dict) else {}
+        pg = data.get('point_origin')
+        project.point_origin = {str(k): str(v) for k, v in pg.items()} \
+            if isinstance(pg, dict) else {}
 
         # Deserialize lines
         from .models import StationSetup, LineStatus

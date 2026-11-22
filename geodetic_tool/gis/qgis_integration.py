@@ -230,7 +230,8 @@ print(f"Total points: {len(project.get_all_points())}")
     def export_for_qgis(self,
                         project: ProjectData,
                         output_folder: str,
-                        include_geojson: bool = True):
+                        include_geojson: bool = True,
+                        coord_manager=None):
         """
         Export project data for QGIS loading.
 
@@ -262,7 +263,8 @@ print(f"Total points: {len(project.get_all_points())}")
                 geojson_files = export_network_to_geojson(
                     project.get_used_lines(),
                     str(output_path),
-                    project.name
+                    project.name,
+                    coord_manager=coord_manager,
                 )
             except Exception as e:
                 print(f"Warning: GeoJSON export failed: {e}")

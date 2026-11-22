@@ -12,8 +12,8 @@ and loops, and least-squares adjustment with FA0 / FA1 / PDF output.
 > **Branches**
 > * `main` (this branch): the standalone app in `geodetic_tool/`.
 > * [`GeoLevelGraviQGIS`](https://github.com/sealevelil48/Geo_Level_Gravi-/tree/GeoLevelGraviQGIS):
->   the QGIS plugin. Same engine, plus map layers, the benchmark database
->   (PostGIS) with Point Verification, and GeoPackage project state.
+>   the QGIS plugin. Same engine and benchmark-database logic, plus map
+>   layers and GeoPackage project state.
 
 ---
 
@@ -21,7 +21,9 @@ and loops, and least-squares adjustment with FA0 / FA1 / PDF output.
 
 | Area | What it does |
 |---|---|
-| **Input** | Trimble DAT, Leica RAW / GSI-8 / GSI-16, and the summary formats **FA0 / FA1 / REZ** (one line per row; known heights in the file become fixed-point candidates). Hebrew (cp1255), UTF-8 and Latin-1 encodings. |
+| **Input** | Trimble DAT, Leica RAW / GSI-8 / GSI-16, and the summary formats **FA0 / FA1 / REZ** (one line per row). In FA0/FA1 the header `npoints nfixed` marks the first *nfixed* listed points as fixed; other listed heights are approximate. Hebrew (cp1255) and UTF-8 files, including cp1255 files re-saved as UTF-8 (`2751á` is read as `2751ב`). |
+| **Benchmark database** | PostgreSQL/PostGIS control-point table (e.g. `cp_bangal` / `public.cp_table`). On loading, every field ID is matched to the DB (ASCII ↔ Hebrew forms, with or without `/`); duplicated names are resolved by comparing DB distances with the measured line lengths. Open cases go to the **Point Verification** dialog (12-row candidate lists, **Search DB**, twins, *Decide later*). Same batched, cached lookups as the plugin: one connection, a few queries per load. |
+| **Coordinates** | EPSG:2039 coordinates from the DB (spatial-median / k=1 centroid for unverified duplicates); points missing from the DB are estimated from the measured network. Stored in the project benchmarks, used for GeoJSON (WGS 84, same transformation as QGIS) and DB heights in the adjustment window (*Auto-Select*, *Fetch from DB*). |
 | **Validation** | Classes H1–H6: misclosure k·√L, sight lengths, BF/BFFB method, endpoint and naming checks. Lines can be reversed or excluded; the removed-files report keeps track. |
 | **Analysis** | Double-run detection, loop finder, line merging (with direction alignment), point exclusion with search. |
 | **Adjustment** (one window) | Step 1: forward/return runs averaged and checked against k·√L (one-direction L). Step 2: approximate heights. Parametric (V = AX − L) or conditional (Bv + w = 0) least squares; weights by distance, setups or equal; single-line adjustment. Export **FA0**, **FA1**, **PDF report**. See [docs/LSA_ENGINE.md](docs/LSA_ENGINE.md). |
@@ -45,7 +47,23 @@ git clone https://github.com/sealevelil48/Geo_Level_Gravi-.git
 cd Geo_Level_Gravi-
 pip install -r requirements.txt        # numpy, pandas
 pip install matplotlib                 # optional: charts and PDF report
+pip install psycopg2-binary keyring    # optional: benchmark database (+ remembered password)
+pip install pyproj                     # optional: PROJ for ITM -> WGS 84 (built-in fallback is identical)
 ```
+
+### Benchmark database
+
+*Settings → Database Connection…*: host, port, database, user and table
+(`[schema.]table`), with *Test Connection*. A fresh install is pre-filled with
+`localhost / cp_bangal / public.cp_table`. The settings are shared with the
+QGIS plugin (`~/.geodetic_tool/settings.json`).
+
+The password is **never** written to settings or project files. It is taken
+from `GEOLEVEL_DB_PASSWORD`, else the password typed this session, else the
+system keyring (when *Remember* was ticked and `keyring` is installed), else
+libpq's `pgpass.conf` / trusted login. When the server rejects the login, the
+app asks once. If the DB can't be reached, loading continues without DB
+verification and a warning says why.
 
 Tkinter comes with the standard Python installers on Windows and macOS. On
 Linux install `python3-tk`.
@@ -57,6 +75,8 @@ Linux install `python3-tk`.
 python run_gui.py
 ```
 1. **File → Open Files / Open Folder**, then choose the class (H1–H6) in the status bar.
+   With a database configured, **Point Verification** opens for points that need a
+   decision; *Cancel Loading* loads nothing. Choices are saved with the project.
 2. **Analysis → Validate All**: red lines are invalid; check *Line Details* and the messages.
 3. **Analysis → Network Adjustment (LSA)** → *Prepare (Steps 1–2)* → choose
    fixed points → *Run* → *Export FA0 / FA1 / PDF*.
@@ -98,9 +118,12 @@ geodetic_tool/
 ├── engine/         least_squares, network_prep (Steps 1–2), loops, line tools,
 │                   point_normalizer (name forms + search ranking)
 ├── exporters/      FA0 / FA1 / REZ writers, PDF report
-├── gis/            GeoJSON export, topology estimator
+├── gis/            GeoJSON export, topology estimator, itm (EPSG:2039 -> WGS 84)
+├── db/             benchmark_db (DB manager, ported from the plugin), resolution
+│                   (point verification, coordinates), credentials
 ├── config/         models, class parameters, settings, project manager
-├── gui/            app.py (main window and dialogs), adjustment_window.py, window_utils.py
+├── gui/            app.py (main window and dialogs), adjustment_window.py,
+│                   point_resolution_dialog.py, db_settings_dialog.py, window_utils.py
 ├── cli/            command-line interface
 └── tests/          pytest unit tests
 tests/              script tests (LSA demo, class selector)
@@ -111,7 +134,8 @@ run_gui.py, run_cli.py, setup.py
 ## Tests
 
 ```bash
-python -m pytest geodetic_tool/tests     # LSA (textbook networks), Steps 1-2, FA0/FA1/REZ, topology
+python -m pytest geodetic_tool/tests     # LSA, Steps 1-2, FA0/FA1/REZ, topology, DB resolver, ITM
+python tests/test_point_resolution.py    # DB point matching (same suite as the plugin)
 python tests/test_lsa.py                 # parametric + conditional demo
 python tests/test_class_selector.py
 ```

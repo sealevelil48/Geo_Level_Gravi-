@@ -848,6 +848,11 @@ class GeodeticToolGUI:
         self.file_paths: List[str] = []
         # Known heights read from .FA0 / .FA1 files {point_id: height}
         self.file_benchmarks: Dict[str, float] = {}
+        # Benchmark DB: EPSG:2039 coordinates of the project's points
+        # {point_id: PointCoordinate} and the Point Verification state
+        self.point_coords: Dict[str, Any] = {}
+        self.point_overrides: Dict[str, dict] = {}
+        self.point_origin: Dict[str, str] = {}
 
         # Settings
         from ..config.settings import get_settings
@@ -929,6 +934,8 @@ class GeodeticToolGUI:
                                  command=self._show_class_settings)
         settings_menu.add_command(label="Encoding... / קידוד תווים",
                                  command=self._show_encoding_settings)
+        settings_menu.add_command(label="Database Connection... / חיבור למסד נתונים",
+                                 command=self._show_db_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="Point Exclusion... / הדרת נקודות",
                                  command=self._manage_point_exclusion)
@@ -1294,45 +1301,205 @@ Special Requirements:"""
             else:
                 messagebox.showinfo("No Files", "No supported files found in folder")
     
-    def _load_files(self, file_paths: List[str]):
-        """Load and parse files."""
-        self._set_status("Loading files...")
-        
-        for file_path in file_paths:
-            if file_path in self.file_paths:
+    # ------------------------------------------------------------------ #
+    # Benchmark database
+    # ------------------------------------------------------------------ #
+    def _db(self):
+        """The shared DB manager when configured, else None."""
+        try:
+            from ..db.benchmark_db import get_db_manager
+            mgr = get_db_manager()
+            return mgr if mgr.is_configured() else None
+        except Exception:
+            return None
+
+    def _show_db_settings(self):
+        from .db_settings_dialog import DBSettingsDialog
+        dlg = DBSettingsDialog(self.root)
+        self.root.wait_window(dlg)
+        if dlg.saved:
+            self._log("Database connection saved")
+            if self.lines and self._db() is not None and messagebox.askyesno(
+                    "Database", "Look up the coordinates of the loaded points now?"):
+                self._update_point_coordinates()
+
+    def _verify_points(self, new_lines) -> bool:
+        """Point Verification for freshly parsed lines (renamed / filtered in
+        place).  Returns False when the user cancelled loading.  Without a
+        reachable DB nothing happens and loading continues."""
+        db = self._db()
+        if db is None:
+            return True
+        from .db_settings_dialog import ensure_db_ready
+        if not ensure_db_ready(self.root, log=self._log):
+            return True
+        from ..db.resolution import PointResolver
+        from .point_resolution_dialog import ask_point_resolution
+        resolver = PointResolver(db, self.point_overrides, self.point_origin, log=self._log)
+        self._set_status("Matching points with the benchmark database...")
+        self.root.update_idletasks()
+        try:
+            outcome = resolver.resolve(new_lines, ask_point_resolution(self.root))
+        except Exception as exc:
+            self._log(f"Point verification failed ({exc}) - loading without it")
+            return True
+        if outcome is None:
+            return False
+        self.point_overrides = resolver.point_overrides
+        self.point_origin = resolver.point_origin
+        for old, new in outcome.remap.items():
+            if old in self.file_benchmarks and new not in self.file_benchmarks:
+                self.file_benchmarks[new] = self.file_benchmarks.pop(old)
+            self._log(f"Point Verification: '{old}' -> '{new}'")
+        if outcome.excluded:
+            self._log("Point Verification: excluded " + ", ".join(sorted(outcome.excluded)))
+        self._log(f"Point Verification: {outcome.auto_matched} point(s) matched "
+                  f"automatically by DB / measured distances")
+        return True
+
+    def _update_point_coordinates(self):
+        """EPSG:2039 coordinates for all loaded points (DB + topology
+        estimates), stored in the project benchmarks for the exports."""
+        db = self._db()
+        if db is None:
+            return
+        from .db_settings_dialog import ensure_db_ready
+        if not ensure_db_ready(self.root, log=self._log):
+            return
+        from ..db.resolution import resolve_coordinates
+        try:
+            self.point_coords = resolve_coordinates(self.lines, db)
+        except Exception as exc:
+            self._log(f"Coordinate lookup failed: {exc}")
+            return
+        bms = self.current_project.benchmarks
+        for pid, c in self.point_coords.items():
+            if c.estimated or c.height is None:
                 continue
-            
+            rec = c.record
+            desc = "DB: " + " ".join(str(v) for v in (
+                getattr(rec, "name", None), getattr(rec, "shem_darga_gova", None),
+                getattr(rec, "kfar_aher_name", None)) if v)
+            bms[pid] = Benchmark(point_id=pid, height=c.height, easting=c.easting,
+                                 northing=c.northing, description=desc)
+        n_db = sum(1 for c in self.point_coords.values() if not c.estimated)
+        n_est = len(self.point_coords) - n_db
+        self._log(f"Coordinates: {n_db} point(s) from the DB, {n_est} estimated "
+                  f"from the measured network")
+
+    def _coordinate_manager(self):
+        """CoordinateManager (WGS 84) for GeoJSON export, or None."""
+        coords = dict(self.point_coords)
+        if not coords:           # e.g. a reopened project: use stored benchmarks
+            for pid, bm in (self.current_project.benchmarks or {}).items():
+                if bm.easting is not None and bm.northing is not None:
+                    from ..db.resolution import PointCoordinate
+                    coords[pid] = PointCoordinate(bm.easting, bm.northing, bm.height, False)
+        if not coords:
+            return None
+        from ..gis.geojson_export import CoordinateManager
+        from ..gis.itm import itm_to_wgs84
+        cm = CoordinateManager()
+        for pid, c in coords.items():
+            lon, lat = itm_to_wgs84(c.easting, c.northing)
+            cm.add_point(pid, lon, lat, c.height or 0.0)
+        return cm
+
+    def _db_height(self, pid: str):
+        db = self._db()
+        if db is None:
+            return None
+        c = self.point_coords.get(pid)
+        if c is not None and not c.estimated and c.height is not None:
+            return c.height
+        try:
+            rec = db.resolve_benchmark(pid)
+            return None if rec is None or rec.gova_ort is None else float(rec.gova_ort)
+        except Exception:
+            return None
+
+    def _db_heights(self, pids) -> Dict[str, float]:
+        """DB orthometric heights of *pids* in one batched lookup."""
+        db = self._db()
+        if db is None:
+            return {}
+        pids = [p for p in pids if p]
+        out = {}
+        try:
+            todo = [p for p in pids if p not in self.point_coords]
+            if todo:
+                db.prefetch(todo)
+            for p in pids:
+                h = self._db_height(p)
+                if h is not None:
+                    out[p] = h
+        except Exception as exc:
+            self._log(f"DB height lookup failed: {exc}")
+        return out
+
+    def _load_files(self, file_paths: List[str]):
+        """Load and parse files, verify the point IDs against the benchmark DB
+        (when configured), then add the lines to the project."""
+        self._set_status("Loading files...")
+        loaded = set(self.file_paths)
+        parsed_files = []                  # (path, lines, benchmarks)
+        for file_path in file_paths:
+            if file_path in loaded:
+                continue
+            loaded.add(file_path)
             try:
                 parser = create_parser(file_path)
                 if parser is None:
                     raise ValueError("unsupported file type")
                 # A summary file (.FA0 / .FA1 / .rez) holds one line per row
                 parsed = parser.parse_many(file_path)
-                self.file_paths.append(file_path)
-                self.file_benchmarks.update(getattr(parser, "benchmarks", None) or {})
-                display_name = Path(file_path).name
                 for line in parsed:
                     line.source_path = str(Path(file_path).resolve())
-                    self.lines.append(line)
-                    used_marker = "✓" if line.is_used else "✗"
-                    label = line.filename if len(parsed) > 1 else display_name
-                    self.file_listbox.insert(
-                        tk.END, f"{used_marker} {label}: {line.start_point} → {line.end_point}")
-
-                if len(parsed) > 1:
-                    self._log(f"Loaded: {display_name} ({len(parsed)} lines, "
-                              f"{len(getattr(parser, 'benchmarks', {}) or {})} known heights)")
-                else:
-                    self._log(f"Loaded: {display_name}")
-                
+                parsed_files.append((file_path, parsed,
+                                     dict(getattr(parser, "benchmarks", None) or {})))
             except Exception as e:
                 self._log(f"Error loading {Path(file_path).name}: {str(e)}")
-        
+
+        new_lines = [ln for _, lines, _ in parsed_files for ln in lines]
+        if not new_lines:
+            self._set_status("Ready")
+            return
+
+        # Known heights from FA0/FA1 first, so renames below carry them along
+        prev_benchmarks = dict(self.file_benchmarks)
+        for _, _, bms in parsed_files:
+            self.file_benchmarks.update(bms)
+        if not self._verify_points(new_lines):
+            self.file_benchmarks = prev_benchmarks
+            self._log("Loading cancelled in Point Verification")
+            self._set_status("Ready")
+            return
+        kept = {id(ln) for ln in new_lines}       # verification may drop lines
+
+        for file_path, parsed, bms in parsed_files:
+            lines = [ln for ln in parsed if id(ln) in kept]
+            self.file_paths.append(file_path)
+            display_name = Path(file_path).name
+            for line in lines:
+                self.lines.append(line)
+                used_marker = "✓" if line.is_used else "✗"
+                label = line.filename if len(parsed) > 1 else display_name
+                self.file_listbox.insert(
+                    tk.END, f"{used_marker} {label}: {line.start_point} → {line.end_point}")
+            if len(parsed) > 1:
+                self._log(f"Loaded: {display_name} ({len(lines)} lines, "
+                          f"{len(bms)} known heights)")
+            else:
+                self._log(f"Loaded: {display_name}")
+
+        if self._db() is not None:
+            self._update_point_coordinates()
+
         # Update summary
         total_dist = sum(line.total_distance for line in self.lines)
         self.summary_label.config(text=f"{len(self.lines)} files, {total_dist:.0f} m total")
         self._set_status("Ready")
-    
+
     def _clear_files(self):
         """Clear all loaded files (Item 16: logs to removed files report)."""
         from datetime import datetime
@@ -1352,6 +1519,10 @@ Special Requirements:"""
         self.lines.clear()
         self.file_paths.clear()
         self.file_benchmarks.clear()
+        self.point_coords = {}             # point choices (overrides) are kept
+        db = self._db()
+        if db is not None:
+            db.clear_session_cache()
         self.file_listbox.delete(0, tk.END)
         self._clear_details()
         self.summary_label.config(text="No files loaded")
@@ -1639,7 +1810,8 @@ Special Requirements:"""
                 and self.current_project.name != "Unnamed Project" else "geo_level")
         win = AdjustmentWindow(self.root, self.lines, leveling_class=cls,
                                known_heights=self.file_benchmarks,
-                               selected_lines=selected_lines, project_name=name)
+                               selected_lines=selected_lines, project_name=name,
+                               db_heights=self._db_heights if self._db() else None)
         self.root.wait_window(win)
         if win.result is not None:
             self._log(f"Adjustment completed ({win.result.method}, "
@@ -1730,7 +1902,7 @@ Special Requirements:"""
 
                 # Export GeoJSON (only used lines)
                 geojson_path = Path(folder) / "lines.geojson"
-                gj = GeoJSONExporter()
+                gj = GeoJSONExporter(self._coordinate_manager())
                 used_lines = [line for line in self.lines if line.is_used]
                 gj.export_lines(used_lines, str(geojson_path))
 
@@ -1890,8 +2062,10 @@ Features:
             messagebox.showinfo("No Data", "No data to save")
             return
 
-        # Sync lines to project
+        # Sync lines and point-verification choices to project
         self.current_project.lines = self.lines
+        self.current_project.point_overrides = dict(self.point_overrides)
+        self.current_project.point_origin = dict(self.point_origin)
 
         # Ask for project name if unnamed
         if self.current_project.name == "Unnamed Project":
@@ -1929,6 +2103,10 @@ Features:
                 self.current_project = project
                 self.lines = project.lines
                 self.file_paths = [line.filename for line in self.lines]
+                # DB coordinates come from the saved benchmarks; no DB query
+                self.point_overrides = dict(getattr(project, "point_overrides", {}) or {})
+                self.point_origin = dict(getattr(project, "point_origin", {}) or {})
+                self.point_coords = {}
 
                 # Update UI
                 self.file_listbox.delete(0, tk.END)
@@ -2029,7 +2207,9 @@ Total Points: {len(self.current_project.get_all_points())}
                 self.current_project.lines = self.lines
 
                 builder = QGISVirtualLayerBuilder()
-                output_files = builder.export_for_qgis(self.current_project, folder, include_geojson=True)
+                output_files = builder.export_for_qgis(
+                    self.current_project, folder, include_geojson=True,
+                    coord_manager=self._coordinate_manager())
 
                 messagebox.showinfo("Export Complete",
                     f"QGIS files exported to:\n{folder}\n\n"

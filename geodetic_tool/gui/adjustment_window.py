@@ -36,12 +36,14 @@ class AdjustmentWindow(tk.Toplevel):
     def __init__(self, parent, lines, leveling_class: str = "H3",
                  known_heights: Optional[Dict[str, float]] = None,
                  selected_lines=None, project_name: str = "geo_level",
-                 output_dir: str = ""):
+                 output_dir: str = "", db_heights=None):
         super().__init__(parent)
         self.title("Network Adjustment (LSA) / תיאום רשת")
         fit_to_screen(self, 1280, 780)
         self.lines = list(lines or [])
         self.known_heights = dict(known_heights or {})
+        # db_heights(pids) -> {pid: height}: one batched benchmark-DB lookup
+        self.db_heights = db_heights
         self.project_name = project_name or "geo_level"
         self.output_dir = output_dir or ""
         self.result = None
@@ -102,6 +104,8 @@ class AdjustmentWindow(tk.Toplevel):
         ttk.Button(er, text="+ Add", command=self._add_fp_from_entries).pack(side=tk.LEFT)
         ttk.Button(er, text="− Remove", command=self._remove_fp).pack(side=tk.LEFT)
         ttk.Button(er, text="Auto-Select", command=self.auto_select).pack(side=tk.LEFT)
+        if self.db_heights is not None:
+            ttk.Button(er, text="Fetch from DB", command=self.fetch_from_db).pack(side=tk.LEFT)
 
         of = ttk.LabelFrame(left, text="Options / אפשרויות")
         of.pack(fill=tk.X, pady=4)
@@ -253,9 +257,19 @@ class AdjustmentWindow(tk.Toplevel):
         self.fp_tree.delete(*self.fp_tree.get_children())
 
     def auto_select(self):
+        """Points of the ticked lines with a known height: from the loaded
+        FA0/FA1 files first, else from the benchmark DB."""
         lines = self.active_lines()
         pts = sorted({p for ln in lines for p in (ln.start_point, ln.end_point) if p})
-        rows = [(p, f"{self.known_heights[p]:.4f}") for p in pts if p in self.known_heights]
+        heights = {}
+        if self.db_heights is not None:
+            try:
+                heights.update(self.db_heights([p for p in pts
+                                                if p not in self.known_heights]) or {})
+            except Exception:
+                pass
+        heights.update({p: self.known_heights[p] for p in pts if p in self.known_heights})
+        rows = [(p, f"{heights[p]:.4f}") for p in pts if p in heights]
         if len(lines) == 1:
             have = {p for p, _ in rows}
             rows += [(p, "") for p in (lines[0].start_point, lines[0].end_point)
@@ -263,6 +277,23 @@ class AdjustmentWindow(tk.Toplevel):
         self.clear_fixed()
         for p, h in rows:
             self.add_fixed(p, h)
+
+    def fetch_from_db(self):
+        """Fill empty heights in the fixed-point list from the DB."""
+        empty = [iid for iid in self.fp_tree.get_children()
+                 if not str(self.fp_tree.item(iid, "values")[1]).strip()]
+        pids = [str(self.fp_tree.item(iid, "values")[0]).strip() for iid in empty]
+        found = self.db_heights(pids) if (self.db_heights and pids) else {}
+        for iid, pid in zip(empty, pids):
+            if pid in found:
+                vals = list(self.fp_tree.item(iid, "values"))
+                vals[1] = f"{found[pid]:.4f}"
+                self.fp_tree.item(iid, values=vals)
+        missing = [p for p in pids if p not in found]
+        msg = f"Filled {len(found)} height(s) from the DB."
+        if missing:
+            msg += "\nNo height in the DB for: " + ", ".join(missing)
+        messagebox.showinfo("Fetch from DB", msg, parent=self)
 
     def collect_fixed(self) -> Dict[str, float]:
         fixed = {}

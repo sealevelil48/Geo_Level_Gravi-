@@ -17,6 +17,45 @@ from geodetic_tool.config.settings import get_settings, FileFormat
 logger = logging.getLogger(__name__)
 
 
+
+# cp1255 bytes 0xE0-0xFA are the Hebrew letters alef..tav (U+05D0-U+05EA).
+# A cp1255 file that was opened as Latin-1 and re-saved as UTF-8 turns them
+# into U+00E0-U+00FA ('2751\u05d1' -> '2751\u00e1'); this table undoes that.
+_LATIN1_AS_HEBREW = {0xE0 + i: 0x05D0 + i for i in range(0xFB - 0xE0)}
+
+
+def decode_survey_text(raw: bytes, encodings) -> tuple:
+    """Decode a field / summary file.  Returns (text, encoding used | None).
+
+    * Pure ASCII: decoded directly.
+    * Valid UTF-8 with non-ASCII bytes: UTF-8 (cp1255 would also "succeed" on
+      those bytes and produce garbage such as '\u05b3\u00a1').  Hebrew letters
+      that arrived as Latin-1 look-alikes are restored, but only when the
+      text holds no real Hebrew.
+    * Otherwise the configured encodings in order (cp1255 first by default),
+      last resort Latin-1 with replacements (encoding None).
+    """
+    try:
+        raw.decode("ascii")
+        return raw.decode("ascii"), "ascii"
+    except UnicodeDecodeError:
+        pass
+    try:
+        text = raw.decode("utf-8")
+        if not any("\u05d0" <= ch <= "\u05ea" for ch in text):
+            text = text.translate(_LATIN1_AS_HEBREW)
+        return text, "utf-8"
+    except UnicodeDecodeError:
+        pass
+    for enc in encodings:
+        if not enc or enc.lower().replace("-", "") in ("utf8",):
+            continue
+        try:
+            return raw.decode(enc), enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("latin-1", errors="replace"), None
+
 class BaseParser(ABC):
     """Abstract base class for geodetic file parsers."""
     
@@ -76,23 +115,16 @@ class BaseParser(ABC):
         Returns:
             List of lines from the file
         """
-        encodings = [self.encoding] + self.settings.encoding.fallback_encodings
-        
-        for enc in encodings:
-            try:
-                with open(filepath, 'r', encoding=enc) as f:
-                    lines = f.readlines()
-                logger.debug(f"Successfully read {filepath} with encoding {enc}")
-                return lines
-            except (UnicodeDecodeError, LookupError):
-                continue
-        
-        # Last resort: read with errors='replace'
-        with open(filepath, 'r', encoding='latin-1', errors='replace') as f:
-            lines = f.readlines()
-        self.warnings.append(f"Could not detect encoding, used latin-1 with replacements")
-        return lines
-    
+        with open(filepath, 'rb') as f:
+            raw = f.read()
+        text, enc = decode_survey_text(
+            raw, [self.encoding] + list(self.settings.encoding.fallback_encodings))
+        if enc is None:
+            self.warnings.append("Could not detect encoding, used latin-1 with replacements")
+        else:
+            logger.debug(f"Successfully read {filepath} with encoding {enc}")
+        return text.splitlines(keepends=True)
+
     def extract_filename(self, filepath: str) -> str:
         """Extract just the filename without path or extension."""
         return Path(filepath).stem

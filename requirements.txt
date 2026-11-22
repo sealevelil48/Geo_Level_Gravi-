@@ -1,2 +1,7 @@
 pandas>=1.3.0
 numpy>=1.20.0
+# Optional
+# matplotlib>=3.5        # charts, PDF report
+# psycopg2-binary>=2.9   # benchmark database (PostgreSQL / PostGIS)
+# keyring>=23            # remember the DB password in the system keyring
+# pyproj>=3.0            # PROJ for ITM -> WGS 84 (built-in fallback gives the same result)

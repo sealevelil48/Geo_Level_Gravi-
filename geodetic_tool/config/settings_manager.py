@@ -62,7 +62,7 @@ class SettingsManager:
 
         # Resolve path relative to this file: .../geodetic_tool/config/ → .../resources/
         default_cfg_path = (
-            Path(__file__).resolve().parent.parent.parent
+            Path(__file__).resolve().parent.parent      # .../geodetic_tool
             / "resources"
             / "default_db_config.json"
         )
@@ -287,7 +287,7 @@ class SettingsManager:
         Return the stored DB connection parameters dict.
 
         Keys: host, port, dbname, user, table, authcfg.
-        Password is NEVER stored here — it lives in QgsAuthManager.
+        Password is NEVER stored here (QGIS: QgsAuthManager; standalone: OS keyring / session).
 
         Returns:
             dict with connection params, or {} if not configured.

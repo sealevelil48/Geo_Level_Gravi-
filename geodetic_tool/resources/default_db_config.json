@@ -1,0 +1,11 @@
+{
+  "_comment": "Seeded into ~/.geodetic_tool/settings.json on first run when no DB host is configured. Never put a password here.",
+  "db_connection": {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "cp_bangal",
+    "user": "postgres",
+    "table": "public.cp_table",
+    "authcfg": ""
+  }
+}

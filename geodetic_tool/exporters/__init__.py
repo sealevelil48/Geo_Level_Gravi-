@@ -58,7 +58,8 @@ class FA0Exporter:
         with open(filepath, 'w', encoding=self.encoding) as f:
             # Header line
             num_points = len(benchmarks) + self._count_unknown_points(observations, benchmarks)
-            f.write(f"  {num_points}   2            {project_name:40}9\n")
+            # "npoints  nfixed  name": the first nfixed listed points are fixed
+            f.write(f"  {num_points}{len(benchmarks):4d}            {project_name:40}9\n")
             
             # Benchmark heights
             for bm in benchmarks:
@@ -177,7 +178,8 @@ class FA1Exporter:
             [obs.to_point for obs in observations]
         ))
         
-        f.write(f"{' ' * 43}{num_points}   2            {project_name:40}9\n\n\n\n")
+        # "npoints  nfixed  name": the first nfixed listed points are fixed
+        f.write(f"{' ' * 43}{num_points}{len(benchmarks):4d}            {project_name:40}9\n\n\n\n")
         
         # Point heights
         f.write(" " * 43 + "DATA\n")
@@ -191,7 +193,9 @@ class FA1Exporter:
             all_points.add(obs.from_point)
             all_points.add(obs.to_point)
         
-        for point_id in sorted(all_points):
+        fixed_first = [bm.point_id for bm in benchmarks]
+        ordered = fixed_first + sorted(all_points - set(fixed_first))
+        for point_id in ordered:
             if point_id in known_heights:
                 height = known_heights[point_id]
                 f.write(f"{' ' * 42}{idx:3}  {point_id:8}{height:12.3f}\n")

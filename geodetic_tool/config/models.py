@@ -267,6 +267,10 @@ class ProjectData:
     is_joint_project: bool = False
     source_projects: List[str] = field(default_factory=list)  # Track source project names
     project_path: Optional[str] = None  # File path for persistence
+    # Benchmark-DB point choices (Point Verification), re-applied on reload:
+    # {raw field ID: {"mode": ..., "record": {...}}} and {name: raw field ID}
+    point_overrides: Dict[str, dict] = field(default_factory=dict)
+    point_origin: Dict[str, str] = field(default_factory=dict)
 
     def add_line(self, line: LevelingLine):
         """Add a leveling line to the project."""
