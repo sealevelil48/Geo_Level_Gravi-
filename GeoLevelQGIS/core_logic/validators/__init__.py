@@ -448,6 +448,8 @@ class BatchValidator:
         Returns:
             Dictionary with summary statistics
         """
+        # accept validate_batch() output [(line, result)] as well
+        results = [r[1] if isinstance(r, tuple) else r for r in results]
         total = len(results)
         valid = sum(1 for r in results if r.is_valid)
         invalid = total - valid

@@ -58,12 +58,13 @@ def parse_files(filepaths: List[str]) -> List[LevelingLine]:
             continue
         
         try:
-            line = parser.parse(fp)
-            lines.append(line)
-            logger.info(
-                f"Parsed {path.name}: {line.start_point} → {line.end_point}, "
-                f"{line.num_setups} setups, {line.total_distance:.2f}m"
-            )
+            # Summary files (.FA0 / .FA1 / .rez) hold one line per row
+            for line in parser.parse_many(fp):
+                lines.append(line)
+                logger.info(
+                    f"Parsed {path.name}: {line.start_point} → {line.end_point}, "
+                    f"{line.num_setups} setups, {line.total_distance:.2f}m"
+                )
         except Exception as e:
             logger.error(f"Failed to parse {fp}: {e}")
     
@@ -85,7 +86,7 @@ def validate_files(lines: List[LevelingLine]) -> dict:
     summary = validator.get_summary(results)
     
     # Log issues
-    for line, result in zip(lines, results):
+    for line, result in results:
         if not result.is_valid:
             for error in result.errors:
                 logger.error(f"{line.filename}: {error}")
