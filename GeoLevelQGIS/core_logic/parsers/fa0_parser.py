@@ -39,11 +39,15 @@ class FA0Parser(BaseParser):
         rows = self.read_file(filepath)
         if not any(r.strip() for r in rows):
             raise ValueError("Empty or unreadable file")
-        self.benchmarks: Dict[str, float] = {}
+        self.benchmarks: Dict[str, float] = {}      # fixed points
+        self.approx_heights: Dict[str, float] = {}  # other listed heights
         self.unknown_points: List[str] = []
         stem = Path(filepath).stem
         lines: List[LevelingLine] = []
-        body = rows[1:] if rows and self._is_header(rows[0]) else rows
+        has_header = bool(rows) and self._is_header(rows[0])
+        n_fixed = self.header_fixed_count(rows[0]) if has_header else None
+        listed = 0
+        body = rows[1:] if has_header else rows
         for no, raw in enumerate(body, start=2):
             text = raw.rstrip("\r\n")
             toks = text.split()
@@ -52,10 +56,14 @@ class FA0Parser(BaseParser):
             if toks == ["9"]:
                 break
             if len(toks) == 2 and (toks[1] == "." or is_number(toks[1])):
-                if toks[1] == ".":
+                listed += 1
+                h = None if toks[1] == "." else to_float(toks[1])
+                if h is None:
                     self.unknown_points.append(toks[0])
+                elif n_fixed is None or listed <= n_fixed:
+                    self.benchmarks[toks[0]] = h
                 else:
-                    self.benchmarks[toks[0]] = to_float(toks[1])
+                    self.approx_heights[toks[0]] = h
                 continue
             obs = self._parse_observation(text)
             if obs is None:
@@ -71,6 +79,16 @@ class FA0Parser(BaseParser):
                     len(lines), len(self.benchmarks), Path(filepath).name)
         logger.debug("FA0 known heights: %s", self.benchmarks)
         return lines
+
+    @staticmethod
+    def header_fixed_count(row: str):
+        """Second header number = how many of the listed points (the first
+        ones) are FIXED, e.g. '36   2   K6177-64PU-65PU   9' -> 2.  The
+        remaining listed heights are approximate heights.  None if absent."""
+        toks = row.split()
+        if len(toks) >= 2 and toks[0].isdigit() and toks[1].isdigit():
+            return int(toks[1])
+        return None
 
     @staticmethod
     def _is_header(row: str) -> bool:
