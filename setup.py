@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="geodetic_tool",
-    version="1.0.0",
+    version="1.1.0",
     packages=find_packages(),
     install_requires=[
         "pandas>=1.3.0",

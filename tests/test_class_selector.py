@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 # Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from geodetic_tool.config.israel_survey_regulations import (
     get_default_class,

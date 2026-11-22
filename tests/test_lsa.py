@@ -3,6 +3,10 @@ Test script for LSA (Least Squares Adjustment) implementation
 
 Demonstrates both Parametric (Ax+L) and Conditional (Bv+W) adjustment methods.
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import numpy as np
 from geodetic_tool.engine import (
     LeastSquaresAdjuster,

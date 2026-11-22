@@ -1750,34 +1750,33 @@ GEODETIC LEVELING TOOL - QUICK REFERENCE
 =========================================
 
 FILE FORMATS SUPPORTED:
-• Trimble DAT (pipe-delimited)
-• Leica RAW/GSI (fixed-width)
+• Trimble DAT, Leica RAW / GSI-8 / GSI-16 (one line per file)
+• FA0 / FA1 / REZ summary files (one line per row; known
+  heights in the file become fixed-point candidates)
 
 WORKFLOW:
 1. Load Files: File > Open Files or Open Folder
 2. Validate: Analysis > Validate All
-3. Review: Check Line Details tab
-4. Adjust: Analysis > Line Adjustment (single line)
-         or Analysis > Network Adjustment (LSA)
-5. Export: File > Export Results
+3. Review: line list, Line Details, Validation messages
+4. Adjust: Analysis > Network Adjustment (LSA)
+   (Line Adjustment opens the same window for one line)
+5. Export: FA0 / FA1 / PDF from the adjustment window,
+   REZ / GeoJSON from File > Export
 
-LINE ADJUSTMENT (תיאום קו):
-- Select a line from the list
-- Enter known start and end heights
-- Choose leveling class (1-4)
-- View misclosure and intermediate heights
+ADJUSTMENT WINDOW (תיאום רשת):
+- Prepare (Steps 1-2): forward/return runs averaged and
+  checked against k*sqrt(L) (L one direction); approximate
+  heights from the fixed points
+- Choose fixed points, method (Parametric V=AX-L or
+  Conditional Bv+w=0), weights (distance / setups / equal)
+- Run: adjusted heights with sigma and 95%, residuals,
+  BM-to-BM misclosures
+- Single line: misclosure distributed by distance between
+  two known heights
 
-NETWORK ADJUSTMENT (תיאום רשת):
-- Requires 2+ lines
-- Select fixed points (benchmarks)
-- Enter their known heights
-- Run LSA to get adjusted heights
-
-TOLERANCE CLASSES:
-• Class 1: 3 mm × √km (First order)
-• Class 2: 5 mm × √km (Second order)
-• Class 3: 10 mm × √km (Third order)
-• Class 4: 20 mm × √km (Fourth order)
+TOLERANCES  k * sqrt(L km), Directive G2 (2021):
+• H1 3 mm   • H2 5 mm   • H3 10 mm
+• H4 20 mm  • H5 30 mm  • H6 60 mm
         """
         messagebox.showinfo("Documentation", docs_text)
 
