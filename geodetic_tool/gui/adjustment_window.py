@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional
 
 from ..config.models import Benchmark, MeasurementSummary
+from .window_utils import fit_to_screen
 from ..engine.least_squares import (
     ConditionalAdjuster, LeastSquaresAdjuster, lines_to_observations)
 from ..engine.network_prep import (
@@ -38,7 +39,7 @@ class AdjustmentWindow(tk.Toplevel):
                  output_dir: str = ""):
         super().__init__(parent)
         self.title("Network Adjustment (LSA) / תיאום רשת")
-        self.geometry("1280x780")
+        fit_to_screen(self, 1280, 780)
         self.lines = list(lines or [])
         self.known_heights = dict(known_heights or {})
         self.project_name = project_name or "geo_level"
@@ -109,10 +110,10 @@ class AdjustmentWindow(tk.Toplevel):
         orow = ttk.Frame(of)
         orow.pack(fill=tk.X)
         ttk.Label(orow, text="Weights:").pack(side=tk.LEFT)
-        ttk.Combobox(orow, textvariable=self.weight_var, state="readonly", width=22,
+        ttk.Combobox(orow, height=12, textvariable=self.weight_var, state="readonly", width=22,
                      values=[w[0] for w in WEIGHTS]).pack(side=tk.LEFT)
         ttk.Label(orow, text="Class:").pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Combobox(orow, textvariable=self.class_var, state="readonly", width=5,
+        ttk.Combobox(orow, height=12, textvariable=self.class_var, state="readonly", width=5,
                      values=["H1", "H2", "H3", "H4", "H5", "H6"]).pack(side=tk.LEFT)
 
         ttk.Button(left, text="Prepare (Steps 1–2) / הכנה", command=self.prepare).pack(fill=tk.X)

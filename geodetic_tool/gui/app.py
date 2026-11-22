@@ -18,6 +18,7 @@ from dataclasses import dataclass
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ..parsers.base_parser import create_parser, detect_file_format
+from .window_utils import fit_to_screen
 from ..parsers.trimble_parser import TrimbleParser
 from ..parsers.leica_parser import LeicaParser
 from ..validators import LevelingValidator, BatchValidator
@@ -53,7 +54,7 @@ class PointExclusionDialog(tk.Toplevel):
     def __init__(self, parent, all_lines: List[LevelingLine]):
         super().__init__(parent)
         self.title("Point Exclusion / ה exclusion נקודה")
-        self.geometry("800x600")
+        fit_to_screen(self, 800, 600)
         self.transient(parent)
         self.grab_set()
 
@@ -168,14 +169,21 @@ class PointExclusionDialog(tk.Toplevel):
 
     def _filter_points(self, *args):
         """Filter points list based on search text."""
-        search_text = self.search_var.get().lower()
+        from ..engine.point_normalizer import point_query_rank
+        query = self.search_var.get()
         self.points_listbox.delete(0, tk.END)
 
-        sorted_points = sorted(self.all_points)
-        for point in sorted_points:
-            if search_text in point.lower():
-                usage_count = len(self.point_usage.get(point, []))
-                self.points_listbox.insert(tk.END, f"{point} (used in {usage_count} line(s))")
+        # Same matching as the plugin's DB search: "117" = point number 117
+        # (not "1/17"), "117/MSA" also finds "117MSA"; best matches first.
+        ranked = []
+        for point in self.all_points:
+            rank = point_query_rank(query, point)
+            if rank is not None:
+                ranked.append((rank, len(point), point))
+        ranked.sort()
+        self.points_listbox.insert(tk.END, *[
+            f"{point} (used in {len(self.point_usage.get(point, []))} line(s))"
+            for _, _, point in ranked])
 
     def _on_point_select(self, event):
         """Handle point selection."""
@@ -317,7 +325,7 @@ class ClassSettingsDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Class Settings / הגדרות דרגות דיוק")
-        self.geometry("1100x800")
+        fit_to_screen(self, 1100, 800)
         self.transient(parent)
         self.grab_set()
 
@@ -607,7 +615,7 @@ class MergeDialog(tk.Toplevel):
     def __init__(self, parent, all_lines: List[LevelingLine], selected_indices: List[int] = None):
         super().__init__(parent)
         self.title("Merge Line Segments / מיזוג קווים")
-        self.geometry("1000x700")
+        fit_to_screen(self, 1000, 700)
         self.transient(parent)
         self.grab_set()
 
@@ -832,7 +840,7 @@ class GeodeticToolGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Geodetic Leveling Tool - פילוס גיאודטי")
-        self.root.geometry("1200x800")
+        fit_to_screen(self.root, 1200, 800)
         self.root.minsize(800, 600)
 
         # Data storage
@@ -1157,7 +1165,7 @@ class GeodeticToolGUI:
 
         self.class_selector_var = tk.StringVar(value=current_class)
         class_selector = ttk.Combobox(
-            class_frame,
+            class_frame, height=12,
             textvariable=self.class_selector_var,
             values=["H1", "H2", "H3", "H4", "H5", "H6"],
             state="readonly",
@@ -1785,7 +1793,7 @@ TOLERANCE CLASSES:
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Encoding Settings / הגדרות קידוד")
-        dialog.geometry("500x300")
+        fit_to_screen(dialog, 500, 300)
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -2222,7 +2230,7 @@ Total Points: {len(self.current_project.get_all_points())}
         # Create report dialog
         report_dialog = tk.Toplevel(self.root)
         report_dialog.title("Removed Files Report - דוח קבצים שהוסרו")
-        report_dialog.geometry("900x600")
+        fit_to_screen(report_dialog, 900, 600)
         report_dialog.transient(self.root)
 
         # Header

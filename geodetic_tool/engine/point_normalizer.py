@@ -110,3 +110,46 @@ class PointNormalizer:
                     return result
 
         return result
+
+
+def _point_number(name: str) -> str:
+    """The point NUMBER of a name: the first digit run of its first part.
+    '117/MSA' -> '117', 'MSA117' -> '117', '1/17' -> '1', 'PKT1' -> '1'."""
+    first = re.split(r"[/\-\s_.]", (name or "").strip(), maxsplit=1)[0]
+    m = re.search(r"\d+", first) or re.search(r"\d+", name or "")
+    return m.group(0) if m else ""
+
+
+def point_query_rank(query: str, name: str):
+    """Rank how well point *name* matches a search *query* (lower is better),
+    or None when it does not match.  Same rules as the QGIS plugin's
+    benchmark-DB search:
+
+    * a number-only query ("117") is a point NUMBER: it matches the number
+      part only, so "1/17" (number 1, letters 17 - glued it also reads
+      "117") is NOT a hit; 117/A, 117MSA (exact) rank before 1117B (contains);
+    * any other query matches the name with or without separators
+      ("117/MSA" finds "117MSA" and vice versa): exact, then starts-with,
+      then contains.
+    """
+    q = (query or "").strip().upper()
+    if not q:
+        return 0
+    n = (name or "").strip().upper()
+    if re.sub(r"\s", "", q).isdigit():
+        num, qd = _point_number(n), re.sub(r"\s", "", q)
+        if num == qd:
+            return 0
+        if num.startswith(qd):
+            return 1
+        if qd in num:
+            return 2
+        return None
+    qs, ns = PointNormalizer.strip_separators(q), PointNormalizer.strip_separators(n)
+    if q == n or (qs and qs == ns):
+        return 0
+    if n.startswith(q) or (qs and ns.startswith(qs)):
+        return 1
+    if q in n or (qs and qs in ns):
+        return 2
+    return None

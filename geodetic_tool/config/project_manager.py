@@ -16,6 +16,36 @@ from .models import ProjectData, LevelingLine, Benchmark, AdjustmentResult
 logger = logging.getLogger(__name__)
 
 
+
+def _staged_write(target: Path, write_fn) -> None:
+    """Write a file safely and fast, also on network / synced folders.
+
+    *write_fn(path)* writes into the local temp folder; the result is copied
+    next to *target* in one sequential write and then moved over it with an
+    atomic rename, so a crash or a full disk never leaves a half-written
+    project and the previous version stays intact until the new one is
+    complete.  Same scheme as the QGIS plugin's GeoPackage save.
+    """
+    import os
+    import shutil
+    import tempfile
+    stage_dir = tempfile.mkdtemp(prefix="geolevel_")
+    stage = Path(stage_dir) / ("project" + target.suffix)
+    side = target.with_name(target.name + "~tmp")
+    try:
+        write_fn(stage)
+        shutil.copyfile(stage, side)
+        os.replace(side, target)
+    except BaseException:
+        try:
+            if side.exists():
+                side.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
 class ProjectManager:
     """
     Manages geodetic leveling projects.
@@ -58,11 +88,12 @@ class ProjectManager:
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         if format == "json":
-            self._save_json(project, filepath)
+            writer = self._save_json
         elif format == "pickle":
-            self._save_pickle(project, filepath)
+            writer = self._save_pickle
         else:
             raise ValueError(f"Unsupported format: {format}")
+        _staged_write(filepath, lambda tmp: writer(project, tmp))
 
         logger.info(f"Project '{project.name}' saved to {filepath}")
         return str(filepath)
