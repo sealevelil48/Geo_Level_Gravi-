@@ -73,6 +73,10 @@ class LevelingLine:
     original_direction: str = "BF"  # Track original direction for reversal
     manager_override: bool = False  # Manager override: treat as valid despite validation failure
     source_path: Optional[str] = None  # Absolute path of the measurement file it was parsed from
+    # True for lines read from a summary file (.FA0 / .FA1 / .rez): one row of
+    # the file = one line; its setups are evenly split placeholders that keep
+    # the setup count, so setup-level field checks are not applied.
+    is_summary: bool = False
     
     @property
     def num_setups(self) -> int:
@@ -195,7 +199,16 @@ class AdjustmentResult:
     total_distance_km: float
     total_diff_mm: float
     k_coefficient: float                # Classification coefficient
-    
+    # --- Extended results (filled by the adjusters; all optional) ---
+    method: str = ""                                              # 'parametric' / 'conditional'
+    approximate_heights: Dict[str, float] = field(default_factory=dict)
+    corrections: Dict[str, float] = field(default_factory=dict)  # adjusted - approximate (m)
+    fixed_points: Dict[str, float] = field(default_factory=dict)
+    degrees_of_freedom: int = 0
+    observations: List[Dict] = field(default_factory=list)       # per-observation table
+    benchmark_misclosures: List[Dict] = field(default_factory=list)
+    weight_mode: str = "distance"
+
     def to_dataframe(self) -> pd.DataFrame:
         """Convert adjusted heights to DataFrame."""
         data = []

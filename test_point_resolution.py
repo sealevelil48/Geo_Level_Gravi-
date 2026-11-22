@@ -107,7 +107,8 @@ check(anchor is not None and math.hypot(anchor[0] - 253400, anchor[1] - 751900) 
       f"anchor established near Ginosar from unambiguous points: {anchor}")
 scored = db.score_candidates("250A", batch["250A"], lines_k, batch)
 gilboa = [r for r in scored if r.kfar_aher_name == "Gilboa"][0]
-check(gilboa.in_radius is False, f"Gilboa 250/A out of 15 km radius (d={gilboa.dist_to_anchor_m/1000:.1f} km)")
+check(gilboa.dist_to_anchor_m > 15000,
+      f"Gilboa 250/A ~{gilboa.dist_to_anchor_m/1000:.0f} km away is still offered (no 15 km radius)")
 check(gilboa.topo_ok is False, "Gilboa 250/A fails measured-length check (2 km line, ~40 km away)")
 check(scored[-1] is gilboa, "Gilboa 250/A ranked last")
 check(db.pick_unambiguous(scored) is None,
@@ -122,26 +123,14 @@ b2 = db2.get_candidates_batch(["250A"])
 db2._resolved_coords["GILBOA1"] = (237500.0, 713000.0)   # unambiguous Gilboa point
 db2.establish_anchor(b2)
 s2 = db2.score_candidates("250A", b2["250A"], [], b2)
-check(s2[0].kfar_aher_name == "Gilboa" and s2[0].in_radius is True,
-      "Gilboa survey: Gilboa 250/A ranked first, in radius")
-check(all(r.in_radius is False for r in s2 if r.kfar_aher_name == "Ginosar"),
-      "Gilboa survey: Kineret 250/A and 849/L out of radius")
-check(db2.pick_unambiguous(s2) is not None and db2.pick_unambiguous(s2).kfar_aher_name == "Gilboa",
-      "Gilboa survey: Gilboa 250/A auto-approved (Kineret twins are out of radius)")
+check(s2[0].kfar_aher_name == "Gilboa",
+      "Gilboa survey: Gilboa 250/A ranked first (nearest to the field anchor)")
+check(any(r.kfar_aher_name == "Ginosar" for r in s2),
+      "Gilboa survey: far Kineret candidates are still listed (no radius filter)")
 
-# ---------------------------------------------------------------- 6. _resolve_by_proximity honours radius
-db3 = FakeDB()
-db3._anchor = (237500.0, 713000.0)
-win = db3._resolve_by_proximity([r for r in b2["250A"] if r.name == "250/A"], "250A")
-check(win.kfar_aher_name == "Gilboa", "_resolve_by_proximity picks in-radius candidate")
-db3._anchor = (200000.0, 600000.0)   # nothing within 15 km
-win = db3._resolve_by_proximity(list(b2["250A"]), "250A")
-check(win is not None, "_resolve_by_proximity never returns None when all are out of radius")
-
-# ---------------------------------------------------------------- 7. radius setting
-db.set_search_radius_km(50)
-s50 = db.score_candidates("250A", batch["250A"], [], batch)
-check(all(r.in_radius for r in s50), "radius 50 km -> Gilboa now inside radius")
+# ---------------------------------------------------------------- 6-7. no radius setting any more
+check(not hasattr(db, "set_search_radius_km"),
+      "15 km working-radius setting removed (long cross-country lines)")
 
 # ---------------------------------------------------------------- 8. per-pid copies
 check(batch["250A"][0] is not batch["849L"][-1], "records are per-pid copies (no annotation leakage)")

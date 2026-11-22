@@ -44,6 +44,7 @@ _LINE_COLS = [
     ("original_direction", "TEXT"),
     ("manager_override", "INTEGER"),
     ("validation", "TEXT"),          # JSON ValidationResult (schema >= 2)
+    ("is_summary", "INTEGER"),       # line imported from .FA0/.FA1/.rez
 ]
 
 _SETUP_COLS = [
@@ -140,6 +141,7 @@ def lines_to_rows(lines, val_results=None):
             "is_used": int(bool(getattr(ln, "is_used", True))),
             "original_direction": getattr(ln, "original_direction", "BF"),
             "manager_override": int(bool(getattr(ln, "manager_override", False))),
+            "is_summary": int(bool(getattr(ln, "is_summary", False))),
             "validation": (json.dumps(validation_to_dict(vr_by_line[id(ln)]),
                                       ensure_ascii=False)
                            if vr_by_line.get(id(ln)) is not None else None),
@@ -274,6 +276,7 @@ def rows_to_project(line_rows, setup_rows):
             manager_override=bool(r.get("manager_override")),
         )
         ln.source_path = r.get("source_path")
+        ln.is_summary = bool(r.get("is_summary")) if isinstance(r.get("is_summary"), (bool, int)) else False
         lines.append(ln)
         vr = None
         raw = r.get("validation")
@@ -448,6 +451,27 @@ def _str_map(v):
             if isinstance(k, str) and k.strip() and isinstance(x, str) and x.strip()}
 
 
+def _sanitize_adjustment(d):
+    """Last applied adjustment: plain numbers / strings only."""
+    if not isinstance(d, dict):
+        return {}
+    out = {}
+    for k in ("method", "saved_utc", "weight_mode"):
+        if isinstance(d.get(k), str):
+            out[k] = d[k]
+    for k in ("sigma0_mm",):
+        if _finite(d.get(k)) is not None:
+            out[k] = float(d[k])
+    if isinstance(d.get("dof"), int) and not isinstance(d.get("dof"), bool):
+        out["dof"] = d["dof"]
+    for k in ("fixed_points", "heights", "std_mm", "residuals_mm"):
+        v = d.get(k)
+        if isinstance(v, dict):
+            out[k] = {kk: float(vv) for kk, vv in v.items()
+                      if isinstance(kk, str) and _finite(vv) is not None}
+    return out
+
+
 def sanitize_meta(meta):
     """Type-check the lv_meta values read from a GeoPackage.
 
@@ -501,6 +525,12 @@ def sanitize_meta(meta):
                 if rec is not None:
                     resolved[k] = rec
     out["resolved_points"] = resolved
+
+    fb = meta.get("file_benchmarks")
+    out["file_benchmarks"] = ({k: float(v) for k, v in fb.items()
+                               if isinstance(k, str) and k.strip() and _finite(v) is not None}
+                              if isinstance(fb, dict) else {})
+    out["last_adjustment"] = _sanitize_adjustment(meta.get("last_adjustment"))
 
     od = meta.get("output_dir")
     out["output_dir"] = od if isinstance(od, str) else ""

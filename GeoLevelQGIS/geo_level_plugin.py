@@ -7,7 +7,7 @@ import os
 import sys
 import json
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from qgis.PyQt.QtWidgets import (
@@ -213,157 +213,6 @@ def _apply_point_renderer(layer):
         )
 
 
-class GeoLevelLSAInputDialog(QDialog):
-    """
-    Fixed-points input dialog for the standard LSA Network Adjustment.
-
-    Mirrors the Enhanced LSA dialog's fixed-points table so that:
-    - Users can add/remove rows with a table instead of a single text box.
-    - Auto-Select populates leaf-node endpoints (degree == 1 in network).
-    - Rows with a blank height are SKIPPED (treated as unknowns), preventing
-      the architecture-inversion bug where 0.000 or accidental entries lock
-      extra nodes as fixed constraints.
-    """
-
-    def __init__(self, lines, parent=None):
-        super().__init__(parent)
-        self._lines = lines
-        self.fixed_points = {}
-        self.setWindowTitle("LSA — Fixed Points / נקודות קבועות")
-        self.setMinimumSize(480, 340)
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-
-        grp = QGroupBox(
-            "Enter known benchmark heights.\n"
-            "Rows with a blank height are treated as unknown (adjusted) points."
-        )
-        vbox = QVBoxLayout(grp)
-
-        self.fp_table = QTableWidget(0, 2)
-        self.fp_table.setHorizontalHeaderLabels(["Point ID", "Known Height (m)"])
-        self.fp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.fp_table.setMinimumHeight(180)
-        self.fp_table.setToolTip(
-            "Enter Point ID and its KNOWN height.\n"
-            "Leave height blank to treat the point as unknown."
-        )
-        vbox.addWidget(self.fp_table)
-
-        btn_row = QHBoxLayout()
-        btn_add = QPushButton("+ Add Row")
-        btn_add.clicked.connect(self._add_row)
-        btn_del = QPushButton("− Remove")
-        btn_del.clicked.connect(self._del_row)
-        btn_auto = QPushButton("Auto-Select")
-        btn_auto.setToolTip("Populate with network leaf-node endpoints")
-        btn_auto.clicked.connect(self._auto_select)
-        btn_row.addWidget(btn_add)
-        btn_row.addWidget(btn_del)
-        btn_row.addWidget(btn_auto)
-        vbox.addLayout(btn_row)
-        layout.addWidget(grp)
-
-        ok_row = QHBoxLayout()
-        btn_ok = QPushButton("Run Adjustment")
-        btn_ok.setStyleSheet(
-            "font-weight: bold; background: #1565c0; color: white; padding: 5px 14px;"
-        )
-        btn_ok.clicked.connect(self._on_ok)
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.reject)
-        ok_row.addStretch()
-        ok_row.addWidget(btn_ok)
-        ok_row.addWidget(btn_cancel)
-        layout.addLayout(ok_row)
-
-    def _add_row(self):
-        row = self.fp_table.rowCount()
-        self.fp_table.insertRow(row)
-        self.fp_table.setItem(row, 0, QTableWidgetItem(""))
-        self.fp_table.setItem(row, 1, QTableWidgetItem(""))
-
-    def _del_row(self):
-        row = self.fp_table.currentRow()
-        if row >= 0:
-            self.fp_table.removeRow(row)
-
-    def _auto_select(self):
-        """Populate table with leaf-node endpoints (degree == 1 in network)."""
-        from collections import Counter
-        degree = Counter()
-        for ln in self._lines:
-            if ln.start_point:
-                degree[ln.start_point] += 1
-            if ln.end_point:
-                degree[ln.end_point] += 1
-        candidates = sorted(pid for pid, cnt in degree.items() if cnt == 1)
-        if not candidates:
-            candidates = sorted(degree.keys())
-        # Pre-load DB manager once so each row doesn't re-instantiate
-        try:
-            from geolevel_db_manager import get_db_manager
-            _db_mgr = get_db_manager()
-        except Exception:
-            _db_mgr = None
-
-        self.fp_table.setRowCount(0)
-        for pid in candidates:
-            r = self.fp_table.rowCount()
-            self.fp_table.insertRow(r)
-            self.fp_table.setItem(r, 0, QTableWidgetItem(pid))
-
-            height_text = ""
-            if _db_mgr is not None and _db_mgr.is_configured():
-                try:
-                    rec = _db_mgr.resolve_benchmark(pid)
-                    if rec is not None and rec.gova_ort is not None:
-                        height_text = f"{rec.gova_ort:.4f}"
-                except Exception:
-                    pass
-            self.fp_table.setItem(r, 1, QTableWidgetItem(height_text))
-
-    def _on_ok(self):
-        fixed = {}
-        skipped = []
-        for row in range(self.fp_table.rowCount()):
-            pid_item = self.fp_table.item(row, 0)
-            h_item   = self.fp_table.item(row, 1)
-            if not pid_item:
-                continue
-            pid = pid_item.text().strip()
-            if not pid:
-                continue
-            h_text = h_item.text().strip() if h_item else ""
-            if not h_text:
-                skipped.append(pid)
-                continue
-            try:
-                fixed[pid] = float(h_text)
-            except ValueError:
-                skipped.append(pid)
-
-        if skipped:
-            QMessageBox.information(
-                self, "Fixed Points — Incomplete Rows",
-                "The following points have no height and will be treated as unknowns "
-                "(adjusted):\n\n" + "\n".join(skipped) + "\n\n"
-                "Enter a known height or remove these rows before running."
-            )
-
-        if not fixed:
-            QMessageBox.warning(
-                self, "No Fixed Points",
-                "Please enter at least one point with a known height."
-            )
-            return
-
-        self.fixed_points = fixed
-        self.accept()
-
-
 class GeoLevelPlugin:
     """QGIS Plugin — Geo Level Gravi (פילוס גיאודטי)."""
 
@@ -390,6 +239,10 @@ class GeoLevelPlugin:
         self._gpkg_path = ""
         # .glp file that points at _gpkg_path ("" = none / opened .gpkg directly)
         self._glp_path = ""
+        # Known heights read from .FA0 / .FA1 files {point_id: height}
+        self._file_benchmarks = {}
+        # Last adjustment applied to the map (persisted in the GeoPackage)
+        self._last_adjustment = {}
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -426,8 +279,10 @@ class GeoLevelPlugin:
         anal_menu.addAction("Detect Double-Runs").triggered.connect(self._detect_double_runs)
         anal_menu.addAction("Find Loops").triggered.connect(self._detect_loops)
         anal_menu.addSeparator()
-        anal_menu.addAction("Line Adjustment...").triggered.connect(self._adjust_current_line)
-        anal_menu.addAction("Network Adjustment (LSA)...").triggered.connect(self._run_lsa)
+        anal_menu.addAction("Line Adjustment (selected line)...").triggered.connect(
+            self._adjust_current_line)
+        anal_menu.addAction("Network Adjustment (LSA)...").triggered.connect(
+            lambda _=False: self._run_lsa())
         anal_menu.addSeparator()
         anal_menu.addAction("Merge Line Segments...").triggered.connect(self._open_merge_dialog)
 
@@ -483,7 +338,7 @@ class GeoLevelPlugin:
 
         self.dock.line_selected.connect(self._on_line_selected)
         self.dock.adjust_line_requested.connect(self._adjust_single_line)
-        self.dock.lsa_requested.connect(self._run_lsa)
+        self.dock.lsa_requested.connect(lambda: self._run_lsa())
         self.dock.files_added.connect(self._process_files)
         self.dock.double_runs_requested.connect(self._detect_double_runs)
         self.dock.loops_requested.connect(self._detect_loops)
@@ -569,9 +424,13 @@ class GeoLevelPlugin:
         existing = {ln.filename for ln in self._lines}
         existing.update(os.path.normcase(os.path.abspath(ln.source_path))
                         for ln in self._lines if getattr(ln, "source_path", None))
-        new_paths = [fp for fp in file_paths
-                     if os.path.normcase(os.path.abspath(fp)) not in existing
-                     and Path(fp).stem not in existing]
+        new_paths, seen = [], set()
+        for fp in file_paths:
+            key = os.path.normcase(os.path.abspath(fp))
+            if key in seen or key in existing or Path(fp).stem in existing:
+                continue
+            seen.add(key)       # a summary file (.FA0) holds many lines: parse once
+            new_paths.append(fp)
         if not new_paths:
             self.iface.messageBar().pushMessage(
                 "Geo Level Gravi", "All selected files are already loaded.",
@@ -649,6 +508,8 @@ class GeoLevelPlugin:
             self._pending_pid_remap = {}   # consume — one-shot per load
 
         new_lines = result["lines"]
+        # Known heights carried by .FA0 / .FA1 files (fixed-point candidates)
+        self._file_benchmarks.update(result.get("file_benchmarks") or {})
         # Keep setup endpoints consistent with the renamed line endpoints
         self._rename_points_in_lines(new_lines, pid_remap, setups_only=True)
         # Re-apply exclusions chosen in the dialog (the re-run re-parsed them)
@@ -940,7 +801,7 @@ class GeoLevelPlugin:
             # directly, without re-parsing files or querying the DB.
             "gpkg": gpkg_ref,
             # Real measurement-file paths (fallback when the GPKG is missing)
-            "files": [self._line_src_path(ln) for ln in self._lines],
+            "files": list(dict.fromkeys(self._line_src_path(ln) for ln in self._lines)),
             # Point Settings choices keyed by original field point ID
             "point_overrides": self._point_overrides,
         }
@@ -1008,7 +869,9 @@ class GeoLevelPlugin:
         # -- Fast path: everything is in the project GeoPackage ----------
         gpkg = self._resolve_gpkg_ref(data.get("gpkg"), glp_dir, output_dir)
         if gpkg and self._load_project_from_gpkg(gpkg, cls, output_dir, overrides):
-            # Load succeeded: _load_project_from_gpkg sets _glp_path only for GPKG direct open (empty)
+            # Loaded from the GeoPackage: this .glp is now the open project
+            # (needed so a later fallback GPKG name is written back to it).
+            self._glp_path = os.path.abspath(path)
             return
         cls = cls or "H3"
 
@@ -1168,12 +1031,14 @@ class GeoLevelPlugin:
             "leveling_class": cls,
             "class": cls,                       # schema-1 readers
             "output_dir": self._last_output_dir,
-            "dat_files": [self._line_src_path(ln) for ln in self._lines],
+            "dat_files": list(dict.fromkeys(self._line_src_path(ln) for ln in self._lines)),
             "point_overrides": self._point_overrides,
             "point_origin": self._point_origin,
             "pid_remap": pid_remap,
             "resolved_points": resolved,
-            "saved_utc": datetime.utcnow().isoformat(timespec="seconds"),
+            "saved_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "file_benchmarks": dict(self._file_benchmarks),
+            "last_adjustment": dict(self._last_adjustment),
         }
 
     @staticmethod
@@ -1494,6 +1359,7 @@ class GeoLevelPlugin:
             output_dir = os.path.dirname(gpkg)
 
         # Fresh session state (nothing from a previous project may leak in)
+        self._glp_path = ""
         self._pending_marker_pids = {}
         self._pending_excluded = set()
         self._pending_unuse = set()
@@ -1512,6 +1378,8 @@ class GeoLevelPlugin:
         for old, new in self._pending_pid_remap.items():
             self._point_origin.setdefault(new, old)
         self._restore_point_cache(meta["resolved_points"])
+        self._file_benchmarks = dict(meta.get("file_benchmarks") or {})
+        self._last_adjustment = dict(meta.get("last_adjustment") or {})
 
         self._remove_result_layers()
         self._gpkg_path = gpkg
@@ -1614,6 +1482,8 @@ class GeoLevelPlugin:
         self._gpkg_path = ""
         self._glp_path = ""
         self._pending_pid_remap = {}
+        self._file_benchmarks = {}
+        self._last_adjustment = {}
 
         # Remove the QGIS map layers (lines + points)
         self._remove_result_layers()
@@ -2509,35 +2379,45 @@ class GeoLevelPlugin:
         canvas.refresh()
 
     def _apply_lsa_to_layer(self, result):
-        """Add/update adj_height field on point features in the active layer."""
-        if not self._layer or not self._layer.isValid():
-            return
-        from qgis.core import QgsField
-        from qgis.PyQt.QtCore import QVariant
-
-        layer = self._layer
-        layer.startEditing()
-
-        # Add adj_height field if absent
-        if layer.fields().indexOf("adj_height") < 0:
-            layer.addAttribute(QgsField("adj_height", QVariant.Double, "double", 12, 5))
-
-        adj_idx = layer.fields().indexOf("adj_height")
-        pid_idx = layer.fields().indexOf("point_id")
-
-        if pid_idx >= 0 and adj_idx >= 0:
+        """Write adjusted heights to the 'adj_height' field of the point layer
+        ('Geodetic Points') and keep the result in the project GeoPackage."""
+        n_set = 0
+        for layer in self._result_layers("Geodetic Points"):
+            if not layer.isValid():
+                continue
+            from qgis.core import QgsField
+            from qgis.PyQt.QtCore import QVariant
+            pid_idx = layer.fields().indexOf("point_id")
+            if pid_idx < 0:
+                continue
+            layer.startEditing()
+            if layer.fields().indexOf("adj_height") < 0:
+                layer.addAttribute(QgsField("adj_height", QVariant.Double, "double", 12, 5))
+                layer.updateFields()
+            adj_idx = layer.fields().indexOf("adj_height")
             for feat in layer.getFeatures():
-                if feat.geometry() and feat.geometry().type() == 0:  # Point
-                    pid = str(feat[pid_idx])
-                    if pid in result.adjusted_heights:
-                        layer.changeAttributeValue(
-                            feat.id(), adj_idx, result.adjusted_heights[pid]
-                        )
+                pid = str(feat[pid_idx])
+                val = result.adjusted_heights.get(pid)
+                layer.changeAttributeValue(feat.id(), adj_idx, val)
+                n_set += val is not None
+            layer.commitChanges()
+            layer.triggerRepaint()
 
-        layer.commitChanges()
+        self._last_adjustment = {
+            "method": result.method,
+            "saved_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "sigma0_mm": float(result.mse_unit_weight * 1000.0),
+            "dof": int(result.degrees_of_freedom),
+            "weight_mode": result.weight_mode,
+            "fixed_points": {k: float(v) for k, v in result.fixed_points.items()},
+            "heights": {k: float(v) for k, v in result.adjusted_heights.items()},
+            "std_mm": {k: float(v * 1000.0) for k, v in result.mse_heights.items()},
+            "residuals_mm": {k: float(v) for k, v in result.residuals.items()},
+        }
+        self._autosave_gpkg()
         self.iface.messageBar().pushMessage(
-            "LSA", "adj_height field updated on map layer",
-            level=Qgis.Success, duration=4
+            "LSA", f"Adjusted heights applied to {n_set} map point(s) (adj_height)",
+            level=Qgis.Success, duration=5
         )
 
     def _adjust_current_line(self):
@@ -2546,32 +2426,36 @@ class GeoLevelPlugin:
             idx = self.dock.get_current_index()
             if idx >= 0:
                 self._adjust_single_line(idx)
+                return
+        self._run_lsa()
 
     def _adjust_single_line(self, idx: int):
+        """'Adjust This Line' opens the same adjustment window with only this
+        line ticked (single-line adjustment between its two known heights)."""
         if not (0 <= idx < len(self._lines)):
             return
-        line = self._lines[idx]
-        try:
-            from geo_level_line_adj_dialog import GeoLevelLineAdjDialog
-            dlg = GeoLevelLineAdjDialog(line, self.iface.mainWindow())
-            dlg.exec_()
-        except Exception as exc:
-            QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
-                                     level=Qgis.Critical)
-            QMessageBox.critical(self.iface.mainWindow(), "Adjust Line -- Error", str(exc))
+        self._run_lsa(selected_lines=[self._lines[idx]])
 
-    def _run_lsa(self):
+    def _run_lsa(self, selected_lines=None):
         if not self._lines:
             QMessageBox.information(self.iface.mainWindow(), "Network Adjustment (LSA)",
                                     "No lines loaded.")
             return
         try:
             from geo_level_enhanced_lsa_dialog import GeoLevelEnhancedLSADialog
+            cls = self.dock.get_selected_class() if self.dock else self._last_class
+            name = (os.path.splitext(os.path.basename(self._glp_path))[0]
+                    if self._glp_path else "geo_level")
             dlg = GeoLevelEnhancedLSADialog(
                 self._lines, self.iface.mainWindow(),
-                val_results=self._val_results
+                val_results=self._val_results,
+                leveling_class=cls or self._last_class or "H3",
+                known_heights=self._file_benchmarks,
+                selected_lines=selected_lines,
+                project_name=name,
+                output_dir=self._last_output_dir,
             )
-            if dlg.exec_() and dlg.result:
+            if dlg.exec_() and dlg.result is not None:
                 self._apply_lsa_to_layer(dlg.result)
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
@@ -2595,8 +2479,9 @@ class GeoLevelPlugin:
                     self._val_results = bv.validate_batch(self._lines)
                 except Exception:
                     pass
-                if self.dock:
-                    self.dock.load_lines(self._lines, self._val_results)
+                # The line set changed: rebuild the map and the project
+                # GeoPackage from memory (also re-validates and autosaves).
+                self._rebuild_map_layers()
                 self.iface.messageBar().pushMessage(
                     "Merge",
                     "Lines updated -- " + str(len(self._lines)) + " total",

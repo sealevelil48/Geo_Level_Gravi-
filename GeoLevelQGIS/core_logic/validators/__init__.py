@@ -80,9 +80,16 @@ class LevelingValidator:
         # New regulation-based checks (if enabled)
         if self.use_new_regulations and self.class_params:
             self._check_line_length(line, result)
-            self._check_sight_distances(line, result)
-            self._check_measurement_method(line, result)
-            self._check_distance_balance(line, result)
+            if getattr(line, "is_summary", False):
+                # Imported from .FA0/.FA1/.rez: no staff readings / sight
+                # lengths / method in the file - field-level checks were
+                # done when the summary was produced.
+                result.add_warning("Summary line (imported from a summary file): "
+                                   "setup-level field checks not applicable.")
+            else:
+                self._check_sight_distances(line, result)
+                self._check_measurement_method(line, result)
+                self._check_distance_balance(line, result)
 
         # Tolerance check (uses new formula if available)
         result.tolerance_valid = self._check_tolerance(line, result)

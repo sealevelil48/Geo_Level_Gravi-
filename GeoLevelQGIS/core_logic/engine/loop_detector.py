@@ -206,20 +206,36 @@ class NetworkGraph:
         the number of independent loops is: L = E - V + C
         """
         all_loops = self.find_all_loops()
-        
-        # Sort by number of lines (prefer smaller loops)
-        all_loops.sort(key=lambda x: x.num_lines)
-        
-        # Select independent loops
-        # This is a simplified selection - just returns smallest loops
+        # Prefer the shortest loops, then keep a loop only if it is
+        # independent of the loops already chosen (GF(2) cycle-space basis).
+        all_loops.sort(key=lambda x: (x.num_lines, x.total_distance))
+
         num_vertices = len(self.points)
         num_edges = len(self.lines)
         num_components = self._count_components()
-        
-        expected_loops = num_edges - num_vertices + num_components
-        
-        return all_loops[:max(expected_loops, len(all_loops))]
-    
+        expected_loops = max(0, num_edges - num_vertices + num_components)
+
+        index = {id(ln): i for i, ln in enumerate(self.lines)}
+        basis = {}          # pivot bit -> reduced mask
+        chosen = []
+        for loop in all_loops:
+            mask = 0
+            for ln in loop.lines:
+                i = index.get(id(ln))
+                if i is not None:
+                    mask ^= (1 << i)
+            while mask:
+                pivot = mask.bit_length() - 1
+                if pivot in basis:
+                    mask ^= basis[pivot]
+                else:
+                    basis[pivot] = mask
+                    chosen.append(loop)
+                    break
+            if len(chosen) >= expected_loops:
+                break
+        return chosen
+
     def _count_components(self) -> int:
         """Count connected components in the network."""
         visited = set()
@@ -294,7 +310,8 @@ class LoopAnalyzer:
         # Calculate mean values
         mean_dh = (dh_forward - dh_return) / 2
         total_distance = line1.total_distance + line2.total_distance
-        dist_km = total_distance / 1000.0
+        # Directive G2 App. B 4.1: L is the length in ONE direction
+        dist_km = (total_distance / 2.0) / 1000.0
 
         # Tolerance for double-run using new regulations
         try:

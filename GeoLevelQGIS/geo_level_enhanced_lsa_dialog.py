@@ -1,605 +1,745 @@
 """
 geo_level_enhanced_lsa_dialog.py
-Enhanced Network Adjustment dialog — PyQt5 port of EnhancedNetworkAdjustmentDialog.
+The single adjustment window of the plugin ("Network Adjustment (LSA)").
 
-Left panel  : Method radio buttons, Fixed Points table, Advanced Options
-Right panel : QTabWidget — Summary | Adjusted Heights | Residuals | Matrix Diagnostics
+Left panel
+    Method (Parametric V = Ax - L / Conditional Bv + W = 0)
+    Lines in the adjustment (tick / untick; opened from "Adjust This Line"
+    only that line is ticked)
+    Fixed points (Auto-Select, Fetch from DB, heights from .FA0/.FA1 files)
+    Options: Step 1 averaging, weights, stability check
+    Buttons: Prepare (Steps 1-2) | Run | Apply to Map | Export FA0 / FA1 / PDF
+
+Right panel tabs
+    Summary | Step 1: Observations | Step 2: Approximate Heights |
+    Adjusted Heights | Residuals | Line Adjustment | Matrix Diagnostics
 """
 
-from qgis.PyQt.QtWidgets import (
-    QDialog, QHBoxLayout, QVBoxLayout, QGroupBox, QRadioButton,
-    QTableWidget, QTableWidgetItem, QPushButton, QLabel, QTextEdit,
-    QTabWidget, QWidget, QDoubleSpinBox, QSpinBox, QCheckBox,
-    QSplitter, QHeaderView, QAbstractItemView, QMessageBox, QSizePolicy
-)
+import os
+
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor, QFont
+from qgis.PyQt.QtWidgets import (
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
+    QRadioButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+    QTextEdit, QVBoxLayout, QWidget,
+)
+
+_FIXED_BG = QColor(173, 216, 230)
+_WARN_BG = QColor(255, 200, 100)
+_BAD_BG = QColor(255, 170, 170)
+
+_WEIGHTS = [("Distance  p = n/L(km)", "distance"),
+            ("Setups  p = n/setups", "setups"),
+            ("Equal  p = n", "equal")]
+
+
+def _item(text, align=Qt.AlignCenter, bg=None, editable=False):
+    it = QTableWidgetItem(str(text))
+    it.setTextAlignment(align)
+    if not editable:
+        it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+    if bg is not None:
+        it.setBackground(bg)
+    return it
 
 
 class GeoLevelEnhancedLSADialog(QDialog):
     """
-    Enhanced Network Adjustment dialog.
-
     Parameters
     ----------
-    lines       : list of LevelingLine
-    parent      : QWidget
-    val_results : list of (LevelingLine, ValidationResult) tuples (optional).
-                  When supplied, only lines that are VALID or have manager_override
-                  are offered to the adjustment engine.  Lines with is_used=False
-                  are always excluded.
+    lines          : list of LevelingLine (all loaded lines)
+    val_results    : list of (LevelingLine, ValidationResult)
+    leveling_class : 'H1'..'H6' - tolerances k*sqrt(L)
+    known_heights  : {point: height} from .FA0/.FA1 files (used for Auto-Select
+                     and as Step 2 seeds)
+    selected_lines : lines to tick initially (single-line mode); None = all
+                     eligible lines
+    project_name   : name written into exported FA0 / FA1 files
+    output_dir     : default folder for exports
     """
 
-    def __init__(self, lines, parent=None, val_results=None):
+    def __init__(self, lines, parent=None, val_results=None, leveling_class="H3",
+                 known_heights=None, selected_lines=None, project_name="geo_level",
+                 output_dir=""):
         super().__init__(parent)
-        self.lines = lines
+        self.lines = list(lines or [])
         self._val_results = val_results or []
+        self.leveling_class = leveling_class or "H3"
+        self.known_heights = dict(known_heights or {})
+        self.project_name = project_name or "geo_level"
+        self.output_dir = output_dir or ""
+        self._selected_ids = ({id(l) for l in selected_lines}
+                              if selected_lines else None)
         self.result = None
-        self.setWindowTitle("Network Adjustment (Enhanced LSA) / כיוון רשת מתקדם")
-        self.resize(1000, 650)
+        self.fixed_points = {}
+        self._observations = []
+        self._merge_report = []
+        self.setWindowTitle("Network Adjustment (LSA) / כיוון רשת")
+        self.resize(1250, 760)
         self._build_ui()
+        self._fill_lines_table()
+        if self._selected_ids:
+            self._auto_select_fixed(quiet=True)
 
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     # UI
-    # ------------------------------------------------------------------ #
-
+    # ================================================================== #
     def _build_ui(self):
         root = QHBoxLayout(self)
         splitter = QSplitter(Qt.Horizontal)
         root.addWidget(splitter)
-
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([320, 680])
-
-    # ── Left panel ──────────────────────────────────────────────────── #
+        splitter.setSizes([430, 820])
 
     def _build_left_panel(self):
         panel = QWidget()
         vbox = QVBoxLayout(panel)
 
-        # Method
-        grp_method = QGroupBox("Adjustment Method / שיטת כיוון")
-        vbox_m = QVBoxLayout(grp_method)
+        grp_m = QGroupBox("Adjustment Method / שיטת כיוון")
+        vm = QVBoxLayout(grp_m)
         self.rb_parametric = QRadioButton("Parametric (Observations)  V = Ax − L")
         self.rb_conditional = QRadioButton("Conditional (Constraints)  Bv + W = 0")
         self.rb_parametric.setChecked(True)
-        vbox_m.addWidget(self.rb_parametric)
-        vbox_m.addWidget(self.rb_conditional)
-        vbox.addWidget(grp_method)
+        vm.addWidget(self.rb_parametric)
+        vm.addWidget(self.rb_conditional)
+        vbox.addWidget(grp_m)
 
-        # Fixed points
+        grp_l = QGroupBox("Lines in adjustment / קווים בכיוון")
+        vl = QVBoxLayout(grp_l)
+        self.lines_table = QTableWidget(0, 5)
+        self.lines_table.setHorizontalHeaderLabels(["Use", "Line", "From → To", "dH (m)", "Status"])
+        self.lines_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.lines_table.horizontalHeader().setStretchLastSection(True)
+        self.lines_table.setMinimumHeight(150)
+        self.lines_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        vl.addWidget(self.lines_table)
+        hb = QHBoxLayout()
+        b_all = QPushButton("All eligible")
+        b_all.clicked.connect(lambda: self._check_all(True))
+        b_none = QPushButton("None")
+        b_none.clicked.connect(lambda: self._check_all(False))
+        self.lbl_lines = QLabel("")
+        hb.addWidget(b_all)
+        hb.addWidget(b_none)
+        hb.addWidget(self.lbl_lines, 1)
+        vl.addLayout(hb)
+        vbox.addWidget(grp_l, 2)
+
         grp_fp = QGroupBox("Fixed Points / נקודות קבועות")
-        vbox_fp = QVBoxLayout(grp_fp)
-
+        vfp = QVBoxLayout(grp_fp)
         self.fp_table = QTableWidget(0, 2)
         self.fp_table.setHorizontalHeaderLabels(["Point ID", "Known Height (m)"])
         self.fp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.fp_table.setMinimumHeight(160)
-        self.fp_table.setToolTip(
-            "Enter the Point ID and its KNOWN height.\n"
-            "Rows with an empty height field are skipped and treated as unknowns.\n"
-            "Only rows with an explicit height value are fixed."
-        )
-        vbox_fp.addWidget(self.fp_table)
+        self.fp_table.setMinimumHeight(120)
+        self.fp_table.setToolTip("Only rows with a height value are held fixed.")
+        vfp.addWidget(self.fp_table)
+        g = QGridLayout()
+        for i, (txt, slot, tip) in enumerate([
+            ("+ Add Row", self._add_fp_row, ""),
+            ("− Remove", self._del_fp_row, ""),
+            ("Auto-Select", self._auto_select_fixed,
+             "Points of the ticked lines that have a known height\n"
+             "(from .FA0/.FA1 files or the national DB)"),
+            ("Fetch from DB", self._fetch_from_db,
+             "Fill missing heights from the national benchmark database"),
+        ]):
+            b = QPushButton(txt)
+            b.clicked.connect(lambda _=False, s=slot: s())
+            if tip:
+                b.setToolTip(tip)
+            g.addWidget(b, 0, i)
+        vfp.addLayout(g)
+        vbox.addWidget(grp_fp, 1)
 
-        btn_row = QHBoxLayout()
-        btn_add_fp = QPushButton("+ Add Row")
-        btn_add_fp.clicked.connect(self._add_fp_row)
-        btn_del_fp = QPushButton("− Remove")
-        btn_del_fp.clicked.connect(self._del_fp_row)
-        btn_auto = QPushButton("Auto-Select")
-        btn_auto.setToolTip("Auto-detect benchmark endpoints from loaded lines")
-        btn_auto.clicked.connect(self._auto_select_fixed)
-        btn_db = QPushButton("Fetch from DB")
-        btn_db.setToolTip(
-            "Look up heights for listed Point IDs in the national benchmark database.\n"
-            "Requires a configured DB connection (Settings → Database Connection…)."
-        )
-        btn_db.clicked.connect(self._fetch_from_db)
-        btn_row.addWidget(btn_add_fp)
-        btn_row.addWidget(btn_del_fp)
-        btn_row.addWidget(btn_auto)
-        btn_row.addWidget(btn_db)
-        vbox_fp.addLayout(btn_row)
-        vbox.addWidget(grp_fp)
-
-        # Advanced options
-        grp_adv = QGroupBox("Advanced Options / אפשרויות מתקדמות")
-        form = QVBoxLayout(grp_adv)
-
-        tol_row = QHBoxLayout()
-        tol_row.addWidget(QLabel("Convergence Tolerance (m):"))
-        self.spin_tol = QDoubleSpinBox()
-        self.spin_tol.setDecimals(8)
-        self.spin_tol.setRange(1e-10, 1.0)
-        self.spin_tol.setValue(1e-6)
-        self.spin_tol.setSingleStep(1e-7)
-        tol_row.addWidget(self.spin_tol)
-        form.addLayout(tol_row)
-
-        iter_row = QHBoxLayout()
-        iter_row.addWidget(QLabel("Max Iterations:"))
-        self.spin_iter = QSpinBox()
-        self.spin_iter.setRange(1, 100)
-        self.spin_iter.setValue(10)
-        iter_row.addWidget(self.spin_iter)
-        form.addLayout(iter_row)
-
-        self.chk_stability = QCheckBox("Matrix Stability Check")
+        grp_o = QGroupBox("Options / אפשרויות")
+        vo = QVBoxLayout(grp_o)
+        self.chk_merge = QCheckBox("Step 1: average repeated runs (forward / return)")
+        self.chk_merge.setChecked(True)
+        self.chk_merge.setToolTip("Each height difference enters the adjustment once:\n"
+                                  "dH = (dH_fwd − dH_ret)/2, checked against k·√L "
+                                  "(L = one-direction length).")
+        vo.addWidget(self.chk_merge)
+        hw = QHBoxLayout()
+        hw.addWidget(QLabel("Weights:"))
+        self.cmb_weights = QComboBox()
+        for label, _key in _WEIGHTS:
+            self.cmb_weights.addItem(label)
+        hw.addWidget(self.cmb_weights, 1)
+        hw.addWidget(QLabel("Class:"))
+        self.cmb_class = QComboBox()
+        self.cmb_class.addItems(["H1", "H2", "H3", "H4", "H5", "H6"])
+        self.cmb_class.setCurrentText(self.leveling_class)
+        hw.addWidget(self.cmb_class)
+        vo.addLayout(hw)
+        self.chk_stability = QCheckBox("Matrix stability check")
         self.chk_stability.setChecked(True)
-        form.addWidget(self.chk_stability)
+        vo.addWidget(self.chk_stability)
+        vbox.addWidget(grp_o)
 
-        self.chk_dist_weights = QCheckBox("Distance-Based Weights  (P = 1/km)")
-        self.chk_dist_weights.setChecked(True)
-        form.addWidget(self.chk_dist_weights)
-
-        vbox.addWidget(grp_adv)
-
-        # Run button
+        btn_prep = QPushButton("Prepare (Steps 1–2) / הכנה")
+        btn_prep.clicked.connect(self._prepare)
+        vbox.addWidget(btn_prep)
         btn_run = QPushButton("▶  Run Adjustment / הפעל כיוון")
-        btn_run.setFixedHeight(38)
+        btn_run.setFixedHeight(36)
         btn_run.setStyleSheet("font-weight: bold; background: #1565c0; color: white;")
         btn_run.clicked.connect(self._run_adjustment)
         vbox.addWidget(btn_run)
 
+        row = QHBoxLayout()
+        self.btn_apply = QPushButton("Apply to Map")
+        self.btn_apply.setToolTip("Write adjusted heights to the map (adj_height) "
+                                  "and keep this result in the project")
+        self.btn_apply.clicked.connect(self._apply)
+        self.btn_fa0 = QPushButton("Export FA0…")
+        self.btn_fa0.clicked.connect(self._export_fa0)
+        self.btn_fa1 = QPushButton("Export FA1…")
+        self.btn_fa1.clicked.connect(self._export_fa1)
+        self.btn_pdf = QPushButton("PDF Report…")
+        self.btn_pdf.clicked.connect(self._export_pdf)
+        for b in (self.btn_apply, self.btn_fa0, self.btn_fa1, self.btn_pdf):
+            row.addWidget(b)
+        vbox.addLayout(row)
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.reject)
         vbox.addWidget(btn_close)
-
-        vbox.addStretch()
+        self._set_result_buttons(False)
         return panel
-
-    # ── Right panel ─────────────────────────────────────────────────── #
 
     def _build_right_panel(self):
         panel = QWidget()
         vbox = QVBoxLayout(panel)
-
         self.tabs = QTabWidget()
         vbox.addWidget(self.tabs)
 
-        self.tabs.addTab(self._build_summary_tab(),     "Summary / סיכום")
-        self.tabs.addTab(self._build_heights_tab(),     "Adjusted Heights / גבהים")
-        self.tabs.addTab(self._build_residuals_tab(),   "Residuals / שאריות")
-        self.tabs.addTab(self._build_matrix_tab(),      "Matrix Diagnostics")
-
-        return panel
-
-    def _build_summary_tab(self):
-        w = QWidget()
-        vbox = QVBoxLayout(w)
         self.summary_text = QTextEdit()
         self.summary_text.setReadOnly(True)
         self.summary_text.setFont(QFont("Courier New", 9))
-        self.summary_text.setPlaceholderText("Run adjustment to see results…")
-        vbox.addWidget(self.summary_text)
-        return w
+        self.summary_text.setPlaceholderText("Prepare or run the adjustment to see results…")
+        self.tabs.addTab(self.summary_text, "Summary / סיכום")
 
-    def _build_heights_tab(self):
-        w = QWidget()
-        vbox = QVBoxLayout(w)
-        self.heights_table = QTableWidget(0, 4)
-        self.heights_table.setHorizontalHeaderLabels(
-            ["Point ID", "Height (m)", "Correction (mm)", "Std Dev (mm)"]
-        )
-        self.heights_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.heights_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.heights_table.setAlternatingRowColors(True)
-        vbox.addWidget(self.heights_table)
-        return w
+        self.obs_table = self._table(["From", "To", "Mean dH (m)", "L (m)", "Runs",
+                                      "Δ runs (mm)", "Allowed (mm)", "Check", "Sources"])
+        self.tabs.addTab(self.obs_table, "Step 1: Observations")
 
-    def _build_residuals_tab(self):
-        w = QWidget()
-        vbox = QVBoxLayout(w)
-        self.residuals_table = QTableWidget(0, 2)
-        self.residuals_table.setHorizontalHeaderLabels(
-            ["Observation (FROM–TO)", "Residual (mm)"]
-        )
-        self.residuals_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.residuals_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.residuals_table.setAlternatingRowColors(True)
-        vbox.addWidget(self.residuals_table)
-        return w
+        self.approx_table = self._table(["Point ID", "Approx. Height (m)", "Carried from",
+                                         "Seed type", "Path (km)"])
+        self.tabs.addTab(self.approx_table, "Step 2: Approximate Heights")
 
-    def _build_matrix_tab(self):
-        w = QWidget()
-        vbox = QVBoxLayout(w)
+        self.heights_table = self._table(["Point ID", "Adjusted (m)", "Approx. (m)",
+                                          "Correction (mm)", "Std Dev (mm)",
+                                          "95% (mm)"])
+        self.tabs.addTab(self.heights_table, "Adjusted Heights / גבהים")
+
+        self.residuals_table = self._table(["From", "To", "Measured dH (m)",
+                                            "Adjusted dH (m)", "Residual (mm)",
+                                            "L (m)", "Weight"])
+        self.tabs.addTab(self.residuals_table, "Residuals / שאריות")
+
+        self.lineadj_text = QTextEdit()
+        self.lineadj_text.setReadOnly(True)
+        self.lineadj_text.setFont(QFont("Courier New", 9))
+        self.lineadj_text.setPlaceholderText(
+            "Single line between two known heights: tick one line, give both "
+            "end heights and Run.")
+        self.tabs.addTab(self.lineadj_text, "Line Adjustment / תיאום קו")
+
         self.matrix_text = QTextEdit()
         self.matrix_text.setReadOnly(True)
         self.matrix_text.setFont(QFont("Courier New", 8))
-        self.matrix_text.setPlaceholderText("Matrix diagnostics appear here after adjustment…")
-        vbox.addWidget(self.matrix_text)
-        return w
+        self.tabs.addTab(self.matrix_text, "Matrix Diagnostics")
+        return panel
 
-    # ------------------------------------------------------------------ #
-    # Slots
-    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _table(headers):
+        t = QTableWidget(0, len(headers))
+        t.setHorizontalHeaderLabels(headers)
+        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        t.horizontalHeader().setStretchLastSection(True)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setAlternatingRowColors(True)
+        return t
 
-    def _add_fp_row(self):
-        row = self.fp_table.rowCount()
-        self.fp_table.insertRow(row)
-        self.fp_table.setItem(row, 0, QTableWidgetItem(""))
-        # Leave height blank — user must supply a real known value.
-        # A blank cell is skipped by _collect_fixed_points and treated as unknown.
-        self.fp_table.setItem(row, 1, QTableWidgetItem(""))
+    def _set_result_buttons(self, enabled):
+        for b in (self.btn_apply, self.btn_fa1, self.btn_pdf):
+            b.setEnabled(enabled)
+
+    # ================================================================== #
+    # Lines
+    # ================================================================== #
+    def _validation_for(self, line):
+        for ln, vr in self._val_results:
+            if ln is line:
+                return vr
+        return None
+
+    def _is_eligible(self, line) -> bool:
+        """Used (not excluded) and either valid or forced valid by the manager.
+        A line with no validation result is not eligible (fail-closed)."""
+        if not getattr(line, "is_used", True):
+            return False
+        if getattr(line, "manager_override", False):
+            return True
+        if not self._val_results:
+            return True
+        vr = self._validation_for(line)
+        return bool(vr and vr.is_valid)
+
+    def _fill_lines_table(self):
+        t = self.lines_table
+        t.setRowCount(0)
+        self._row_lines = []
+        n_el = 0
+        for line in self.lines:
+            elig = self._is_eligible(line)
+            n_el += elig
+            r = t.rowCount()
+            t.insertRow(r)
+            chk = QTableWidgetItem()
+            flags = Qt.ItemIsUserCheckable | Qt.ItemIsSelectable
+            if elig:
+                flags |= Qt.ItemIsEnabled
+            chk.setFlags(flags)
+            on = elig and (self._selected_ids is None or id(line) in self._selected_ids)
+            chk.setCheckState(Qt.Checked if on else Qt.Unchecked)
+            t.setItem(r, 0, chk)
+            status = getattr(line.status, "value", str(line.status))
+            if not getattr(line, "is_used", True):
+                status = "excluded"
+            bg = None if elig else QColor(235, 235, 235)
+            t.setItem(r, 1, _item(line.filename, Qt.AlignLeft | Qt.AlignVCenter, bg))
+            t.setItem(r, 2, _item(f"{line.start_point} → {line.end_point}", bg=bg))
+            t.setItem(r, 3, _item(f"{line.total_height_diff:.5f}", bg=bg))
+            t.setItem(r, 4, _item(status, bg=bg))
+            self._row_lines.append(line)
+        self.lbl_lines.setText(f"{n_el} eligible of {len(self.lines)} "
+                               "(invalid / excluded lines are greyed)")
+
+    def _check_all(self, on):
+        for r in range(self.lines_table.rowCount()):
+            it = self.lines_table.item(r, 0)
+            if it.flags() & Qt.ItemIsEnabled:
+                it.setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+    def _active_lines(self):
+        out = []
+        for r, line in enumerate(self._row_lines):
+            it = self.lines_table.item(r, 0)
+            if it.checkState() == Qt.Checked and self._is_eligible(line):
+                out.append(line)
+        return out
+
+    # ================================================================== #
+    # Fixed points
+    # ================================================================== #
+    def _add_fp_row(self, pid="", height=""):
+        r = self.fp_table.rowCount()
+        self.fp_table.insertRow(r)
+        self.fp_table.setItem(r, 0, QTableWidgetItem(pid))
+        self.fp_table.setItem(r, 1, QTableWidgetItem(height))
 
     def _del_fp_row(self):
-        row = self.fp_table.currentRow()
-        if row >= 0:
-            self.fp_table.removeRow(row)
+        r = self.fp_table.currentRow()
+        if r >= 0:
+            self.fp_table.removeRow(r)
 
-    def _auto_select_fixed(self):
-        """
-        Populate the fixed-points table with network leaf-node candidates.
-
-        A leaf node is a point that appears as a line endpoint exactly once
-        across the whole network — these are the true boundary benchmarks.
-        Junction points (degree ≥ 2) connect multiple lines and must be
-        treated as unknowns, not fixed.
-
-        Heights are left blank so the user must supply real known values.
-        A blank height cell is skipped by _collect_fixed_points and the
-        corresponding point is adjusted as an unknown.
-        """
-        from collections import Counter
-        degree = Counter()
-        for line in self.lines:
-            if line.start_point:
-                degree[line.start_point] += 1
-            if line.end_point:
-                degree[line.end_point] += 1
-
-        # Leaf nodes: appear exactly once (true network boundary points)
-        candidates = sorted(pid for pid, cnt in degree.items() if cnt == 1)
-
-        # Fully-connected loop with no leaves — fall back to all endpoints
-        if not candidates:
-            candidates = sorted(degree.keys())
-
-        # Pre-load DB manager once for all candidate lookups
-        try:
-            from geolevel_db_manager import get_db_manager
-            _db_mgr = get_db_manager()
-        except Exception:
-            _db_mgr = None
-
-        self.fp_table.setRowCount(0)
-        for pid in candidates:
-            row = self.fp_table.rowCount()
-            self.fp_table.insertRow(row)
-            self.fp_table.setItem(row, 0, QTableWidgetItem(pid))
-
-            height_text = ""
-            if _db_mgr is not None and _db_mgr.is_configured():
-                try:
-                    rec = _db_mgr.resolve_benchmark(pid)
-                    if rec is not None and rec.gova_ort is not None:
-                        height_text = f"{rec.gova_ort:.4f}"
-                except Exception:
-                    pass
-            self.fp_table.setItem(row, 1, QTableWidgetItem(height_text))
-
-    def _fetch_from_db(self):
-        """
-        Iterate the Fixed Points table and fill missing heights from the DB.
-        Rows with a blank Point ID are skipped.
-        Heights that are already filled are NOT overwritten.
-        A summary dialog reports filled / not-found / NULL-height counts.
-        """
+    def _db(self):
         try:
             from geolevel_db_manager import get_db_manager
             mgr = get_db_manager()
-        except Exception as exc:
-            QMessageBox.critical(self, "DB Error", f"Could not load DB manager: {exc}")
-            return
+            return mgr if mgr.is_configured() else None
+        except Exception:
+            return None
 
-        if not mgr.is_configured():
+    def _db_height(self, mgr, pid):
+        if mgr is None:
+            return None
+        try:
+            rec = mgr.resolve_benchmark(pid)
+            return None if rec is None or rec.gova_ort is None else float(rec.gova_ort)
+        except Exception:
+            return None
+
+    def _auto_select_fixed(self, quiet=False):
+        """List the points of the ticked lines that have a known height
+        (from .FA0/.FA1 files, else the DB).  For a single ticked line the
+        two end points are always listed (single-line adjustment)."""
+        lines = self._active_lines()
+        pts = []
+        for ln in lines:
+            for p in (ln.start_point, ln.end_point):
+                if p and p not in pts:
+                    pts.append(p)
+        mgr = self._db()
+        rows = []
+        for p in sorted(pts):
+            h = self.known_heights.get(p)
+            if h is None:
+                h = self._db_height(mgr, p)
+            if h is not None:
+                rows.append((p, f"{h:.4f}"))
+        if len(lines) == 1 and not rows:
+            rows = [(lines[0].start_point, ""), (lines[0].end_point, "")]
+        elif len(lines) == 1:
+            have = {p for p, _ in rows}
+            rows += [(p, "") for p in (lines[0].start_point, lines[0].end_point)
+                     if p not in have]
+        self.fp_table.setRowCount(0)
+        for p, h in rows:
+            self._add_fp_row(p, h)
+        if not rows and not quiet:
             QMessageBox.information(
-                self, "DB Not Configured",
-                "Set up the database connection first via\n"
-                "Settings → Database Connection…"
-            )
+                self, "Auto-Select",
+                "No point of the ticked lines has a known height in the loaded "
+                "files or the database.\nEnter the fixed heights manually.")
+
+    def _fetch_from_db(self):
+        mgr = self._db()
+        if mgr is None:
+            QMessageBox.information(self, "DB Not Configured",
+                                    "Set up the database connection first via\n"
+                                    "Settings → Database Connection…")
             return
-
-        filled, not_found, no_height, already_set = 0, [], [], 0
-
-        for row in range(self.fp_table.rowCount()):
-            pid_item = self.fp_table.item(row, 0)
-            if not pid_item or not pid_item.text().strip():
+        filled, missing = 0, []
+        for r in range(self.fp_table.rowCount()):
+            pid_it, h_it = self.fp_table.item(r, 0), self.fp_table.item(r, 1)
+            pid = pid_it.text().strip() if pid_it else ""
+            if not pid or (h_it and h_it.text().strip()):
                 continue
-            pid = pid_item.text().strip()
-
-            # Don't overwrite an already-entered height
-            h_item = self.fp_table.item(row, 1)
-            if h_item and h_item.text().strip():
-                already_set += 1
-                continue
-
-            try:
-                rec = mgr.resolve_benchmark(pid)
-            except Exception:
-                not_found.append(pid)
-                continue
-
-            if rec is None:
-                not_found.append(pid)
-            elif rec.gova_ort is None:
-                no_height.append(pid)
+            h = self._db_height(mgr, pid)
+            if h is None:
+                missing.append(pid)
             else:
-                self.fp_table.setItem(row, 1, QTableWidgetItem(f"{rec.gova_ort:.4f}"))
+                self.fp_table.setItem(r, 1, QTableWidgetItem(f"{h:.4f}"))
                 filled += 1
+        msg = f"Filled {filled} height(s) from DB."
+        if missing:
+            msg += "\nNo height in DB for: " + ", ".join(missing)
+        QMessageBox.information(self, "DB Fetch Complete", msg)
 
-        parts = [f"Filled {filled} height(s) from DB."]
-        if already_set:
-            parts.append(f"Skipped {already_set} row(s) with existing heights.")
-        if not_found:
-            parts.append("Not found in DB:\n  " + ", ".join(not_found))
-        if no_height:
-            parts.append("Found but gova_ort is NULL:\n  " + ", ".join(no_height))
-
-        QMessageBox.information(self, "DB Fetch Complete", "\n".join(parts))
-
-    def _collect_fixed_points(self):
-        """
-        Read the Fixed Points table and return only rows that have a non-empty
-        height value explicitly entered by the user.
-
-        Rows with a blank height field are silently treated as unknown points
-        (they will be adjusted by the LSA engine).  This prevents the common
-        mistake of Auto-Select pre-filling the table with blank rows and the
-        user accidentally treating every endpoint as fixed — which would invert
-        the network architecture (67 fixed / 1 adjusted instead of 1 fixed / 67
-        adjusted).
-
-        A QMessageBox.information lists any skipped rows so the user knows
-        which points will be adjusted rather than held fixed.
-        """
-        fixed = {}
-        skipped = []
-        for row in range(self.fp_table.rowCount()):
-            pid_item = self.fp_table.item(row, 0)
-            h_item   = self.fp_table.item(row, 1)
-            if not pid_item:
-                continue
-            pid = pid_item.text().strip()
+    def _collect_fixed_points(self, warn=True):
+        fixed, skipped = {}, []
+        for r in range(self.fp_table.rowCount()):
+            pid_it, h_it = self.fp_table.item(r, 0), self.fp_table.item(r, 1)
+            pid = pid_it.text().strip() if pid_it else ""
             if not pid:
                 continue
-            h_text = h_item.text().strip() if h_item else ""
-            if not h_text:
-                skipped.append(pid)
-                continue
+            txt = h_it.text().strip() if h_it else ""
             try:
-                fixed[pid] = float(h_text)
+                fixed[pid] = float(txt)
             except ValueError:
                 skipped.append(pid)
-
-        if skipped:
+        if skipped and warn:
             QMessageBox.information(
-                self, "Fixed Points — Incomplete Rows",
-                "The following points have no height value and will be treated as "
-                "unknowns (adjusted):\n\n" + "\n".join(skipped) + "\n\n"
-                "Enter a known height or remove these rows before running the adjustment."
-            )
+                self, "Fixed Points",
+                "These rows have no valid height and are treated as unknown:\n"
+                + ", ".join(skipped))
         return fixed
 
-    def _is_eligible(self, line) -> bool:
-        """
-        Return True if a line should be included in the adjustment.
+    # ================================================================== #
+    # Steps 1-2
+    # ================================================================== #
+    def _weight_mode(self):
+        return _WEIGHTS[self.cmb_weights.currentIndex()][1]
 
-        A line is eligible when ALL of the following hold:
-          1. is_used is True (not manually excluded)
-          2. Either:
-             a. The line is VALID according to its ValidationResult, OR
-             b. The manager_override flag has been set (Force Valid)
+    def _build_observations(self, lines):
+        from core_logic.engine.least_squares import lines_to_observations
+        from core_logic.engine.network_prep import (
+            MergedRun, merge_observations, tolerance_mm)
+        cls = self.cmb_class.currentText()
+        if self.chk_merge.isChecked():
+            return merge_observations(lines, cls)
+        obs = lines_to_observations(lines)
+        report = [MergedRun(o.from_point, o.to_point, o.height_diff, o.distance, 1,
+                            [o.height_diff], [o.source_file], None,
+                            tolerance_mm(o.distance, cls), True) for o in obs]
+        return obs, report
 
-        When no val_results were supplied (legacy call), only is_used is checked
-        so existing behaviour is preserved.
-        """
-        if not getattr(line, "is_used", True):
-            return False
+    def _prepare(self, quiet=False):
+        """Run Steps 1 and 2 and show them. Returns (obs, fixed) or None."""
+        from core_logic.engine.network_prep import approximate_heights
+        lines = self._active_lines()
+        if not lines:
+            if not quiet:
+                QMessageBox.warning(self, "No Lines", "Tick at least one eligible line.")
+            return None
+        fixed = self._collect_fixed_points(warn=not quiet)
+        obs, report = self._build_observations(lines)
+        self._observations, self._merge_report = obs, report
+        self._fill_obs_table(report)
+        known = dict(self.known_heights)
+        approx = approximate_heights(obs, fixed, known)
+        self._fill_approx_table(approx, fixed)
+        n_bad = sum(not r.within_tolerance for r in report)
+        n_rep = sum(r.n_runs > 1 for r in report)
+        txt = (f"Step 1: {len(lines)} line(s) → {len(obs)} observation(s); "
+               f"{n_rep} averaged from repeated runs; {n_bad} exceed k·√L.\n"
+               f"Step 2: approximate heights for {len(approx)} point(s).\n")
+        if any(a.seed_kind == "relative" for a in approx.values()):
+            txt += ("⚠ Some groups have no known height: approximate heights there "
+                    "are relative (0.000 at the first point).\n")
+        if not quiet:
+            self.summary_text.setPlainText(txt)
+            self.tabs.setCurrentWidget(self.obs_table)
+        return obs, fixed
 
-        if not self._val_results:
-            return True
+    def _fill_obs_table(self, report):
+        t = self.obs_table
+        t.setRowCount(0)
+        for r in report:
+            row = t.rowCount()
+            t.insertRow(row)
+            bg = None if r.within_tolerance else _BAD_BG
+            disc = "—" if r.discrepancy_mm is None else f"{r.discrepancy_mm:.2f}"
+            check = "—" if r.discrepancy_mm is None else ("✓" if r.within_tolerance else "✗")
+            vals = [r.from_point, r.to_point, f"{r.mean_dh:.5f}", f"{r.distance:.1f}",
+                    r.n_runs, disc, f"{r.allowed_mm:.2f}", check, " + ".join(r.sources)]
+            for c, v in enumerate(vals):
+                t.setItem(row, c, _item(v, bg=bg))
 
-        override = getattr(line, "manager_override", False)
-        if override:
-            return True
+    def _fill_approx_table(self, approx, fixed):
+        t = self.approx_table
+        t.setRowCount(0)
+        for pid in sorted(approx):
+            a = approx[pid]
+            row = t.rowCount()
+            t.insertRow(row)
+            bg = _FIXED_BG if pid in fixed else (_WARN_BG if a.seed_kind == "relative" else None)
+            for c, v in enumerate([pid, f"{a.height:.4f}", a.seed, a.seed_kind,
+                                   f"{a.path_km:.3f}"]):
+                t.setItem(row, c, _item(v, bg=bg))
 
-        # Match line to its ValidationResult by identity
-        from core_logic.config.models import LineStatus
-        for ln, vr in self._val_results:
-            if ln is line:
-                return vr.is_valid
-        # Line not found in val_results — fail-closed (security: exclude by default)
-        import logging
-        logging.warning(f"Line {getattr(line, 'filename', '?')} not found in validation results; excluding from adjustment")
-        return False
-
+    # ================================================================== #
+    # Run
+    # ================================================================== #
     def _run_adjustment(self):
-        fixed_points = self._collect_fixed_points()
-        if not fixed_points:
-            QMessageBox.warning(self, "Fixed Points",
-                                "Please enter at least one fixed point with a known height.")
+        prep = self._prepare(quiet=True)
+        if prep is None:
+            QMessageBox.warning(self, "No Lines", "Tick at least one eligible line.")
             return
-        if not self.lines:
-            QMessageBox.warning(self, "No Lines", "No leveling lines loaded.")
+        obs, _f = prep
+        fixed = self._collect_fixed_points(warn=True)
+        if not fixed:
+            QMessageBox.warning(self, "Fixed Points",
+                                "Enter at least one fixed point with a known height.")
+            return
+        from core_logic.engine.network_prep import NetworkDatumError, _obs_fields
+        lines = self._active_lines()
+
+        # Single line with both ends known -> Directive G2 line adjustment
+        pts = {p for o in obs for p in _obs_fields(o)[:2]}
+        if pts and pts <= set(fixed):
+            self._run_line_adjustment(lines, fixed)
             return
 
+        cls = self.cmb_class.currentText()
         try:
             if self.rb_parametric.isChecked():
-                self._run_parametric(fixed_points)
+                from core_logic.engine.least_squares import LeastSquaresAdjuster
+                adj = LeastSquaresAdjuster(check_stability=self.chk_stability.isChecked(),
+                                           weight_mode=self._weight_mode(),
+                                           leveling_class=cls)
             else:
-                self._run_conditional(fixed_points)
+                from core_logic.engine.least_squares import ConditionalAdjuster
+                adj = ConditionalAdjuster(check_stability=self.chk_stability.isChecked(),
+                                          weight_mode=self._weight_mode(),
+                                          leveling_class=cls)
+            result = adj.adjust(obs, fixed, known_heights=self.known_heights)
+        except NetworkDatumError as exc:
+            self.result = None
+            self._set_result_buttons(False)
+            self.summary_text.setPlainText("Adjustment not run.\n\n" + str(exc))
+            self.tabs.setCurrentWidget(self.summary_text)
+            QMessageBox.warning(self, "Network not connected to a fixed point", str(exc))
+            return
         except Exception as exc:
             import traceback
+            self.result = None
+            self._set_result_buttons(False)
             QMessageBox.critical(self, "Adjustment Error",
                                  f"{exc}\n\n{traceback.format_exc()}")
+            return
+        self.result = result
+        self.fixed_points = fixed
+        self._populate_results(result, fixed)
+        self._set_result_buttons(True)
 
-    def _run_parametric(self, fixed_points):
-        """Parametric (Ax+L): V = Ax - L, normal equations N*X = U."""
-        from core_logic.engine.least_squares import LeastSquaresAdjuster
-        from core_logic.config.models import MeasurementSummary
-
-        observations = []
-        for line in self.lines:
-            if not self._is_eligible(line):
+    def _run_line_adjustment(self, lines, fixed):
+        from core_logic.engine.network_prep import adjust_single_line
+        cls = self.cmb_class.currentText()
+        out = []
+        for ln in lines:
+            if ln.start_point not in fixed or ln.end_point not in fixed:
                 continue
-            observations.append(MeasurementSummary(
-                from_point=line.start_point,
-                to_point=line.end_point,
-                height_diff=line.total_height_diff,
-                distance=line.total_distance,
-                num_setups=len(line.setups),
-                bf_diff=0.0, year_month="", source_file=line.filename,
-            ))
+            r = adjust_single_line(ln, fixed[ln.start_point], fixed[ln.end_point], cls)
+            out.append(f"Line {ln.filename}:  {ln.start_point} → {ln.end_point}")
+            out.append(f"  Measured dH   : {r['measured_dh']:12.5f} m")
+            out.append(f"  Known dH      : {r['known_dh']:12.5f} m")
+            out.append(f"  Misclosure f  : {r['misclosure_mm']:9.2f} mm   "
+                       f"allowed ±{r['allowed_mm']:.2f} mm ({cls}, L={r['length_m']/1000:.3f} km)  "
+                       + ("✓ OK" if r["ok"] else "✗ EXCEEDED"))
+            out.append("  v_i = −f · L_i / ΣL")
+            out.append(f"  {'Setup':>5} {'L (m)':>9} {'dH (m)':>11} {'v (mm)':>8} "
+                       f"{'dH corr (m)':>12} {'H (m)':>11}")
+            for row in r["rows"]:
+                out.append(f"  {row['setup']:>5} {row['length_m']:9.2f} "
+                           f"{row['measured_dh']:11.5f} {row['correction_mm']:8.2f} "
+                           f"{row['corrected_dh']:12.5f} {row['height']:11.4f}")
+            out.append("")
+        self.result = None
+        self._set_result_buttons(False)
+        self.lineadj_text.setPlainText("\n".join(out) or
+                                       "Both end points of each ticked line must be fixed.")
+        self.summary_text.setPlainText(
+            "All points of the ticked line(s) are fixed: single-line adjustment "
+            "(Directive G2, Appendix C) - see the Line Adjustment tab.")
+        self.tabs.setCurrentWidget(self.lineadj_text)
 
-        if not observations:
-            QMessageBox.warning(self, "No Lines",
-                                "No active lines to adjust.")
+    # ================================================================== #
+    # Results
+    # ================================================================== #
+    def _populate_results(self, res, fixed):
+        cls = self.cmb_class.currentText()
+        n = len(res.observations)
+        u = n - res.degrees_of_freedom if res.method == "parametric" else \
+            len([p for p in res.adjusted_heights if p not in fixed])
+        lines = [
+            "─" * 60,
+            f"Method              : {'Parametric  V = Ax − L' if res.method == 'parametric' else 'Conditional  Bv + W = 0'}",
+            f"Weights             : {res.weight_mode}",
+            "─" * 60,
+            f"Observations (n)    : {n}",
+            f"Unknown heights (u) : {u}",
+            f"Fixed points        : {len(fixed)}",
+            f"Degrees of freedom  : {res.degrees_of_freedom}",
+            f"σ₀ (mm/√km)         : {res.mse_unit_weight * 1000:.3f}",
+            f"Total length        : {res.total_distance_km:.3f} km",
+            f"K coefficient       : {res.k_coefficient:.3f}",
+            "Solution            : direct (linear model, no iterations)",
+            "─" * 60,
+        ]
+        if res.benchmark_misclosures:
+            lines.append(f"Misclosures between fixed points ({cls}, k·√L):")
+            for b in res.benchmark_misclosures:
+                lines.append(f"  {b['from']:>10} → {b['to']:<10} f = {b['misclosure_mm']:8.2f} mm"
+                             f"   allowed ±{b['allowed_mm']:.2f} mm  "
+                             + ("✓" if b["ok"] else "✗ EXCEEDED"))
+        bad = [r for r in self._merge_report if not r.within_tolerance]
+        if bad:
+            lines.append(f"⚠ {len(bad)} repeated-run discrepancy(ies) exceed k·√L "
+                         "(see Step 1 tab).")
+        self.summary_text.setPlainText("\n".join(lines))
+
+        t = self.heights_table
+        t.setRowCount(0)
+        for pid in sorted(res.adjusted_heights):
+            h = res.adjusted_heights[pid]
+            is_fixed = pid in fixed
+            sd = res.mse_heights.get(pid, 0.0) * 1000
+            approx = res.approximate_heights.get(pid, h)
+            corr = "—" if is_fixed else f"{res.corrections.get(pid, 0.0) * 1000:.2f}"
+            vals = [pid, f"{h:.5f}", f"{approx:.5f}", corr,
+                    "—" if is_fixed else f"{sd:.2f}",
+                    "—" if is_fixed else f"{1.96 * sd:.2f}"]
+            row = t.rowCount()
+            t.insertRow(row)
+            for c, v in enumerate(vals):
+                t.setItem(row, c, _item(v, bg=_FIXED_BG if is_fixed else None))
+
+        t = self.residuals_table
+        t.setRowCount(0)
+        for o in res.observations:
+            row = t.rowCount()
+            t.insertRow(row)
+            v = o["residual_mm"]
+            allowed = _allowed(o["distance"], cls)
+            bg = _WARN_BG if abs(v) > allowed else None
+            vals = [o["from"], o["to"], f"{o['measured_dh']:.5f}", f"{o['adjusted_dh']:.5f}",
+                    f"{v:.2f}", f"{o['distance']:.1f}", f"{o['weight']:.3f}"]
+            for c, val in enumerate(vals):
+                t.setItem(row, c, _item(val, bg=bg))
+
+        self.matrix_text.setPlainText(
+            f"Normal matrix diagnostics\n{'─' * 40}\n"
+            f"n = {n}   u = {u}   r = n − u = {res.degrees_of_freedom}\n"
+            f"VᵀPV = {res.mse_unit_weight ** 2 * res.degrees_of_freedom:.8f}\n"
+            f"σ₀²  = {res.mse_unit_weight ** 2:.10f}\n"
+            f"σ₀   = {res.mse_unit_weight * 1000:.4f} mm/√km\n"
+            f"Std dev of heights: σ₀·√Qxx ; 95%: 1.96·σ\n")
+        self.tabs.setCurrentWidget(self.summary_text)
+
+    # ================================================================== #
+    # Apply / export
+    # ================================================================== #
+    def _apply(self):
+        if self.result is not None:
+            self.accept()
+
+    def _ask_path(self, title, default_name, filt):
+        start = os.path.join(self.output_dir, default_name) if self.output_dir else default_name
+        path, _ = QFileDialog.getSaveFileName(self, title, start, filt)
+        return path
+
+    def _export_fa0(self):
+        prep = self._prepare(quiet=True)
+        if prep is None:
+            QMessageBox.warning(self, "Export FA0", "Tick at least one eligible line.")
             return
-
-        adjuster = LeastSquaresAdjuster(
-            max_iterations=self.spin_iter.value(),
-            tolerance=self.spin_tol.value(),
-            check_stability=self.chk_stability.isChecked()
-        )
-        result = adjuster.adjust(observations, fixed_points)
-        self.result = result
-        self._populate_results(result, fixed_points, method="Parametric (Ax - L)")
-
-    def _run_conditional(self, fixed_points):
-        """
-        True Conditional (Bv+W) adjustment.
-        n_conditions = n_loops + (n_BM - 1).
-        B matrix uses +1/-1 signs based on line direction vs loop traversal.
-        """
-        from core_logic.engine.least_squares import ConditionalAdjuster
-        from core_logic.engine.loop_detector import LoopAnalyzer
-
-        active_lines = [ln for ln in self.lines if self._is_eligible(ln)]
-        if not active_lines:
-            QMessageBox.warning(self, "No Lines", "No active lines to adjust.")
+        obs, _ = prep
+        fixed = self._collect_fixed_points(warn=False)
+        path = self._ask_path("Export FA0", f"{self.project_name}.FA0", "FA0 (*.FA0 *.fa0)")
+        if not path:
             return
+        try:
+            from core_logic.config.models import Benchmark
+            from core_logic.exporters import FA0Exporter
+            FA0Exporter().export(path, [Benchmark(point_id=k, height=v) for k, v in fixed.items()],
+                                 obs, f"{self.project_name}.rez")
+            QMessageBox.information(self, "Export FA0", f"Written:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export FA0", str(exc))
 
-        analyzer = LoopAnalyzer(active_lines)
-        loops = analyzer.find_basis_loops()
-
-        # Build signed loop indices: list of (line_index, sign) tuples
-        line_id_map = {id(ln): i for i, ln in enumerate(active_lines)}
-        loop_indices = []
-        for loop in loops:
-            signed = []
-            prev_pt = loop.points[0] if loop.points else None
-            for ln in loop.lines:
-                if id(ln) not in line_id_map:
-                    continue
-                idx = line_id_map[id(ln)]
-                if prev_pt is not None and ln.start_point == prev_pt:
-                    sign = 1
-                    prev_pt = ln.end_point
-                else:
-                    sign = -1
-                    prev_pt = ln.start_point
-                signed.append((idx, sign))
-            if len(signed) >= 2:
-                loop_indices.append(signed)
-
-        n_bm = len(fixed_points)
-        expected_conditions = len(loop_indices) + max(0, n_bm - 1)
-
-        if expected_conditions == 0:
-            QMessageBox.information(
-                self, "Conditional Adjustment",
-                "No conditions could be formed.\n"
-                "Need loops or at least 2 fixed benchmarks.\n"
-                "Falling back to Parametric method."
-            )
-            self._run_parametric(fixed_points)
+    def _export_fa1(self):
+        if self.result is None:
             return
-
-        if expected_conditions >= len(active_lines):
-            QMessageBox.information(
-                self, "Conditional Adjustment",
-                "Too many conditions for the number of observations.\n"
-                "Falling back to Parametric method."
-            )
-            self._run_parametric(fixed_points)
+        path = self._ask_path("Export FA1", f"{self.project_name}.FA1", "FA1 (*.FA1 *.fa1)")
+        if not path:
             return
+        try:
+            from core_logic.config.models import Benchmark, MeasurementSummary
+            from core_logic.exporters import FA1Exporter
+            obs = [MeasurementSummary(from_point=o["from"], to_point=o["to"],
+                                      height_diff=o["measured_dh"], distance=o["distance"],
+                                      num_setups=o.get("num_setups", 0) or 0, bf_diff=0.0,
+                                      year_month="", source_file=o.get("source", ""))
+                   for o in self.result.observations]
+            FA1Exporter().export(path, [Benchmark(point_id=k, height=v)
+                                        for k, v in self.fixed_points.items()],
+                                 obs, self.result, f"{self.project_name}.rez",
+                                 leveling_class=self.cmb_class.currentText())
+            QMessageBox.information(self, "Export FA1", f"Written:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export FA1", str(exc))
 
-        adjuster = ConditionalAdjuster(check_stability=self.chk_stability.isChecked())
-        result = adjuster.adjust_loops(active_lines, loop_indices, fixed_points)
-        self.result = result
-        self._populate_results(result, fixed_points, method="Conditional (Bv + W)")
+    def _export_pdf(self):
+        if self.result is None:
+            return
+        path = self._ask_path("PDF Report", f"{self.project_name}_LSA.pdf", "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            from geo_level_reporter import GeoLevelReporter
+            GeoLevelReporter(self.result, self.fixed_points, {
+                "project_name": self.project_name,
+                "class": self.cmb_class.currentText(),
+            }).generate_pdf(path)
+            QMessageBox.information(self, "PDF Report", f"Written:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "PDF Report", str(exc))
 
 
-
-
-    # ------------------------------------------------------------------ #
-    # Result display
-    # ------------------------------------------------------------------ #
-
-    def _populate_results(self, result, fixed_points, method):
-        dof = max(0, len(result.residuals) - (
-            len(result.adjusted_heights) - len(fixed_points)
-        ))
-        sigma_sq = result.mse_unit_weight ** 2
-
-        # ── Summary tab ──
-        summary = (
-            f"{'─'*50}\n"
-            f"Method          : {method}\n"
-            f"{'─'*50}\n"
-            f"σ₀²             : {sigma_sq:.6f}\n"
-            f"σ₀  (mm)        : {result.mse_unit_weight * 1000:.4f}\n"
-            f"Degrees of Freedom : {dof}\n"
-            f"Iterations      : {result.iteration}\n"
-            f"K Coefficient   : {result.k_coefficient:.4f}\n"
-            f"Total Distance  : {result.total_distance_km:.3f} km\n"
-            f"Fixed Points    : {len(fixed_points)}\n"
-            f"Adjusted Points : {len(result.adjusted_heights) - len(fixed_points)}\n"
-            f"{'─'*50}\n"
-        )
-        self.summary_text.setPlainText(summary)
-
-        # ── Heights tab ──
-        self.heights_table.setRowCount(0)
-        for pid, h in sorted(result.adjusted_heights.items()):
-            is_fixed = pid in fixed_points
-            sigma_mm = result.mse_heights.get(pid, 0.0) * 1000
-            corr_mm  = "—" if is_fixed else f"{(h - fixed_points.get(pid, h)) * 1000:.2f}"
-            row = self.heights_table.rowCount()
-            self.heights_table.insertRow(row)
-            for col, val in enumerate([pid, f"{h:.5f}", corr_mm, f"{sigma_mm:.3f}"]):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignCenter)
-                if is_fixed:
-                    item.setBackground(QColor(173, 216, 230))
-                self.heights_table.setItem(row, col, item)
-
-        # ── Residuals tab ──
-        self.residuals_table.setRowCount(0)
-        for key, res_mm in sorted(result.residuals.items()):
-            row = self.residuals_table.rowCount()
-            self.residuals_table.insertRow(row)
-            for col, val in enumerate([key, f"{res_mm:.3f}"]):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignCenter)
-                if abs(res_mm) > 5.0:
-                    item.setBackground(QColor(255, 200, 100))
-                self.residuals_table.setItem(row, col, item)
-
-        # ── Matrix diagnostics tab ──
-        diag = (
-            f"Normal Matrix Diagnostics\n{'─'*40}\n"
-            f"Observations (n)  : {len(result.residuals)}\n"
-            f"Unknowns (u)      : {len(result.adjusted_heights) - len(fixed_points)}\n"
-            f"Redundancy (r)    : {dof}\n"
-            f"VᵀPV              : {sigma_sq * dof:.6f}\n"
-            f"σ₀²               : {sigma_sq:.8f}\n"
-            f"σ₀                : {result.mse_unit_weight:.8f} m\n"
-            f"K                 : {result.k_coefficient:.6f} mm/√km\n"
-        )
-        self.matrix_text.setPlainText(diag)
-
-        self.tabs.setCurrentIndex(0)
+def _allowed(distance_m, cls):
+    from core_logic.engine.network_prep import tolerance_mm
+    return tolerance_mm(distance_m, cls)

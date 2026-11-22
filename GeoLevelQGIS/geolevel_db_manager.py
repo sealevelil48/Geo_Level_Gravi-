@@ -1041,6 +1041,53 @@ class BenchmarkDBManager:
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _drop_far_anchors(seeds, known, edges, cands, status, notes) -> None:
+        import heapq
+        import statistics
+        pts = [(r.x, r.y) for recs in cands.values() for r in recs
+               if r.x is not None and r.y is not None]
+        if not pts:
+            return
+        cx = statistics.median(x for x, _ in pts)
+        cy = statistics.median(y for _, y in pts)
+
+        def path_lengths(src):
+            dist = {src: 0.0}
+            heap = [(0.0, src)]
+            while heap:
+                d0, n = heapq.heappop(heap)
+                if d0 > dist.get(n, float("inf")):
+                    continue
+                for nb, L in edges.get(n, {}).items():
+                    nd = d0 + L
+                    if nd < dist.get(nb, float("inf")):
+                        dist[nb] = nd
+                        heapq.heappush(heap, (nd, nb))
+            return dist
+
+        while True:
+            located = dict(known)
+            located.update(seeds)
+            bad = {}
+            for p, loc in seeds.items():
+                for q, d in path_lengths(p).items():
+                    if q == p or q not in located or q in edges.get(p, {}):
+                        continue
+                    o = located[q]
+                    if _dist(loc[0], loc[1], o[0], o[1]) > d * TOPO_FACTOR + TOPO_SLACK_M:
+                        bad.setdefault(p, []).append(q)
+            if not bad:
+                return
+            # drop the contradicting anchor farthest from the consensus
+            worst = max(bad, key=lambda p: (_dist(seeds[p][0], seeds[p][1], cx, cy),
+                                            len(bad[p])))
+            seeds.pop(worst)
+            status[worst] = "conflict"
+            notes[worst] = ("The only DB location contradicts the measured path to "
+                            + ", ".join(bad[worst][:3])
+                            + " - wrong namesake or point missing in DB")
+
+    @staticmethod
     def build_edges(lines: list, exclude=()) -> Dict[str, Dict[str, float]]:
         """Measured connections between line endpoints: pid -> {neighbour: length_m}.
 
@@ -1163,6 +1210,12 @@ class BenchmarkDBManager:
                 status[p] = "conflict"
                 notes[p] = ("The only DB location contradicts the measured distance to "
                             + ", ".join(bad_nb) + " - wrong namesake or point missing in DB")
+
+        # --- anchors not linked by a direct line: compare along the measured
+        # path (no radius).  A far namesake that is the only DB location of a
+        # point is caught here; of two contradicting anchors the one farther
+        # from the consensus of all DB candidates is dropped.
+        self._drop_far_anchors(seeds, known, edges, cands, status, notes)
 
         for p, loc in seeds.items():
             known[p] = loc

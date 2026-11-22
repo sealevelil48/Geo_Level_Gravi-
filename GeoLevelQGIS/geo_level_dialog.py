@@ -18,7 +18,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import Qt
 
 
-SUPPORTED_FILTER = "Measurement Files (*.DAT *.dat *.RAW *.raw *.GSI *.gsi *.rez *.REZ *.FA0 *.fa0)"
+SUPPORTED_FILTER = "Measurement Files (*.DAT *.dat *.RAW *.raw *.GSI *.gsi *.rez *.REZ *.FA0 *.fa0 *.FA1 *.fa1)"
 
 CLASS_DESCRIPTIONS = {
     "H1": "H1 — ±3 mm√km  |  BFFB  |  sight ≤ 30 m",

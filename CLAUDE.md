@@ -72,8 +72,7 @@ There is no test runner framework (pytest/unittest CLI); tests are run as standa
 | `geo_level_dockwidget.py` | `GeoLevelDockWidget` — main dock panel (list + 3 tabs) |
 | `geo_level_dialog.py` | Legacy popup `QDialog` for file/class/output selection |
 | `geo_level_settings_dialog.py` | `GeoLevelSettingsDialog` — editable H1-H6 parameters table |
-| `geo_level_enhanced_lsa_dialog.py` | `GeoLevelEnhancedLSADialog` — Enhanced LSA results viewer with dual methods (Parametric/Conditional) |
-| `geo_level_lsa_dialog.py` | Legacy support file (kept for compatibility) |
+| `geo_level_enhanced_lsa_dialog.py` | `GeoLevelEnhancedLSADialog` — the single adjustment window (network + single line, Steps 1–2, exports) |
 | `geo_level_reporter.py` | `GeoLevelReporter` — PDF report generator via QPrinter |
 | `core_logic/` | Full copy of the geodetic engine (parsers, validators, engine, gis) |
 
@@ -136,15 +135,31 @@ Signals: `line_selected(int)`, `adjust_line_requested(int)`, `lsa_requested()`, 
 
 Key methods: `load_lines(lines, val_results)`, `populate_line_details(line)`, `update_validation_tab(line)`, `show_adjustment_result(text)`, `select_line_by_filename(filename)`, `get_current_index()`, `get_selected_class()`
 
-### `GeoLevelLSADialog` (`geo_level_lsa_dialog.py`)
+### `GeoLevelEnhancedLSADialog` (`geo_level_enhanced_lsa_dialog.py`) — the only adjustment window
 
-Constructor: `GeoLevelLSADialog(result: AdjustmentResult, fixed_points: dict, parent)`
+Opened by "Network Adjustment (LSA)" (dock + menu) and by "Adjust This Line" (same window, only that line ticked).
+Constructor: `GeoLevelEnhancedLSADialog(lines, parent, val_results, leveling_class, known_heights, selected_lines, project_name, output_dir)`
 
-- Statistics group box: σ₀², σ₀ (mm), DoF, iterations, K, total dist
-- Heights table (4 cols): Point ID, Adjusted Height (m), Correction (mm), Std Dev (mm) — fixed points highlighted light-blue
-- Residuals table (2 cols): Observation, Residual (mm) — >5 mm highlighted orange
-- Bottom row: **[Export PDF Report]** (dark navy) + **[Close]**
-- `on_export_report()` → `QFileDialog.getSaveFileName` → `GeoLevelReporter.generate_pdf(path)`
+- Left: method (Parametric / Conditional), lines table (tick/untick; invalid/excluded greyed), fixed points (Auto-Select from .FA0/.FA1 heights or DB, Fetch from DB), options (Step 1 averaging, weights distance/setups/equal, class)
+- Buttons: Prepare (Steps 1–2), Run, **Apply to Map** (accept → plugin `_apply_lsa_to_layer` writes `adj_height` on "Geodetic Points" and stores `last_adjustment` in the GPKG), **Export FA0 / FA1 / PDF**
+- Tabs: Summary (σ₀, dof, BM-to-BM misclosures vs k√L), Step 1 Observations, Step 2 Approximate Heights, Adjusted Heights (approx, correction, σ, 95%), Residuals, Line Adjustment (single line between two known heights, Directive G2 App. C), Matrix Diagnostics
+
+### Adjustment engine (`core_logic/engine/least_squares.py`, `network_prep.py`)
+
+- **Step 1** `merge_observations()`: repeated runs of a section averaged once (dH = (dH_fwd − dH_ret)/2), δ checked against k√L with L = one-direction length; merged weight n_runs/L.
+- **Step 2** `approximate_heights()`: multi-source Dijkstra from fixed points (else any known height, else relative 0.000).
+- `check_datum()`: raises `NetworkDatumError` when a connected group has no fixed point (no silent singular solutions).
+- **Parametric**: L = Lb − L0 (L0 by direction: FROM fixed → −H, TO fixed → +H, both → H_to − H_from), X = N⁻¹U solved directly (linear model, no iterations), V = AX − L, σ₀² = VᵀPV/(n−u).
+- **Conditional**: independent conditions from fundamental loops of a spanning forest + (n_fixed−1) BM paths per group; k = −M⁻¹w, v = P⁻¹Bᵀk.
+- Verified against "Condition Adjustment_BvW.pdf" example 1 (RFH-95/96/97 → A=121.344, B=117.573, C=110.190, D=102.764, σ₀=4.512) in `core_logic/tests/test_adjustment.py`.
+
+### Summary-file import (`core_logic/parsers/fa0_parser.py`, `fa1_parser.py`, `rez_parser.py`)
+
+`parser.parse_many(path)` returns one `LevelingLine` per row (`is_summary=True`, setup count kept with evenly split placeholder setups); known heights in `parser.benchmarks` → `process_geodetic_data()["file_benchmarks"]` → plugin `_file_benchmarks` (persisted in `lv_meta`). Summary files are detected by extension before content sniffing.
+
+### Position estimation (`core_logic/gis/topo_estimator.py`)
+
+Dijkstra on measured line lengths from every DB-located point; unknown points (also chains PKT1→PKT2) are placed between the two nearest anchors at r = d1/(d1+d2), or at the path length from a single anchor. No radius limit.
 
 ### `GeoLevelReporter` (`geo_level_reporter.py`)
 

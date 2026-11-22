@@ -8,6 +8,7 @@ from core_logic.parsers.trimble_parser import TrimbleParser, parse_trimble_dat
 from core_logic.parsers.leica_parser import LeicaParser, parse_leica_gsi
 from core_logic.parsers.rez_parser import RezParser, parse_rez_file
 from core_logic.parsers.fa0_parser import FA0Parser, parse_fa0_file
+from core_logic.parsers.fa1_parser import FA1Parser, parse_fa1_file
 
 __all__ = [
     'BaseParser',
@@ -21,4 +22,6 @@ __all__ = [
     'parse_rez_file',
     'FA0Parser',
     'parse_fa0_file',
+    'FA1Parser',
+    'parse_fa1_file',
 ]

@@ -447,7 +447,12 @@ def export_network_to_geojson(lines: List[LevelingLine],
 
     # Export lines (mixed FeatureCollection — lines + points bundled)
     lines_file = output_path / f"{project_name}_lines.geojson"
-    geojson_data = exporter.export_lines(lines, str(lines_file))
+    # Schematic placeholder positions only when there are no real
+    # coordinates at all; otherwise an unlocated point is left out instead of
+    # being drawn on a fake circle far from the project.
+    has_real = bool(coord_manager is not None and getattr(coord_manager, "coordinates", None))
+    geojson_data = exporter.export_lines(lines, str(lines_file),
+                                         include_schematic=not has_real)
 
     # Export points as a separate GeoJSON so the plugin can load them as an
     # independent layer on the QGIS map canvas with their own symbology.

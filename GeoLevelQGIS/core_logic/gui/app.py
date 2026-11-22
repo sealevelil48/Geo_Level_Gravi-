@@ -3179,11 +3179,12 @@ Special Requirements:"""
     def _open_files(self):
         """Open file dialog to select files."""
         filetypes = [
-            ("All supported", "*.DAT *.dat *.RAW *.raw *.GSI *.gsi *.rez *.REZ *.FA0 *.fa0"),
+            ("All supported", "*.DAT *.dat *.RAW *.raw *.GSI *.gsi *.rez *.REZ *.FA0 *.fa0 *.FA1 *.fa1"),
             ("Trimble DAT", "*.DAT *.dat"),
             ("Leica RAW", "*.RAW *.raw"),
             ("Rez Summary", "*.rez *.REZ"),
             ("FA0 Input", "*.FA0 *.fa0"),
+            ("FA1 Report", "*.FA1 *.fa1"),
             ("All files", "*.*")
         ]
         
@@ -3205,6 +3206,7 @@ Special Requirements:"""
             files += list(folder_path.glob("*.RAW")) + list(folder_path.glob("*.raw"))
             files += list(folder_path.glob("*.rez")) + list(folder_path.glob("*.REZ"))
             files += list(folder_path.glob("*.FA0")) + list(folder_path.glob("*.fa0"))
+            files += list(folder_path.glob("*.FA1")) + list(folder_path.glob("*.fa1"))
             
             if files:
                 self._load_files([str(f) for f in files])

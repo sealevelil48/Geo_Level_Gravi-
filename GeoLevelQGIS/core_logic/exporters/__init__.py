@@ -9,13 +9,10 @@ from pathlib import Path
 from datetime import datetime
 import logging
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from config.models import (
+from core_logic.config.models import (
     LevelingLine, MeasurementSummary, Benchmark, AdjustmentResult
 )
-from config.settings import get_settings
+from core_logic.config.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
@@ -134,7 +131,8 @@ class FA1Exporter:
         benchmarks: List[Benchmark],
         observations: List[MeasurementSummary],
         result: AdjustmentResult,
-        project_name: str = "project.rez"
+        project_name: str = "project.rez",
+        leveling_class=3,
     ):
         """
         Export to FA1 format.
@@ -146,6 +144,8 @@ class FA1Exporter:
             result: AdjustmentResult from adjustment
             project_name: Project name
         """
+        self.leveling_class = leveling_class
+        self.project_name = project_name
         with open(filepath, 'w', encoding=self.encoding) as f:
             # Data section header
             self._write_data_section(f, benchmarks, observations, project_name)
@@ -217,13 +217,15 @@ class FA1Exporter:
         
         for obs in observations:
             key = f"{obs.from_point}-{obs.to_point}"
-            residual = result.residuals.get(key, 0) / 1000  # Convert back to m
-            
-            # Calculate allowable tolerance
-            dist_km = obs.distance / 1000
-            tolerance = 0.003 * (dist_km ** 0.5) if dist_km > 0 else 0
-            
-            delta = residual - tolerance
+            # DH-(H2-H1) = measured - adjusted = -v
+            residual = -result.residuals.get(key, 0) / 1000  # mm -> m
+
+            # Allowed value for the leveling class: k * sqrt(L_km)
+            from core_logic.engine.network_prep import tolerance_mm
+            tolerance = tolerance_mm(obs.distance,
+                                     getattr(self, "leveling_class", 3)) / 1000.0
+
+            delta = abs(residual) - tolerance
             
             # Determine if good/bad
             status = "  " if abs(residual) <= tolerance else "**"
@@ -234,7 +236,7 @@ class FA1Exporter:
                 f"{obs.distance:8.0f}."
                 f"{residual:12.5f}"
                 f"    {tolerance:.6f}"
-                f"{delta:12.6f}  {status}    0    0- 0      0\n\n"
+                f"{delta:12.6f}  {status}    0    0- 0  {getattr(obs, 'num_setups', 0) or 0:5d}\n\n"
             )
             f.write(line)
     
@@ -255,7 +257,7 @@ class FA1Exporter:
     ):
         """Write adjusted heights table."""
         f.write(f"1{' ' * 45}ITERATION  NO. {result.iteration}\n\n")
-        f.write(f"{' ' * 39}project.rez\n\n")
+        f.write(f"{' ' * 39}{getattr(self, 'project_name', 'project.rez')}\n\n")
         f.write(f"{' ' * 37}M.S.E. OF UNIT WEIGHT = {result.mse_unit_weight:10.6f}\n\n")
         f.write(f"{' ' * 34}NO.      ADJUSTED     APPROX          DIF         M.S.E.\n\n")
         
@@ -271,7 +273,7 @@ class FA1Exporter:
                 f.write(f"{' ' * 30}{idx:3} {point_id:8}{height:12.5f}\n")
             else:
                 # Adjusted point
-                approx = 0.0  # Would need to track approximate
+                approx = (getattr(result, "approximate_heights", None) or {}).get(point_id, height)
                 diff = height - approx
                 f.write(
                     f"{' ' * 30}{idx:3} {point_id:8}{height:12.5f}"
@@ -359,10 +361,10 @@ class REZExporter:
 
             # Build header with optional Source Files column
             if include_source_files:
-                f.write(f"{'From':<12}{'To':<12}{'Height Diff':>14}{'Distance':>12}{'Setups':>8}{'Status':>12}  {'Source File':<30}\n")
+                f.write(f"{'From':<12}{'To':<12}{'Height Diff':>14}{'Distance':>12}{'Setups':>8} {'Status':>12}  {'Source File':<30}\n")
                 f.write("-" * 110 + "\n")
             else:
-                f.write(f"{'From':<12}{'To':<12}{'Height Diff':>14}{'Distance':>12}{'Setups':>8}{'Status':>12}\n")
+                f.write(f"{'From':<12}{'To':<12}{'Height Diff':>14}{'Distance':>12}{'Setups':>8} {'Status':>12}\n")
                 f.write("-" * 70 + "\n")
 
             for line in lines:
@@ -372,7 +374,7 @@ class REZExporter:
                 output = (
                     f"{line.start_point:<12}{line.end_point:<12}"
                     f"{line.total_height_diff:>14.5f}{line.total_distance:>12.2f}"
-                    f"{line.num_setups:>8}{status_str:>12}"
+                    f"{line.num_setups:>8} {status_str:>12}"
                 )
 
                 # Add source file if requested
@@ -401,11 +403,13 @@ def export_fa1(
     benchmarks: List[Benchmark],
     observations: List[MeasurementSummary],
     result: AdjustmentResult,
-    project_name: str = "project.rez"
+    project_name: str = "project.rez",
+    leveling_class=3,
 ):
     """Export to FA1 format."""
     exporter = FA1Exporter()
-    exporter.export(filepath, benchmarks, observations, result, project_name)
+    exporter.export(filepath, benchmarks, observations, result, project_name,
+                    leveling_class)
 
 
 def export_fteg(filepath: str, observations: List[MeasurementSummary]):

@@ -31,6 +31,9 @@ class BaseParser(ABC):
         self.encoding = encoding or self.settings.encoding.default_encoding
         self.errors: List[str] = []
         self.warnings: List[str] = []
+        # Known heights found in the file ({point_id: height}); summary
+        # files (.FA0 / .FA1) carry them, field files do not.
+        self.benchmarks = {}
     
     @abstractmethod
     def parse(self, filepath: str) -> LevelingLine:
@@ -58,6 +61,11 @@ class BaseParser(ABC):
         """
         pass
     
+    def parse_many(self, filepath: str) -> List[LevelingLine]:
+        """Parse a file that may hold several lines (summary files).
+        Field files (.DAT / .RAW) hold exactly one line."""
+        return [self.parse(filepath)]
+
     def read_file(self, filepath: str) -> List[str]:
         """
         Read file with automatic encoding detection.
@@ -132,6 +140,15 @@ def detect_file_format(filepath: str) -> FileFormat:
     ext = path.suffix.lower()
     filename = path.name.lower()
     
+    # Summary files are identified by extension only: their numeric rows
+    # can look like Leica GSI words to the content sniffer below.
+    if ext == '.rez':
+        return FileFormat.REZ
+    if ext == '.fa0':
+        return FileFormat.FA0
+    if ext == '.fa1':
+        return FileFormat.FA1
+
     # Try content-based detection first
     try:
         with open(filepath, 'r', encoding='latin-1') as f:
@@ -177,6 +194,8 @@ def detect_file_format(filepath: str) -> FileFormat:
         return FileFormat.REZ
     if '_fa0' in filename or 'fa0' in filename:
         return FileFormat.FA0
+    if '_fa1' in filename or 'fa1' in filename:
+        return FileFormat.FA1
 
     return FileFormat.UNKNOWN
 
@@ -205,6 +224,9 @@ def create_parser(filepath: str) -> Optional[BaseParser]:
     elif file_format == FileFormat.FA0:
         from core_logic.parsers.fa0_parser import FA0Parser
         return FA0Parser()
+    elif file_format == FileFormat.FA1:
+        from core_logic.parsers.fa1_parser import FA1Parser
+        return FA1Parser()
     else:
         logger.warning(f"Unknown file format for {filepath}")
         return None

@@ -40,7 +40,7 @@ class GeoLevelReporter:
         ----------
         result_data : AdjustmentResult  OR  dict
             Accepts either an ``AdjustmentResult`` object (the normal case when
-            called from ``GeoLevelLSADialog.on_export_report``) or the legacy
+            called from the Enhanced LSA dialog) or the legacy
             dict format ``{stats: {...}, points: {...}, residuals: [...]}``.
             When an ``AdjustmentResult`` is supplied it is converted to the
             internal dict representation automatically.
@@ -88,7 +88,7 @@ class GeoLevelReporter:
 
         n_obs      = len(result.residuals)
         n_unknowns = len(result.adjusted_heights) - len(self.fixed_points)
-        dof        = max(0, n_obs - n_unknowns)
+        dof        = getattr(result, "degrees_of_freedom", 0) or max(0, n_obs - n_unknowns)
         sigma_sq   = result.mse_unit_weight ** 2
 
         stats = {
@@ -105,13 +105,9 @@ class GeoLevelReporter:
             is_fixed   = pid in self.fixed_points
             sigma_mm   = result.mse_heights.get(pid, 0.0) * 1000
             orig_h     = fp_heights.get(pid, adj_h)
-            corr_mm    = (adj_h - orig_h) * 1000 if is_fixed else (
-                result.residuals.get(
-                    # try to find a residual keyed by this point as destination
-                    next((k for k in result.residuals if k.endswith("-" + pid)), ""),
-                    0.0
-                )
-            )
+            # correction = adjusted - approximate height (Step 2)
+            corr_mm    = (0.0 if is_fixed else
+                          (getattr(result, "corrections", {}) or {}).get(pid, 0.0) * 1000)
             points[pid] = {
                 "height":        adj_h,
                 "correction_mm": corr_mm,

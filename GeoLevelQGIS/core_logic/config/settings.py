@@ -20,6 +20,7 @@ class FileFormat(Enum):
     LEICA_GSI = "leica_gsi"
     REZ = "rez"
     FA0 = "fa0"
+    FA1 = "fa1"
     UNKNOWN = "unknown"
 
 

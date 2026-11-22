@@ -106,73 +106,13 @@ def _build_coord_manager(lines, db_manager):
     )
 
     # ------------------------------------------------------------------ #
-    # Pass 2 — Distance-weighted topological estimation for PKT points    #
-    #                                                                      #
-    # Uses the same IDW / linear-interp / +X logic as QGISLineLayerBuilder#
-    # so GeoJSON point markers match the layer builder's line endpoints.  #
+    # Pass 2 — topological estimation (Dijkstra on measured lengths) for   #
+    # points missing from the DB, also through chains of unknown points.   #
     # ------------------------------------------------------------------ #
-    for unknown_id in unknown_ids:
-        dist_accumulator = {}
-        coord_for = {}
-
-        for line in lines:
-            s_id = str(line.start_point or "").strip()
-            e_id = str(line.end_point   or "").strip()
-            raw_d = getattr(line, "total_distance", None)
-            d = float(raw_d) if raw_d is not None else None
-
-            if s_id == unknown_id and e_id in itm_coords:
-                coord_for[e_id] = itm_coords[e_id][:2]
-                if d is not None:
-                    dist_accumulator.setdefault(e_id, []).append(d)
-            elif e_id == unknown_id and s_id in itm_coords:
-                coord_for[s_id] = itm_coords[s_id][:2]
-                if d is not None:
-                    dist_accumulator.setdefault(s_id, []).append(d)
-
-        neighbour_data = []
-        for nbr_id, xy in coord_for.items():
-            dvals = dist_accumulator.get(nbr_id, [])
-            avg_d = sum(dvals) / len(dvals) if dvals else 100.0
-            neighbour_data.append((xy, avg_d))
-
-        if not neighbour_data:
-            log.warning(
-                "_build_coord_manager: Pass 2 — '%s' has no known neighbours, "
-                "cannot estimate — skipping GeoJSON point",
-                unknown_id,
-            )
-            continue
-
-        import math as _math
-        n = len(neighbour_data)
-        if n == 1:
-            # Offset by d·cos(45°) / d·sin(45°) — renders at the exact
-            # measured distance along a diagonal rather than a flat +X shift.
-            (ke, kn), offset = neighbour_data[0]
-            est_e = ke + offset * _math.cos(_math.radians(45))
-            est_n = kn + offset * _math.sin(_math.radians(45))
-        elif n == 2:
-            (x1, y1), d1 = neighbour_data[0]
-            (x2, y2), d2 = neighbour_data[1]
-            r = d1 / (d1 + d2) if (d1 + d2) > 0 else 0.5
-            est_e = x1 + r * (x2 - x1)
-            est_n = y1 + r * (y2 - y1)
-        else:
-            total_w = sum(1.0 / d for _, d in neighbour_data if d > 0)
-            if total_w == 0:
-                est_e = sum(xy[0] for xy, _ in neighbour_data) / n
-                est_n = sum(xy[1] for xy, _ in neighbour_data) / n
-            else:
-                est_e = sum(xy[0] / d for xy, d in neighbour_data if d > 0) / total_w
-                est_n = sum(xy[1] / d for xy, d in neighbour_data if d > 0) / total_w
-
-        itm_coords[unknown_id] = (est_e, est_n, 0.0, True)
-        log.info(
-            "_build_coord_manager: Pass 2 — '%s' estimated "
-            "(n=%d neighbours): E=%.1f N=%.1f",
-            unknown_id, n, est_e, est_n,
-        )
+    from core_logic.gis.topo_estimator import estimate_positions
+    known_xy = {pid: (v[0], v[1]) for pid, v in itm_coords.items()}
+    for pid, (est_e, est_n) in estimate_positions(lines, known_xy).items():
+        itm_coords[pid] = (est_e, est_n, 0.0, True)
 
     # ------------------------------------------------------------------ #
     # Transform all ITM coords to WGS84 and load into CoordinateManager  #
@@ -264,14 +204,24 @@ def process_geodetic_data(
     lines = []
     parse_errors = []
 
+    file_benchmarks = {}   # known heights carried by .FA0 / .FA1 files
     for fp in file_paths:
         try:
             parser = create_parser(fp)
-            line = parser.parse(fp)
-            line.source_path = os.path.abspath(fp)
-            lines.append(line)
-            log.info("Parsed: %s  (%s → %s)", Path(fp).name,
-                     line.start_point, line.end_point)
+            if parser is None:
+                raise ValueError("unsupported file type")
+            parsed = parser.parse_many(fp)
+            for line in parsed:
+                line.source_path = os.path.abspath(fp)
+                lines.append(line)
+            for pid, h in (getattr(parser, "benchmarks", None) or {}).items():
+                file_benchmarks[pid] = h
+            if len(parsed) == 1:
+                log.info("Parsed: %s  (%s → %s)", Path(fp).name,
+                         parsed[0].start_point, parsed[0].end_point)
+            else:
+                log.info("Parsed: %s  (%d lines, %d known heights)", Path(fp).name,
+                         len(parsed), len(getattr(parser, "benchmarks", {}) or {}))
         except Exception as exc:
             msg = f"{Path(fp).name}: {exc}"
             parse_errors.append(msg)
@@ -352,6 +302,9 @@ def process_geodetic_data(
         "line_style":     output_files["line_style"],
         "point_style":    output_files["point_style"],
         "rez_path":       rez_path,
+        # Known heights read from .FA0 / .FA1 files (renamed like the lines)
+        "file_benchmarks": {(name_overrides or {}).get(k, k): v
+                            for k, v in file_benchmarks.items()},
         "summary": {
             "total":    len(lines),
             "valid":    valid_count,

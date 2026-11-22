@@ -25,7 +25,7 @@ This branch (`GeoLevelGraviQGIS`) extends the core tool with a **native QGIS plu
 | `GeoLevelQGIS/geo_level_dockwidget.py` | PyQt5 dock panel — file list, 3-tab detail view, class selector |
 | `GeoLevelQGIS/geo_level_dialog.py` | Legacy popup dialog (file selector, class selector, output dir) |
 | `GeoLevelQGIS/geo_level_settings_dialog.py` | Editable H1-H6 class parameters table with live registry patching |
-| `GeoLevelQGIS/geo_level_lsa_dialog.py` | LSA results viewer — heights, corrections, std devs, residuals |
+| `GeoLevelQGIS/geo_level_enhanced_lsa_dialog.py` | The single adjustment window — network & single-line LSA, Steps 1–2, FA0/FA1/PDF export |
 | `GeoLevelQGIS/geo_level_reporter.py` | PDF report generator via QPrinter — zero external dependencies |
 | `GeoLevelQGIS/geolevel_db_manager.py` | PostgreSQL/PostGIS benchmark resolver — spatial disambiguation, ITM coords |
 | `GeoLevelQGIS/qgis_line_layer_builder.py` | Direct QGIS memory layer builder — three-pass DB coordinate resolver |
@@ -345,7 +345,7 @@ GeoLevelQGIS/
 ├── geo_level_dockwidget.py        ← Dock panel (list + 3 tabs)
 ├── geo_level_dialog.py            ← Legacy popup dialog
 ├── geo_level_settings_dialog.py   ← H1-H6 class parameters editor
-├── geo_level_lsa_dialog.py        ← LSA results viewer + PDF export
+├── geo_level_enhanced_lsa_dialog.py ← adjustment window + FA0/FA1/PDF export
 ├── geo_level_reporter.py          ← PDF generator (QPrinter, zero deps)
 ├── geolevel_db_manager.py         ← PostgreSQL/PostGIS benchmark resolver
 │                                     Spatial Median + K-Means k=1 centroid
