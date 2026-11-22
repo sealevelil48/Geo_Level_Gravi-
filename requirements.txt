@@ -1,2 +1,7 @@
-pandas>=1.3.0
-numpy>=1.20.0
+# Geo Level Gravi - QGIS plugin
+# QGIS 3.x ships Python with PyQt5, numpy and (on Windows / OSGeo4W) psycopg2.
+# Install only what your QGIS Python is missing, from the OSGeo4W shell:
+#   python -m pip install -r requirements.txt
+numpy>=1.20
+pandas>=1.3
+psycopg2-binary>=2.9   # benchmark database (PostgreSQL/PostGIS); optional

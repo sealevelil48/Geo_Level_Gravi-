@@ -20,7 +20,7 @@ import sys
 from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "GeoLevelQGIS"))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "GeoLevelQGIS"))
 
 from geolevel_db_manager import BenchmarkDBManager, group_twins  # noqa: E402
 

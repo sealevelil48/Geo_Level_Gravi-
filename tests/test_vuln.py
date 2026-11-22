@@ -1,7 +1,7 @@
 """Untrusted GeoPackage rows: malformed values must be dropped, not loaded."""
 import os
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "GeoLevelQGIS"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "GeoLevelQGIS"))
 
 from geo_level_gpkg import rows_to_project  # noqa: E402
 

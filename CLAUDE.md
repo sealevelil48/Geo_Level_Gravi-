@@ -4,61 +4,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Geodetic Leveling Tool v1.1 — a Python application for automating geodetic leveling calculations and survey data processing, compliant with Israeli Survey Regulations (Directive ג2, 2021). Supports Trimble DAT and Leica RAW/GSI input formats with Hebrew encoding (cp1255).
+Geo Level Gravi — QGIS plugin for geometric-leveling processing and least-squares adjustment, compliant with Israeli Survey Regulations (Directive ג2, 2021). Reads Trimble DAT, Leica RAW/GSI and FA0/FA1/REZ summary files with Hebrew encoding (cp1255).
 
 This repository has two branches:
-- `main` — standalone tool with Tkinter GUI + CLI
-- `GeoLevelGraviQGIS` — native QGIS plugin (PyQt5/PyQGIS), this branch
+- `main` — standalone tool (Tkinter GUI + CLI) in `geodetic_tool/`, same engine
+- `GeoLevelGraviQGIS` — this branch: only the QGIS plugin in `GeoLevelQGIS/` (no standalone copy here)
 
 ---
 
 ## Commands
 
 ```bash
-# Run standalone GUI (Tkinter)
-python run_gui.py
+# Engine tests (pytest)
+cd GeoLevelQGIS && python -m pytest core_logic/tests
+# Plugin-level tests (plain scripts, run from repo root)
+python tests/test_point_resolution.py
+python tests/test_gpkg_roundtrip.py
+python tests/test_vuln.py
 
-# Run CLI
-python run_cli.py parse *.DAT
-python run_cli.py validate *.DAT
-python run_cli.py geojson *.DAT -o ./output
-
-# Run tests
-python geodetic_tool/tests/test_parsers.py
-python test_class_selector.py
-python test_lsa.py
-
-# Install dependencies
-pip install -r requirements.txt
-# Or editable install
-pip install -e .
-
-# Deploy QGIS plugin (Windows — run from repo root)
-xcopy "GeoLevelQGIS" "%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\GeoLevelQGIS" /E /I /Y
-# Then press Ctrl+F5 in QGIS to reload via Plugin Reloader
+# Deploy to QGIS (Windows): mirror-copies GeoLevelQGIS/ into the default profile
+deploy.bat
 ```
-
-There is no test runner framework (pytest/unittest CLI); tests are run as standalone scripts.
 
 ---
 
 ## Architecture
 
-### Standalone Tool (`geodetic_tool/`)
+### Engine (`GeoLevelQGIS/core_logic/`, shared with `main`'s `geodetic_tool/`)
 
 **Input Files → Parsers → Validators → Engine → Exporters/GIS**
 
-- **`config/models.py`** — Core dataclasses: `LevelingLine`, `StationSetup`, `Benchmark`, `ValidationResult`, `AdjustmentResult`, `LineStatus`. Shared data structures across all modules.
-- **`config/settings.py`** — Global `Settings` singleton (encoding, tolerance, Leica GSI word indices, Trimble format config). Access via `get_settings()`.
-- **`config/israel_survey_regulations.py`** — H1-H6 class parameters, tolerance formulas, `CLASS_REGISTRY_BY_NAME` dict, `get_default_class()`, `get_class_parameters()`.
-- **`config/settings_manager.py`** — Persistent user settings stored in `~/.geodetic_tool/settings.json`. Methods: `save_class_parameters`, `load_class_parameters`, `update_class_parameters(class_name, params)`, `reset_to_defaults`, `get_default_class`, `set_default_class`.
-- **`parsers/`** — `BaseParser` ABC with `TrimbleParser` and `LeicaParser`. Use `create_parser(filename)` for auto-detection. Parsers return `LevelingLine` objects.
-- **`validators/__init__.py`** — `LevelingValidator` (single line) and `BatchValidator` (multiple files). Validates endpoints, naming conventions, tolerances per class.
-- **`engine/`** — `height_calculator.py`, `line_adjustment.py`, `least_squares.py` (LSA with Ax+L and Bv+W), `loop_detector.py`, `line_coordinator.py`, `adjustment_computations.py`.
-- **`exporters/__init__.py`** — All exporters (FA0, FA1, FTEG, REZ) in a single file. Output uses cp1255 encoding with fixed-width formatting.
-- **`gis/geojson_export.py`** — GeoJSON export with QGIS QML style files. Point features have `point_id`, `height`, `is_benchmark`, `status` fields. Line features have `filename` field (required for map-to-dock sync).
-- **`gui/app.py`** — Tkinter GUI (single file). Includes class selector combo box (H1-H6), network adjustment dialog, batch processing.
-- **`cli/main.py`** — CLI with subcommands: `info`, `validate`, `export`, `geojson`.
+- **`config/models.py`** — `LevelingLine`, `StationSetup`, `Benchmark`, `ValidationResult`, `AdjustmentResult`, `LineStatus`.
+- **`config/israel_survey_regulations.py`** — H1-H6 parameters, `CLASS_REGISTRY_BY_NAME`.
+- **`config/settings_manager.py`** — user settings in `~/.geodetic_tool/settings.json`.
+- **`parsers/`** — `create_parser(path)` auto-detects DAT / RAW / GSI / FA0 / FA1 / REZ; `parse_many(path)` returns a list of lines.
+- **`validators/`** — `LevelingValidator`, `BatchValidator`.
+- **`engine/`** — `least_squares.py`, `network_prep.py` (Steps 1–2, datum check, conditions), loops, line tools.
+- **`exporters/`** — FA0, FA1, FTEG, REZ (cp1255, fixed width).
+- **`gis/`** — `geojson_export.py`, `topo_estimator.py`.
+- **`process.py`** — `process_geodetic_data(paths, class, out_dir, name_overrides, parse_only, preparsed)`.
 
 ### QGIS Plugin (`GeoLevelQGIS/`)
 
@@ -159,7 +143,16 @@ Constructor: `GeoLevelEnhancedLSADialog(lines, parent, val_results, leveling_cla
 
 ### Position estimation (`core_logic/gis/topo_estimator.py`)
 
-Dijkstra on measured line lengths from every DB-located point; unknown points (also chains PKT1→PKT2) are placed between the two nearest anchors at r = d1/(d1+d2), or at the path length from a single anchor. No radius limit.
+One multi-source Dijkstra on measured line lengths (`_nearest_anchors`): every unknown point keeps its nearest anchor and the nearest anchor at a different position; paths never pass through another anchor. Unknown points (also chains PKT1→PKT2) are placed between the two anchors at r = d1/(d1+d2), or at the path length from a single anchor. No radius limit. O(E log V) regardless of the anchor count.
+
+### Load pipeline & performance (`geo_level_plugin._process_files`)
+
+1. `process_geodetic_data(..., parse_only=True)` — parse only; `result["parsed"]` is a pickle snapshot of the pristine lines.
+2. `_check_point_resolution` — `get_candidates_batch` (`prefetch` = one SQL per 500 names over all 6 name-key expressions + one `unnest`/`ST_DWithin` twin query), `resolve_network`, dialog rounds. `search_fn` = `db_mgr.search()` (number-only query matches `mispar_nekuda`, never the glued `mispar||ot` form).
+3. `process_geodetic_data(..., preparsed=parsed)` — full run on the snapshot (taken over, not copied) with verified names.
+4. Inside `_frozen_canvas(iface)`: line layer, point layer, `_sync_map_statuses` (edits only changed features), `_persist_to_gpkg`; one canvas refresh at the end.
+
+`BenchmarkDBManager` keeps ONE psycopg2 connection (`_shared_connection`, autocommit) and per-session caches (`_query_cache`, `_twin_cache`, control-layer index `_layer_index`); `clear_session_cache()` resets all of them. `seed_from_qgis_layer` indexes the `נקודות בקרה` layer once (attributes only) and fetches geometry by feature id. Never add per-point SQL in loops — use `prefetch` / `prefetch_twins`.
 
 ### `GeoLevelReporter` (`geo_level_reporter.py`)
 
@@ -240,10 +233,8 @@ Reset to Defaults: calls `mgr.reset_to_defaults()` + `importlib.reload(israel_su
 
 ## Dependencies
 
-### Standalone tool
-- `pandas`, `numpy` (plus `tkinter` from stdlib for GUI)
-
 ### QGIS plugin
+- `psycopg2` — benchmark DB (bundled with OSGeo4W QGIS); no scipy needed
 - All Qt/PyQGIS dependencies bundled with QGIS/OSGeo4W
 - `QPrinter`, `QTextDocument` — used for PDF generation (no external libs needed)
 - `numpy` — used by `LeastSquaresAdjuster`
@@ -252,12 +243,7 @@ Reset to Defaults: calls `mgr.reset_to_defaults()` + `importlib.reload(israel_su
 
 ## Deploy Workflow
 
-```bat
-REM From repo root (Windows):
-xcopy "GeoLevelQGIS" "%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\GeoLevelQGIS" /E /I /Y
-```
-
-After deploy, press `Ctrl+F5` in QGIS (Plugin Reloader) to reload without restart.
+Run `deploy.bat` from the repo root (Windows). It uses `robocopy /MIR` from `GeoLevelQGIS/` into `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\GeoLevelQGIS`, excluding `__pycache__` and `tests`. Restart QGIS (or Plugin Reloader) afterwards.
 
 Sanity check in QGIS Python Console (`Ctrl+Alt+P`):
 ```python

@@ -19,7 +19,7 @@ import tempfile
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "GeoLevelQGIS"))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "GeoLevelQGIS"))
 
 import geo_level_gpkg as gp  # noqa: E402
 from core_logic.config.models import (  # noqa: E402
