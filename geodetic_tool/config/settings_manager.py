@@ -76,9 +76,9 @@ class SettingsManager:
             self.set_db_connection(
                 host=db.get("host", "localhost"),
                 port=int(db.get("port", 5432)),
-                dbname=db.get("dbname", "survey_db"),
+                dbname=db.get("dbname", "cp_bangal"),
                 user=db.get("user", "cp_read"),
-                table=db.get("table", "benchmarks"),
+                table=db.get("table", "public.cp_table"),
                 authcfg=db.get("authcfg", ""),
             )
             print(
