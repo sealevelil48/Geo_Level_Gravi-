@@ -2,10 +2,10 @@
     "db_connection": {
         "host": "localhost",
         "port": 5432,
-        "dbname": "survey_db",
+        "dbname": "cp_bangal",
         "user": "cp_read",
         "password": "__set_via_QgsAuthManager__",
-        "table": "benchmarks",
+        "table": "public.cp_table",
         "authcfg": ""
     }
 }

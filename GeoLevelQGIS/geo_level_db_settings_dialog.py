@@ -66,7 +66,7 @@ class GeoLevelDBSettingsDialog(QDialog):
         form.addRow("Port:", self.spin_port)
 
         self.edit_dbname = QLineEdit()
-        self.edit_dbname.setPlaceholderText("database name")
+        self.edit_dbname.setPlaceholderText("e.g. cp_bangal")
         form.addRow("Database:", self.edit_dbname)
 
         self.edit_user = QLineEdit()
@@ -78,7 +78,7 @@ class GeoLevelDBSettingsDialog(QDialog):
         form.addRow("Auth Config:", self.auth_widget)
 
         self.edit_table = QLineEdit()
-        self.edit_table.setPlaceholderText("benchmark table name (required)")
+        self.edit_table.setPlaceholderText("e.g. public.cp_table (required)")
         form.addRow("Table name:", self.edit_table)
 
         root.addWidget(grp)
