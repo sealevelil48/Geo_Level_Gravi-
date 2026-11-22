@@ -236,6 +236,33 @@ WHERE
      UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || COALESCE(CAST(ot_nekuda_kfula AS TEXT), '')))        = UPPER(TRIM(%s)))
 """
 
+# Batch name lookup: ONE scan of the table for any number of names.  The six
+# match keys are returned too, so each row is mapped back to the exact search
+# name(s) it matched (same six forms as _SQL_TEMPLATE).
+_SQL_KEY_EXPRS = (
+    "UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || '/' || COALESCE(CAST(ot_nekuda AS TEXT), '')))",
+    "UPPER(TRIM(CAST(mispar_nekuda AS TEXT) || COALESCE(CAST(ot_nekuda AS TEXT), '')))",
+    "UPPER(TRIM(COALESCE(CAST(ot_nekuda AS TEXT), '') || CAST(mispar_nekuda AS TEXT)))",
+    "UPPER(TRIM(name))",
+    "CASE WHEN mispar_nekuda_kfula IS NULL THEN NULL ELSE UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || '/' || COALESCE(CAST(ot_nekuda_kfula AS TEXT), ''))) END",
+    "CASE WHEN mispar_nekuda_kfula IS NULL THEN NULL ELSE UPPER(TRIM(CAST(mispar_nekuda_kfula AS TEXT) || COALESCE(CAST(ot_nekuda_kfula AS TEXT), ''))) END",
+)
+_SQL_BATCH_NAMES = (
+    "SELECT * FROM (SELECT {cols}, "
+    + ", ".join(f"{e} AS k{i}" for i, e in enumerate(_SQL_KEY_EXPRS))
+    + " FROM {table}) q WHERE "
+    + " OR ".join(f"k{i} = ANY(%s)" for i in range(len(_SQL_KEY_EXPRS)))
+)
+
+# Spatial twins of many locations in one query (row index i -> its twins).
+_SQL_TWINS_BATCH = """
+SELECT q.i, {cols}
+FROM unnest(%s::float8[], %s::float8[]) WITH ORDINALITY AS q(qx, qy, i)
+JOIN {table} t
+  ON t.geom_full IS NOT NULL
+ AND ST_DWithin(t.geom_full, ST_SetSRID(ST_MakePoint(q.qx, q.qy), 2039), %s)
+"""
+
 # Batch query — fetches ITM 2005 coordinates for ALL DAT point names in one
 # round-trip. Uses ST_X/ST_Y(geom_full) so coordinates are always EPSG:2039
 # metres regardless of the raw x/y column values in the table.
@@ -258,6 +285,9 @@ _SEED_LAYER_NAME = "נקודות בקרה"
 # ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------
+
+_NON_ALNUM = re.compile(r"[^A-Z0-9]")
+
 
 class BenchmarkDBManager:
     """
@@ -290,6 +320,14 @@ class BenchmarkDBManager:
         self._anchor: Optional[Tuple[float, float]] = None
         # Cache of spatial-twin lookups keyed by record key
         self._twin_cache: Dict[str, List[BenchmarkRecord]] = {}
+        # Raw DB rows per search name (the registry does not change during a
+        # session) - every name is queried at most once.
+        self._query_cache: Dict[str, List[BenchmarkRecord]] = {}
+        # One reused connection (opening one costs a TCP + auth round trip)
+        self._conn = None
+        # Index of the control-points layer: (layer id, feature count) -> {norm name: (E, N)}
+        self._layer_index_key = None
+        self._layer_index = None   # (feats, inverted) of the control-points layer
 
     # ------------------------------------------------------------------ #
     # Configuration
@@ -326,6 +364,10 @@ class BenchmarkDBManager:
         self._global_pool_centroid = None
         self._anchor = None
         self._twin_cache.clear()
+        self._query_cache.clear()
+        self._layer_index_key = None
+        self._layer_index = None
+        self.close_connection()
         logger.debug("DB session cache cleared")
 
     # ------------------------------------------------------------------ #
@@ -343,7 +385,7 @@ class BenchmarkDBManager:
           '3349_MPI' → '3349MPI'
           '3349.MPI' → '3349MPI'
         """
-        return re.sub(r'[^A-Z0-9]', '', name.strip().upper())
+        return _NON_ALNUM.sub('', name.strip().upper())
 
     @staticmethod
     def _pick_name_fields(field_names: List[str]) -> List[str]:
@@ -360,6 +402,96 @@ class BenchmarkDBManager:
     # ------------------------------------------------------------------ #
     # Layer seeding — must be called before any resolve_benchmark() call
     # ------------------------------------------------------------------ #
+
+    def _index_seed_layer(self, layer, fields, split, split_k):
+        """Scan the control-points layer once.
+
+        Attributes only (no geometry): returns (feats, inverted, coords) where
+        feats[i] = (ordered [(norm, key)], feature id), inverted maps a
+        normalised name to feature indices, and coords caches the (E, N) of
+        features fetched later by id (None = no usable geometry)."""
+        feats, inverted = [], {}
+        norm = self._normalise_name
+        try:
+            from qgis.core import QgsFeatureRequest
+            req = QgsFeatureRequest()
+            wanted = list(fields)
+            if split:
+                wanted += ["mispar_nekuda", "ot_nekuda"]
+            if split_k:
+                wanted += ["mispar_nekuda_kfula", "ot_nekuda_kfula"]
+            try:
+                req.setSubsetOfAttributes(wanted, layer.fields())
+                req.setFlags(QgsFeatureRequest.NoGeometry)
+            except Exception:
+                pass
+            it = layer.getFeatures(req)
+        except Exception:
+            it = layer.getFeatures()
+
+        def _joined(feature, a, b):
+            try:
+                m_val, o_val = feature[a], feature[b]
+            except Exception:
+                return []
+            if m_val is None or o_val is None:
+                return []
+            m_str, o_str = str(m_val).strip(), str(o_val).strip()
+            # "m/o" and "o/m" normalise like "mo" / "om", which come first
+            # and therefore always win: two forms are enough.
+            return [m_str + o_str, o_str + m_str]
+
+        for feature in it:
+            forms = []
+            for field in fields:
+                try:
+                    raw_val = feature[field]
+                except Exception:
+                    continue
+                if raw_val is None:
+                    continue
+                forms.append((norm(str(raw_val)), str(raw_val).strip().upper()))
+            if split:
+                forms += [(norm(c), c.upper())
+                          for c in _joined(feature, "mispar_nekuda", "ot_nekuda")]
+            if split_k:
+                forms += [(norm(c), c.upper())
+                          for c in _joined(feature, "mispar_nekuda_kfula", "ot_nekuda_kfula")]
+            if not forms:
+                continue
+            fi = len(feats)
+            feats.append((forms, feature.id()))
+            for nn in {f[0] for f in forms}:
+                inverted.setdefault(nn, []).append(fi)
+        logger.info("seed_from_qgis_layer: indexed %d control points", len(feats))
+        return feats, inverted, {}
+
+    @staticmethod
+    def _seed_coords(layer, fids, cache) -> None:
+        """Fill *cache* {fid: (E, N) | None} for *fids* with one request."""
+        todo = [f for f in fids if f not in cache]
+        if not todo:
+            return
+        try:
+            from qgis.core import QgsFeatureRequest
+            it = layer.getFeatures(QgsFeatureRequest().setFilterFids(todo))
+        except Exception:
+            want = set(todo)
+            it = (f for f in layer.getFeatures() if f.id() in want)
+        for feature in it:
+            xy = None
+            try:
+                geom = feature.geometry()
+                if geom is not None and not geom.isEmpty():
+                    pt = geom.asPoint()
+                    xy = (pt.x(), pt.y())            # EPSG:2039 canvas E / N
+                    if xy == (0.0, 0.0):
+                        xy = None
+            except Exception:
+                xy = None
+            cache[feature.id()] = xy
+        for f in todo:
+            cache.setdefault(f, None)
 
     def seed_from_qgis_layer(self, point_names: List[str]) -> int:
         """
@@ -442,96 +574,37 @@ class BenchmarkDBManager:
                     "(mispar_nekuda + ot_nekuda) — will concatenate for matching"
                 )
 
-            already_seeded: set = set()  # avoid double-counting same feature
+            # One scan per layer state, then dictionary lookups: loading
+            # calls this up to three times and the layer holds every control
+            # point of the country.  Same matching order as before: per
+            # feature, single fields first, then the split-column forms.
+            index_key = (layer.id(), layer.featureCount(),
+                         tuple(candidate_fields_actual))
+            if self._layer_index_key != index_key or self._layer_index is None:
+                self._layer_index = self._index_seed_layer(
+                    layer, candidate_fields_actual,
+                    has_mispar and has_ot, has_mispar_k and has_ot_k)
+                self._layer_index_key = index_key
+            feats, inverted, coords = self._layer_index
 
-            for feature in layer.getFeatures():
-                feat_id = feature.id()
-                if feat_id in already_seeded:
+            hit_feats = set()
+            for nn in norm_names:
+                hit_feats.update(inverted.get(nn, ()))
+            hits = sorted(hit_feats)
+            self._seed_coords(layer, [feats[fi][1] for fi in hits], coords)
+            for fi in hits:
+                forms, fid = feats[fi]
+                xy = coords.get(fid)
+                if xy is None:
                     continue
-
-                matched_key = None
-
-                # --- Strategy A: single-field match (name, point_id, etc.) ---
-                for field in candidate_fields_actual:
-                    try:
-                        raw_val = feature[field]
-                    except Exception:
-                        continue
-                    if raw_val is None:
-                        continue
-                    norm_val = self._normalise_name(str(raw_val))
-                    if norm_val in norm_names:
-                        matched_key = str(raw_val).strip().upper()
-                        break
-
-                # --- Strategy B: split-column concatenation ---
-                # Handles DB layers where benchmark name is stored in two
-                # columns: mispar_nekuda (number) and ot_nekuda (letter code).
-                # Tries all four canonical join forms:
-                #   "3349MPI", "3349/MPI", "MPI3349", "MPI/3349"
-                if matched_key is None and has_mispar and has_ot:
-                    try:
-                        m_val = feature["mispar_nekuda"]
-                        o_val = feature["ot_nekuda"]
-                        if m_val is not None and o_val is not None:
-                            m_str = str(m_val).strip()
-                            o_str = str(o_val).strip()
-                            for candidate in (
-                                m_str + o_str,
-                                m_str + "/" + o_str,
-                                o_str + m_str,
-                                o_str + "/" + m_str,
-                            ):
-                                if self._normalise_name(candidate) in norm_names:
-                                    matched_key = candidate.upper()
-                                    break
-                    except Exception:
-                        pass
-
-                # --- Strategy C: _kfula split-column concatenation ---
-                if matched_key is None and has_mispar_k and has_ot_k:
-                    try:
-                        mk_val = feature["mispar_nekuda_kfula"]
-                        ok_val = feature["ot_nekuda_kfula"]
-                        if mk_val is not None and ok_val is not None:
-                            mk_str = str(mk_val).strip()
-                            ok_str = str(ok_val).strip()
-                            for candidate in (
-                                mk_str + ok_str,
-                                mk_str + "/" + ok_str,
-                                ok_str + mk_str,
-                                ok_str + "/" + mk_str,
-                            ):
-                                if self._normalise_name(candidate) in norm_names:
-                                    matched_key = candidate.upper()
-                                    break
-                    except Exception:
-                        pass
-
+                matched_key = next((key for norm, key in forms if norm in norm_names), None)
                 if matched_key is None:
                     continue
-
-                try:
-                    geom = feature.geometry()
-                    if geom is None or geom.isEmpty():
-                        continue
-
-                    pt = geom.asPoint()
-                    easting  = pt.x()   # QGIS canvas x = Easting in EPSG:2039
-                    northing = pt.y()   # QGIS canvas y = Northing in EPSG:2039
-
-                    if easting == 0.0 and northing == 0.0:
-                        continue
-
-                    self._resolved_coords[matched_key] = (easting, northing)
-                    already_seeded.add(feat_id)
-                    seeded += 1
-                    logger.debug("Seeded '%s' from layer: E=%.1f N=%.1f",
-                                 matched_key, easting, northing)
-
-                except Exception as feat_exc:
-                    logger.debug("seed_from_qgis_layer: skipping feature %d — %s",
-                                 feat_id, feat_exc)
+                easting, northing = xy
+                self._resolved_coords[matched_key] = (easting, northing)
+                seeded += 1
+                logger.debug("Seeded '%s' from layer: E=%.1f N=%.1f",
+                             matched_key, easting, northing)
 
         except Exception as exc:
             logger.warning("seed_from_qgis_layer failed with exception: %s", exc)
@@ -580,16 +653,8 @@ class BenchmarkDBManager:
         # All four %s in the batch query get the same list
         params = (norm_keys, norm_keys, norm_keys, norm_keys)
 
-        try:
-            conn = self._get_connection()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(sql, params)
-                    rows = cur.fetchall()
-            finally:
-                conn.close()
-        except Exception as exc:
-            logger.warning("Global pool batch query failed: %s", exc)
+        rows = self._fetch(sql, params, what="global pool")
+        if not rows:
             self._global_pool_centroid = (0.0, 0.0)
             return self._global_pool_centroid
 
@@ -618,6 +683,26 @@ class BenchmarkDBManager:
     # ------------------------------------------------------------------ #
     # Connection (password retrieved from QgsAuthManager — never stored)
     # ------------------------------------------------------------------ #
+
+    def close_connection(self) -> None:
+        conn, self._conn = getattr(self, "_conn", None), None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _shared_connection(self):
+        """The session's reused connection (opened on first use)."""
+        conn = getattr(self, "_conn", None)
+        if conn is None or getattr(conn, "closed", 1):
+            conn = self._get_connection()
+            try:
+                conn.autocommit = True      # read-only lookups: no open transaction
+            except Exception:
+                pass
+            self._conn = conn
+        return conn
 
     def _get_connection(self):
         """
@@ -791,10 +876,13 @@ class BenchmarkDBManager:
         logger.debug("Batch query: %d unique search names from %d input points",
                      len(all_unique), len(point_names))
 
+        self.prefetch(all_unique)                 # one table scan for all variants
         hits_by_search: Dict[str, List[BenchmarkRecord]] = {
             sn: self._query_candidates(sn) for sn in all_unique
         }
 
+        if include_twins:              # twins of every hit, one query for all
+            self.prefetch_twins([r for vs in hits_by_search.values() for r in vs])
         for pn in point_names:
             seen: set = set()
             matches: List[BenchmarkRecord] = []
@@ -817,6 +905,70 @@ class BenchmarkDBManager:
             result[pn] = matches
 
         return result
+
+    def search(self, query: str, limit: int = 60) -> List[BenchmarkRecord]:
+        """Free-text DB search for the Point Verification / Point Settings
+        dialogs: exact name forms first (ASCII / Hebrew variants), then any
+        point whose name (with or without '/') or locality contains *query*.
+        Returns at most *limit* records (duplicates removed)."""
+        q = (query or "").strip().upper()
+        if not q or not self.is_configured():
+            return []
+        out, seen = [], set()
+        for rec in self.get_candidates(q, include_twins=False):
+            if rec.key() not in seen:
+                seen.add(rec.key())
+                out.append(rec)
+        table = self._params.get("table", "")
+        if table and len(out) < limit:
+            pat = "%" + q.replace("%", "").replace("_", "") + "%"
+            pat_noslash = "%" + q.replace("/", "").replace(" ", "")\
+                .replace("%", "").replace("_", "") + "%"
+            sql = (f"SELECT {_SQL_COLUMNS} FROM {table} WHERE "
+                   f"{_SQL_KEY_EXPRS[0]} LIKE %s OR {_SQL_KEY_EXPRS[1]} LIKE %s "
+                   f"OR {_SQL_KEY_EXPRS[2]} LIKE %s OR {_SQL_KEY_EXPRS[3]} LIKE %s "
+                   f"OR UPPER(COALESCE(kfar_aher_name, '')) LIKE %s "
+                   # rank: name starts with the query, then contains it, then
+                   # locality-only hits; shorter names first ("117/A" < "1117/A")
+                   f"ORDER BY CASE WHEN {_SQL_KEY_EXPRS[0]} LIKE %s "
+                   f"OR {_SQL_KEY_EXPRS[1]} LIKE %s THEN 0 "
+                   f"WHEN {_SQL_KEY_EXPRS[0]} LIKE %s OR {_SQL_KEY_EXPRS[1]} LIKE %s "
+                   f"THEN 1 ELSE 2 END, length(name), name LIMIT %s")
+            pre, pre_ns = pat[1:], pat_noslash[1:]
+            rows = self._fetch(sql, (pat, pat_noslash, pat_noslash, pat, pat,
+                                     pre, pre_ns, pat, pat_noslash, int(limit)),
+                               what=f"search '{q}'")
+            for rec in self._rows_to_records(rows):
+                if rec.key() not in seen and len(out) < limit:
+                    seen.add(rec.key())
+                    out.append(rec)
+        return out
+
+    def prefetch_twins(self, records, tol_m: float = TWIN_TOLERANCE_M) -> None:
+        """Spatial twins of many records in one query (fills _twin_cache)."""
+        todo, seen = [], set()
+        for r in records:
+            if r.x is None or r.y is None:
+                continue
+            ck = f"{r.key()}\x00{tol_m}"
+            if ck in self._twin_cache or ck in seen:
+                continue
+            seen.add(ck)
+            todo.append((ck, r))
+        table = self._params.get("table", "")
+        if not todo or not table:
+            return
+        sql = _SQL_TWINS_BATCH.format(cols=_SQL_COLUMNS, table=table)
+        rows = self._fetch(sql, ([float(r.x) for _, r in todo], [float(r.y) for _, r in todo],
+                                 float(tol_m)), what=f"twins of {len(todo)} points")
+        if not rows and self._conn is None:
+            return                       # query failed: leave for per-record lookup
+        by_i: Dict[int, List[BenchmarkRecord]] = {i: [] for i in range(1, len(todo) + 1)}
+        for row in rows:
+            by_i.setdefault(int(row[0]), []).extend(self._rows_to_records([row[1:]]))
+        for i, (ck, r) in enumerate(todo, 1):
+            own = r.key()
+            self._twin_cache[ck] = [t for t in by_i.get(i, []) if t.key() != own]
 
     def get_spatial_twins(self, rec: BenchmarkRecord,
                           tol_m: float = TWIN_TOLERANCE_M) -> List[BenchmarkRecord]:
@@ -1301,18 +1453,22 @@ class BenchmarkDBManager:
     # ------------------------------------------------------------------ #
 
     def _fetch(self, sql: str, params: tuple, what: str = "") -> list:
-        """Run *sql* and return all rows; [] on any error (logged)."""
-        try:
-            conn = self._get_connection()
+        """Run *sql* on the shared connection and return all rows; [] on any
+        error (logged).  A dropped connection is reopened once."""
+        for attempt in (1, 2):
             try:
+                conn = self._shared_connection()
                 with conn.cursor() as cur:
                     cur.execute(sql, params)
                     return cur.fetchall()
-            finally:
-                conn.close()
-        except Exception as exc:
-            logger.warning("DB query failed for %s: %s", what, exc)
-            return []
+            except Exception as exc:
+                broken = getattr(getattr(self, "_conn", None), "closed", 1)
+                self.close_connection()
+                if attempt == 1 and broken:
+                    continue            # server closed an idle connection: retry
+                logger.warning("DB query failed for %s: %s", what, exc)
+                return []
+        return []
 
     @staticmethod
     def _rows_to_records(rows: list) -> List[BenchmarkRecord]:
@@ -1343,13 +1499,35 @@ class BenchmarkDBManager:
         return results
 
     def _query_candidates(self, point_name: str) -> List[BenchmarkRecord]:
-        """Execute the multi-format SQL and return a list of BenchmarkRecord."""
+        """DB records matching *point_name* in any of the six name forms
+        (cached for the session; uncached names go through prefetch)."""
+        key = (point_name or "").strip().upper()
+        if key not in self._query_cache:
+            self.prefetch([key])
+        return [copy.copy(r) for r in self._query_cache.get(key, [])]
+
+    def prefetch(self, point_names, chunk: int = 500) -> None:
+        """Look up every not-yet-cached name in ONE table scan per *chunk*
+        names (instead of one query - and one connection - per name)."""
         table = self._params.get("table", "")
-        if not table:
-            return []
-        sql = _SQL_TEMPLATE.format(cols=_SQL_COLUMNS, table=table)
-        rows = self._fetch(sql, (point_name,) * 6, what=f"'{point_name}'")
-        return self._rows_to_records(rows)
+        keys = sorted({(n or "").strip().upper() for n in point_names
+                       if n and (n or "").strip()} - set(self._query_cache))
+        if not table or not keys:
+            return
+        ncols = len(_SQL_COLUMNS.strip().split(","))
+        sql = _SQL_BATCH_NAMES.format(cols=_SQL_COLUMNS, table=table)
+        for start in range(0, len(keys), chunk):
+            part = keys[start:start + chunk]
+            want = set(part)
+            rows = self._fetch(sql, (part,) * len(_SQL_KEY_EXPRS),
+                               what=f"{len(part)} names")
+            found: Dict[str, List[BenchmarkRecord]] = {k: [] for k in part}
+            for row in rows:
+                rec = self._rows_to_records([row[:ncols]])[0]
+                for k in {v for v in row[ncols:] if v in want}:
+                    found[k].append(rec)
+            self._query_cache.update(found)
+        logger.debug("prefetch: %d name(s) looked up", len(keys))
 
     def _resolve_by_proximity(self, candidates: List[BenchmarkRecord],
                                key: str) -> Optional[BenchmarkRecord]:

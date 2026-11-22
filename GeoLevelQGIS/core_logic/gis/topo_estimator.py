@@ -78,6 +78,49 @@ def _dijkstra(g, source: str, stop_at: set) -> Dict[str, float]:
     return dist
 
 
+def _nearest_anchors(g, anchors: set, known: Dict[str, XY]) -> Dict[str, List[Tuple[float, str]]]:
+    """For every non-anchor node: its nearest anchor and the nearest anchor at
+    a different position, by measured path length, paths not passing through
+    other anchors.
+
+    One multi-source Dijkstra over (distance, anchor, node) labels instead of
+    one full search per anchor: a node accepts labels until it holds two
+    anchors at distinct positions and only accepted labels are expanded, so
+    the work is O(2 * E log V) whatever the number of anchors.  Same answer
+    as ranking all per-anchor searches (ties broken by anchor name)."""
+    accepted: Dict[str, List[Tuple[float, str]]] = defaultdict(list)
+    heap = [(0.0, a, a) for a in sorted(anchors)]
+    heapq.heapify(heap)
+    best: Dict[Tuple[str, str], float] = {(a, a): 0.0 for a in anchors}
+    while heap:
+        d0, a, n = heapq.heappop(heap)
+        if d0 > best.get((n, a), math.inf):
+            continue
+        if n != a:
+            if n in anchors:
+                continue                    # never pass through another anchor
+            acc = accepted[n]
+            if any(x == a for _, x in acc) or _full(acc, known):
+                continue
+            acc.append((d0, a))
+        for nb, w in g.get(n, {}).items():
+            nd = d0 + w
+            if nb == a:
+                continue
+            if nd < best.get((nb, a), math.inf):
+                best[(nb, a)] = nd
+                heapq.heappush(heap, (nd, a, nb))
+    return accepted
+
+
+def _full(acc, known) -> bool:
+    """Two anchors at distinct positions already accepted."""
+    if len(acc) < 2:
+        return False
+    p0 = known[acc[0][1]]
+    return any(math.dist(known[x], p0) > 1e-6 for _, x in acc[1:])
+
+
 def estimate_positions(lines: Iterable, known: Dict[str, XY]) -> Dict[str, XY]:
     """Return {point_id: (E, N)} for the points of *lines* not in *known*."""
     lines = list(lines)
@@ -86,12 +129,7 @@ def estimate_positions(lines: Iterable, known: Dict[str, XY]) -> Dict[str, XY]:
     unknown = [p for p in g if p not in known]
     if not unknown:
         return {}
-    reach: Dict[str, List[Tuple[float, str]]] = defaultdict(list)
-    for a in anchors:
-        for p, d in _dijkstra(g, a, anchors).items():
-            if p in known:
-                continue
-            reach[p].append((d, a))
+    reach = _nearest_anchors(g, anchors, known)
 
     out: Dict[str, XY] = {}
     fan: Dict[str, int] = defaultdict(int)

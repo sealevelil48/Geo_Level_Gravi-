@@ -75,7 +75,8 @@ class GeoLevelPointResolutionDialog(QDialog):
             confirm only some anchors and let distance matching do the rest.
         round_no: matching round shown in the title (load mode).
         search_fn: Callable(pid, query) -> list of scored BenchmarkRecord used
-            by the per-row "Search DB" box (edit mode).
+            by the per-row "Search DB" box (both modes; partial names and
+            localities are matched, results fill the candidate dropdown).
     """
 
     def __init__(
@@ -107,7 +108,7 @@ class GeoLevelPointResolutionDialog(QDialog):
         self._combos: Dict[str, QComboBox] = {}          # field ID -> DB candidate dropdown
         self._edits: Dict[str, QLineEdit] = {}            # field ID -> manual name override
         self._handling: Dict[str, QComboBox] = {}         # field ID -> handling mode dropdown
-        self._searches: Dict[str, QLineEdit] = {}         # field ID -> search box (edit)
+        self._searches: Dict[str, QLineEdit] = {}         # field ID -> search box
         self._forced: Dict[str, bool] = {}                # field ID -> twin choice required
 
         if self._mode == "edit":
@@ -145,8 +146,10 @@ class GeoLevelPointResolutionDialog(QDialog):
             text = (
                 "<b>Some field point IDs were not found, have multiple matches, "
                 "or coincide with another DB point.</b><br>"
-                "Select the correct benchmark from the dropdown (coordinates shown) or "
-                "type the exact database name in the override column.<br>"
+                "Select the correct benchmark from the dropdown (coordinates shown). "
+                "Not in the list? Type part of the name (or a locality) in "
+                "<i>Search DB</i> and press Enter / 🔍 — the matching DB points "
+                "are added to the dropdown with coordinates, class and locality.<br>"
                 "<span style='background:#fff3cd'>&nbsp;Amber rows&nbsp;</span> hold "
                 "twin points (same location, different name / height) — you must "
                 "choose one explicitly.<br>"
@@ -165,7 +168,7 @@ class GeoLevelPointResolutionDialog(QDialog):
                          "DB Candidate  (Name | E | N | Height | Class | Locality | Distance)"]
         if self._notes:
             self._columns.append("Reason")
-        if self._mode == "edit":
+        if self._search_fn is not None:
             self._columns.append("Search DB")
         self._columns += ["Manual Name Override", "Handling Option"]
 
@@ -219,11 +222,22 @@ class GeoLevelPointResolutionDialog(QDialog):
                     note.setForeground(QBrush(QColor("#c62828")))
                 self._table.setItem(row, self._col("Reason"), note)
 
-            if self._mode == "edit":
+            if self._search_fn is not None:
+                cell = QWidget()
+                lay = QHBoxLayout(cell)
+                lay.setContentsMargins(0, 0, 0, 0)
+                lay.setSpacing(2)
                 search = QLineEdit()
-                search.setPlaceholderText("name + Enter…")
+                search.setPlaceholderText("name / part / locality…")
+                search.setText(pid)
                 search.returnPressed.connect(lambda p=pid: self._on_search(p))
-                self._table.setCellWidget(row, self._col("Search DB"), search)
+                btn = QPushButton("🔍")
+                btn.setFixedWidth(28)
+                btn.setToolTip("Search the benchmark database")
+                btn.clicked.connect(lambda _=False, p=pid: self._on_search(p))
+                lay.addWidget(search)
+                lay.addWidget(btn)
+                self._table.setCellWidget(row, self._col("Search DB"), cell)
                 self._searches[pid] = search
 
             edit = QLineEdit()
@@ -390,6 +404,12 @@ class GeoLevelPointResolutionDialog(QDialog):
         if not hits:
             QMessageBox.information(self, "Search DB", f"No DB point found for '{query}'.")
             return
+        # A chosen DB point means "use it" (a not-in-DB row defaulted to Estimate)
+        hc = self._handling.get(pid)
+        if hc is not None:
+            i = hc.findData("use_selected")
+            if i >= 0:
+                hc.setCurrentIndex(i)
         # Merge: new hits first, keep previously listed candidates after them
         merged = list(hits)
         for r in self._candidate_map.get(pid, []):

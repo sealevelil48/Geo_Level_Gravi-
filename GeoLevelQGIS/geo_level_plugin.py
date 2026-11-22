@@ -448,11 +448,15 @@ class GeoLevelPlugin:
 
         try:
             from core_logic.process import process_geodetic_data
+            # First pass: parse only.  Its sole consumer is Point
+            # Verification below; validation, DB coordinates, GeoJSON and REZ
+            # are produced once, by the second pass, with verified names.
             result = process_geodetic_data(
                 file_paths=new_paths,
                 leveling_class=leveling_class,
                 output_dir=output_dir,
                 name_overrides=load_remap or None,
+                parse_only=True,
             )
         except Exception as exc:
             progress.close()
@@ -466,6 +470,7 @@ class GeoLevelPlugin:
 
         # Append new lines to existing list
         new_lines = result["lines"]
+        parsed = result.get("parsed")
         self._rename_points_in_lines(new_lines, load_remap, setups_only=True)
         n_prev = len(self._lines)
         self._lines.extend(new_lines)
@@ -480,11 +485,9 @@ class GeoLevelPlugin:
             self._pending_pid_remap = {}
             return
 
-        # Re-run the full geodetic pipeline now that db_mgr._cache contains the
-        # verified/resolved coordinates for every point.  The first run above
-        # had an empty cache, so its GeoJSON used estimated/missing positions.
-        # This second run picks up the confirmed DB coordinates and regenerates
-        # both lines_geojson and points_geojson with the correct geometry.
+        # Run the full geodetic pipeline now that db_mgr._cache contains the
+        # verified/resolved coordinates for every point.  The parsed lines of
+        # the first pass are reused (deep copy) - the files are not read again.
         self._lines = self._lines[:n_prev]   # remove the pre-resolution lines
         # Pass verified name overrides so process_geodetic_data applies them
         # before validation and GeoJSON export — fixes INVALID_ENDPOINT errors
@@ -496,14 +499,16 @@ class GeoLevelPlugin:
                 leveling_class=leveling_class,
                 output_dir=output_dir,
                 name_overrides=pid_remap or None,
+                preparsed=parsed,
             )
         except Exception as exc:
             QgsMessageLog.logMessage(
                 "Re-run after point resolution failed: " + traceback.format_exc(),
                 "GeoLevelPlugin", level=Qgis.Warning,
             )
-            # Fall back to the pre-resolution result rather than leaving the
-            # user with nothing.
+            # Fall back to the parse-only result (lines without GeoJSON: the
+            # line layer is then built from resolved coordinates) rather than
+            # leaving the user with nothing.
         finally:
             self._pending_pid_remap = {}   # consume — one-shot per load
 
@@ -2141,6 +2146,8 @@ class GeoLevelPlugin:
                     open_pids, scored, parent=self.iface.mainWindow(), mode="load",
                     notes=notes, statuses={p: net.status.get(p, "") for p in open_pids},
                     allow_defer=allow_defer, round_no=round_no,
+                    search_fn=lambda p, q, _b=batch, _k=net.known: db_mgr.score_candidates(
+                        p, db_mgr.search(q), new_lines, _b, known=_k),
                 )
                 if not dlg.exec_():
                     return False
@@ -2256,7 +2263,7 @@ class GeoLevelPlugin:
             current_modes[p] = m if m in ("estimate", "pkt_average", "exclude") else "use_selected"
 
         def _search(pid, query):
-            recs = db_mgr.get_candidates(query)
+            recs = db_mgr.search(query)
             return db_mgr.score_candidates(pid, recs, self._lines)
 
         from geo_level_point_resolution_dialog import GeoLevelPointResolutionDialog

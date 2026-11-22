@@ -54,12 +54,23 @@ class FakeDB(BenchmarkDBManager):
         self.queries = 0
 
     def _fetch(self, sql, params, what=""):
+        """Emulates the batched SQL: name lookups return the row plus its six
+        match keys; twin lookups take arrays and return (index, row)."""
         self.queries += 1
+        if "unnest" in sql:
+            xs, ys, tol = params
+            return [(i,) + tuple(r) for i, (x, y) in enumerate(zip(xs, ys), 1)
+                    for r in ROWS if math.hypot(r[8] - x, r[9] - y) <= tol]
         if "ST_DWithin" in sql:
             x, y, tol = params
             return [r for r in ROWS if math.hypot(r[8] - x, r[9] - y) <= tol]
-        q = params[0].strip().upper()
-        return [r for r in ROWS if q in _forms(r)]
+        want = {q.strip().upper() for q in params[0]}
+        out = []
+        for r in ROWS:
+            keys = sorted(set(_forms(r)) & want)
+            if keys:
+                out.append(tuple(r) + tuple((keys + [None] * 6)[:6]))
+        return out
 
 
 def line(s, e, dist):

@@ -90,6 +90,9 @@ def _build_coord_manager(lines, db_manager):
     itm_coords = {}   # pid -> (E, N, height, is_estimated)
     unknown_ids = []
 
+    # One batched DB lookup for every name not resolved yet this session
+    if hasattr(db_manager, "prefetch"):
+        db_manager.prefetch(sorted(unique_ids))
     for pid in unique_ids:
         record = db_manager.resolve_benchmark(pid)
         if record is not None and record.x is not None and record.y is not None:
@@ -174,6 +177,8 @@ def process_geodetic_data(
     leveling_class: str,
     output_dir: str,
     name_overrides: dict = None,
+    parse_only: bool = False,
+    preparsed: Dict = None,
 ) -> Dict:
     """
     Parse, validate and export a list of measurement files.
@@ -192,7 +197,17 @@ def process_geodetic_data(
         point_style   : str   – path to the points QML style
         summary       : dict  – {total, valid, invalid, warnings}
         lines         : list  – parsed LevelingLine objects
+        parsed        : dict  – raw parse {lines, file_benchmarks, parse_errors}
+                                (deep copy, before *name_overrides*); pass it
+                                back as *preparsed* to skip re-reading files
+
+    parse_only : stop after parsing (+ name overrides): no validation, DB
+                 coordinate resolution, GeoJSON or REZ.  Used by the plugin's
+                 first pass, whose only job is feeding Point Verification.
+    preparsed  : reuse an earlier ``result["parsed"]`` instead of reading
+                 *file_paths* again (deep-copied, the cache stays pristine).
     """
+    import copy
     # ------------------------------------------------------------------ #
     # 1. Parse files
     # ------------------------------------------------------------------ #
@@ -205,6 +220,11 @@ def process_geodetic_data(
     parse_errors = []
 
     file_benchmarks = {}   # known heights carried by .FA0 / .FA1 files
+    if preparsed is not None:
+        lines = copy.deepcopy(preparsed["lines"])
+        file_benchmarks = dict(preparsed.get("file_benchmarks") or {})
+        parse_errors = list(preparsed.get("parse_errors") or [])
+        file_paths = []
     for fp in file_paths:
         try:
             parser = create_parser(fp)
@@ -232,6 +252,9 @@ def process_geodetic_data(
             "No files could be parsed.\n" + "\n".join(parse_errors)
         )
 
+    snapshot = {"lines": copy.deepcopy(lines), "file_benchmarks": dict(file_benchmarks),
+              "parse_errors": list(parse_errors)} if parse_only else None
+
     # Apply verified DB name overrides (e.g. ASCII → Hebrew) before any
     # validation, coordinate resolution, or GeoJSON export runs.
     if name_overrides:
@@ -240,6 +263,19 @@ def process_geodetic_data(
                 ln.start_point = name_overrides[ln.start_point]
             if ln.end_point in name_overrides:
                 ln.end_point = name_overrides[ln.end_point]
+
+    renamed_benchmarks = {(name_overrides or {}).get(k, k): v
+                          for k, v in file_benchmarks.items()}
+    if parse_only:
+        return {
+            "lines_geojson": "", "points_geojson": "", "line_style": "",
+            "point_style": "", "rez_path": None,
+            "file_benchmarks": renamed_benchmarks,
+            "summary": {"total": len(lines), "valid": 0, "invalid": 0,
+                        "warnings": 0, "parse_errors": parse_errors},
+            "lines": lines,
+            "parsed": snapshot,
+        }
 
     # ------------------------------------------------------------------ #
     # 2. Apply selected class to validator
@@ -303,8 +339,7 @@ def process_geodetic_data(
         "point_style":    output_files["point_style"],
         "rez_path":       rez_path,
         # Known heights read from .FA0 / .FA1 files (renamed like the lines)
-        "file_benchmarks": {(name_overrides or {}).get(k, k): v
-                            for k, v in file_benchmarks.items()},
+        "file_benchmarks": renamed_benchmarks,
         "summary": {
             "total":    len(lines),
             "valid":    valid_count,
@@ -313,4 +348,5 @@ def process_geodetic_data(
             "parse_errors": parse_errors,
         },
         "lines": lines,
+        "parsed": snapshot,
     }
