@@ -915,28 +915,48 @@ class BenchmarkDBManager:
         if not q or not self.is_configured():
             return []
         out, seen = [], set()
+        digits = re.sub(r"\s", "", q)       # "1/17" is NOT number-only
         for rec in self.get_candidates(q, include_twins=False):
+            # number-only query: "1" + "17" glued also reads "117" - skip it
+            if digits.isdigit() and str(rec.mispar_nekuda or "").strip() != digits:
+                continue
             if rec.key() not in seen:
                 seen.add(rec.key())
                 out.append(rec)
         table = self._params.get("table", "")
         if table and len(out) < limit:
-            pat = "%" + q.replace("%", "").replace("_", "") + "%"
-            pat_noslash = "%" + q.replace("/", "").replace(" ", "")\
-                .replace("%", "").replace("_", "") + "%"
-            sql = (f"SELECT {_SQL_COLUMNS} FROM {table} WHERE "
-                   f"{_SQL_KEY_EXPRS[0]} LIKE %s OR {_SQL_KEY_EXPRS[1]} LIKE %s "
-                   f"OR {_SQL_KEY_EXPRS[2]} LIKE %s OR {_SQL_KEY_EXPRS[3]} LIKE %s "
-                   f"OR UPPER(COALESCE(kfar_aher_name, '')) LIKE %s "
-                   # rank: name starts with the query, then contains it, then
-                   # locality-only hits; shorter names first ("117/A" < "1117/A")
-                   f"ORDER BY CASE WHEN {_SQL_KEY_EXPRS[0]} LIKE %s "
-                   f"OR {_SQL_KEY_EXPRS[1]} LIKE %s THEN 0 "
-                   f"WHEN {_SQL_KEY_EXPRS[0]} LIKE %s OR {_SQL_KEY_EXPRS[1]} LIKE %s "
-                   f"THEN 1 ELSE 2 END, length(name), name LIMIT %s")
-            pre, pre_ns = pat[1:], pat_noslash[1:]
-            rows = self._fetch(sql, (pat, pat_noslash, pat_noslash, pat, pat,
-                                     pre, pre_ns, pat, pat_noslash, int(limit)),
+            clean = q.replace("%", "").replace("_", "")
+            compact = re.sub(r"[\s/\-.]", "", clean)
+            k_slash, k_flat, k_rev, k_name = _SQL_KEY_EXPRS[:4]
+            num = "UPPER(TRIM(CAST(mispar_nekuda AS TEXT)))"
+            # A number-only query ("117") is a point NUMBER: match the number
+            # column (117 -> 117/A, 1117/B), never the glued "number+letters"
+            # form, where "1/17" would also read "117".  Queries with letters
+            # ("117MSA", "117/MSA", "MSA117") also match the glued forms.
+            conds, params = [f"{k_slash} LIKE %s", f"{k_name} LIKE %s",
+                             f"UPPER(COALESCE(kfar_aher_name, '')) LIKE %s"], \
+                            [f"%{clean}%", f"%{clean}%", f"%{clean}%"]
+            if re.sub(r"\s", "", clean).isdigit():
+                conds.append(f"{num} LIKE %s")
+                params.append(f"%{compact}%")
+                rank = (f"CASE WHEN {num} = %s THEN 0 WHEN {num} LIKE %s THEN 1 "
+                        f"WHEN {num} LIKE %s THEN 2 ELSE 3 END")
+                rparams = [compact, f"{compact}%", f"%{compact}%"]
+            else:
+                conds += [f"{k_flat} LIKE %s", f"{k_rev} LIKE %s"]
+                params += [f"%{compact}%", f"%{compact}%"]
+                rank = (f"CASE WHEN {k_flat} = %s OR {k_rev} = %s OR {k_slash} = %s THEN 0 "
+                        f"WHEN {k_flat} LIKE %s OR {k_slash} LIKE %s OR {k_rev} LIKE %s THEN 1 "
+                        f"WHEN {k_flat} LIKE %s OR {k_slash} LIKE %s OR {k_rev} LIKE %s THEN 2 "
+                        f"ELSE 3 END")
+                rparams = [compact, compact, clean,
+                           f"{compact}%", f"{clean}%", f"{compact}%",
+                           f"%{compact}%", f"%{clean}%", f"%{compact}%"]
+            # exact number first, then starts-with, contains, locality-only;
+            # shorter names first ("117/A" before "1117/A")
+            sql = (f"SELECT {_SQL_COLUMNS} FROM {table} WHERE {' OR '.join(conds)} "
+                   f"ORDER BY {rank}, length(name), name LIMIT %s")
+            rows = self._fetch(sql, tuple(params + rparams + [int(limit)]),
                                what=f"search '{q}'")
             for rec in self._rows_to_records(rows):
                 if rec.key() not in seen and len(out) < limit:
@@ -1680,48 +1700,15 @@ class BenchmarkDBManager:
         # Step 2: outlier rejection via spatial median filter
         core = self._spatial_median_filter(coords)
 
-        try:
-            import numpy as np
-            from scipy.cluster.vq import whiten, kmeans
-
-            arr = np.array(core, dtype=float)
-
-            # Guard: degenerate axis (all values identical) → whiten divides by 0
-            std = arr.std(axis=0)
-            if std[0] == 0.0 or std[1] == 0.0:
-                cx = float(arr[:, 0].mean())
-                cy = float(arr[:, 1].mean())
-                logger.info(
-                    "k=1 centroid (degenerate axis, plain mean, %d core points): "
-                    "E=%.1f  N=%.1f",
-                    len(core), cx, cy,
-                )
-                return cx, cy
-
-            # Step 3: whiten → kmeans k=1 → de-whiten
-            whitened = whiten(arr)          # divides each column by its std
-            centroid_w, distortion = kmeans(whitened, 1)
-
-            cx = float(centroid_w[0][0] * std[0])
-            cy = float(centroid_w[0][1] * std[1])
-
-            logger.info(
-                "k=1 centroid (Spatial Median + K-Means k=1, "
-                "%d core / %d total candidates, distortion=%.2f): "
-                "E=%.1f  N=%.1f",
-                len(core), len(coords), float(distortion), cx, cy,
-            )
-            return cx, cy
-
-        except Exception as exc:
-            logger.warning(
-                "scipy kmeans k=1 failed (%s) — falling back to plain mean "
-                "of %d core points",
-                exc, len(core),
-            )
-            cx = sum(c[0] for c in core) / len(core)
-            cy = sum(c[1] for c in core) / len(core)
-            return cx, cy
+        # Step 3: k-means with ONE cluster converges to the arithmetic mean
+        # (whitening is undone by the de-whitening), so the mean is computed
+        # directly - same result, without importing scipy (~0.3 s on first
+        # use inside QGIS).
+        cx = sum(c[0] for c in core) / len(core)
+        cy = sum(c[1] for c in core) / len(core)
+        logger.info("k=1 centroid (Spatial Median + mean, %d core / %d total "
+                    "candidates): E=%.1f  N=%.1f", len(core), len(coords), cx, cy)
+        return cx, cy
 
 
 # ---------------------------------------------------------------------------

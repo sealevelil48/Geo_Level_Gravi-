@@ -213,6 +213,47 @@ def _apply_point_renderer(layer):
         )
 
 
+def _line_status_str(ln) -> str:
+    """Status written to the line layer: EXCLUDED for unused lines, otherwise
+    the upper-case validation status (the renderer rules match on it)."""
+    if not getattr(ln, "is_used", True):
+        return "EXCLUDED"
+    st = getattr(ln, "status", "")
+    return (st.value if hasattr(st, "value") else str(st)).upper()
+
+
+class _frozen_canvas:
+    """Context manager: freeze the map canvas, refresh once on exit."""
+
+    def __init__(self, iface):
+        try:
+            self._canvas = iface.mapCanvas()
+        except Exception:
+            self._canvas = None
+        self._was = False
+
+    def __enter__(self):
+        c = self._canvas
+        if c is not None:
+            try:
+                self._was = bool(c.isFrozen())
+                c.freeze(True)
+            except Exception:
+                self._canvas = None
+        return self
+
+    def __exit__(self, *exc):
+        c = self._canvas
+        if c is not None:
+            try:
+                c.freeze(self._was)
+                if not self._was:
+                    c.refresh()
+            except Exception:
+                pass
+        return False
+
+
 class GeoLevelPlugin:
     """QGIS Plugin — Geo Level Gravi (פילוס גיאודטי)."""
 
@@ -554,14 +595,20 @@ class GeoLevelPlugin:
         except Exception:
             self._val_results = result.get("val_results", [])
 
-        self._load_line_layer(result["lines_geojson"], result["line_style"], new_lines)
-        self._load_point_layer(result.get("points_geojson", ""), result.get("point_style", ""))
-        # Push validated statuses from memory into the layer attribute table so
-        # the rule-based renderer has fresh, accurate values on first paint.
-        self._sync_map_statuses()
-        # Persist layers + line data to the project GeoPackage and swap the
-        # volatile memory/GeoJSON layers for the GPKG-backed ones.
-        self._persist_to_gpkg()
+        # The layers are added, re-styled, snapshotted, removed and re-added
+        # from the GeoPackage below.  Freeze the canvas so QGIS renders (with
+        # labels) once at the end instead of after every step.
+        with _frozen_canvas(self.iface):
+            self._load_line_layer(result["lines_geojson"], result["line_style"], new_lines)
+            self._load_point_layer(result.get("points_geojson", ""),
+                                   result.get("point_style", ""))
+            # Push validated statuses into the layer attribute table so the
+            # rule-based renderer has accurate values on first paint (the
+            # builder already writes them - this only fixes leftovers).
+            self._sync_map_statuses()
+            # Persist layers + line data to the project GeoPackage and swap the
+            # volatile memory/GeoJSON layers for the GPKG-backed ones.
+            self._persist_to_gpkg()
         self._show_dock()
         self.dock.load_lines(self._lines, self._val_results)
 
@@ -616,9 +663,7 @@ class GeoLevelPlugin:
                         "filename":         ln.filename,
                         "total_distance":   getattr(ln, "total_distance", None),
                         "total_height_diff": getattr(ln, "total_height_diff", None),
-                        "status":           ln.status.value
-                                            if hasattr(ln.status, "value")
-                                            else str(ln.status),
+                        "status":           _line_status_str(ln),
                     }
                     for ln in lines
                     if ln.start_point and ln.end_point
@@ -1782,29 +1827,33 @@ class GeoLevelPlugin:
         # filename → uppercase status string for the ILIKE renderer rules.
         # Excluded lines (is_used=False) write "EXCLUDED" regardless of the
         # LineStatus enum value, which still holds the original validation result.
-        def _status_str(ln) -> str:
-            if not getattr(ln, "is_used", True):
-                return "EXCLUDED"
-            return (
-                ln.status.value.upper()
-                if hasattr(ln.status, "value")
-                else str(ln.status).upper()
-            )
-
         filename_map: dict = {
-            ln.filename: _status_str(ln)
+            ln.filename: _line_status_str(ln)
             for ln in self._lines
             if ln.filename
         }
         if not filename_map:
             return
 
+        # Only touch features whose status actually differs: no edit session
+        # (and no GPKG write / repaint) when the layer is already up to date.
+        try:
+            from qgis.core import QgsFeatureRequest
+            req = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry)
+            req.setSubsetOfAttributes([status_idx, filename_idx])
+            feats = layer.getFeatures(req)
+        except Exception:
+            feats = layer.getFeatures()
+        changes = {}
+        for feat in feats:
+            status_str = filename_map.get(str(feat[filename_idx]))
+            if status_str is not None and str(feat[status_idx] or "") != status_str:
+                changes[feat.id()] = status_str
+        if not changes:
+            return
         layer.startEditing()
-        for feat in layer.getFeatures():
-            fname = str(feat[filename_idx])
-            status_str = filename_map.get(fname)
-            if status_str is not None:
-                layer.changeAttributeValue(feat.id(), status_idx, status_str)
+        for fid, status_str in changes.items():
+            layer.changeAttributeValue(fid, status_idx, status_str)
         layer.commitChanges()
 
         # Rebuild the renderer so ILIKE rules re-evaluate against fresh values
@@ -2368,11 +2417,13 @@ class GeoLevelPlugin:
             QgsMessageLog.logMessage("Layer re-export failed: " + traceback.format_exc(),
                                      "GeoLevelPlugin", level=Qgis.Warning)
 
-        self._load_line_layer(files.get("lines_geojson", ""), files.get("line_style", ""),
-                              self._lines)
-        self._load_point_layer(files.get("points_geojson", ""), files.get("point_style", ""))
-        self._sync_map_statuses()
-        self._persist_to_gpkg()
+        with _frozen_canvas(self.iface):
+            self._load_line_layer(files.get("lines_geojson", ""),
+                                  files.get("line_style", ""), self._lines)
+            self._load_point_layer(files.get("points_geojson", ""),
+                                   files.get("point_style", ""))
+            self._sync_map_statuses()
+            self._persist_to_gpkg()
         if self._layer is not None and self._layer.isValid():
             self._layer.triggerRepaint()
         self.iface.mapCanvas().refresh()

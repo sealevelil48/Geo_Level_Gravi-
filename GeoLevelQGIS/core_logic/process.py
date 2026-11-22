@@ -205,9 +205,10 @@ def process_geodetic_data(
                  coordinate resolution, GeoJSON or REZ.  Used by the plugin's
                  first pass, whose only job is feeding Point Verification.
     preparsed  : reuse an earlier ``result["parsed"]`` instead of reading
-                 *file_paths* again (deep-copied, the cache stays pristine).
+                 *file_paths* again.  Its lines are taken over (not copied):
+                 pass each snapshot once.
     """
-    import copy
+    import pickle
     # ------------------------------------------------------------------ #
     # 1. Parse files
     # ------------------------------------------------------------------ #
@@ -221,7 +222,7 @@ def process_geodetic_data(
 
     file_benchmarks = {}   # known heights carried by .FA0 / .FA1 files
     if preparsed is not None:
-        lines = copy.deepcopy(preparsed["lines"])
+        lines = preparsed["lines"]
         file_benchmarks = dict(preparsed.get("file_benchmarks") or {})
         parse_errors = list(preparsed.get("parse_errors") or [])
         file_paths = []
@@ -252,8 +253,15 @@ def process_geodetic_data(
             "No files could be parsed.\n" + "\n".join(parse_errors)
         )
 
-    snapshot = {"lines": copy.deepcopy(lines), "file_benchmarks": dict(file_benchmarks),
-              "parse_errors": list(parse_errors)} if parse_only else None
+    snapshot = None
+    if parse_only:
+        try:      # pickle round-trip = deep copy, ~3x faster than copy.deepcopy
+            pristine = pickle.loads(pickle.dumps(lines, pickle.HIGHEST_PROTOCOL))
+        except Exception:
+            import copy
+            pristine = copy.deepcopy(lines)
+        snapshot = {"lines": pristine, "file_benchmarks": dict(file_benchmarks),
+                    "parse_errors": list(parse_errors)}
 
     # Apply verified DB name overrides (e.g. ASCII → Hebrew) before any
     # validation, coordinate resolution, or GeoJSON export runs.

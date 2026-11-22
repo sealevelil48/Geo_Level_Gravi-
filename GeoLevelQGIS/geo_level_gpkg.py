@@ -611,16 +611,21 @@ def merge_layers_to_memory(layers, geometry_kind, order_key=None, dedupe_field=N
     mem.dataProvider().addAttributes(fields.toList())
     mem.updateFields()
 
+    mem_fields = mem.fields()               # fields() returns a copy: take it once
+    index = {f.name(): i for i, f in enumerate(mem_fields)}
+    n_fields = mem_fields.count()
     out = []
     for attrs, g in collected:
         if has_z and not QgsWkbTypes.hasZ(g.wkbType()):
             g.get().addZValue(0.0)
-        f = QgsFeature(mem.fields())
+        f = QgsFeature(mem_fields)
         f.setGeometry(g)
+        values = [None] * n_fields
         for name, val in attrs.items():
-            idx = mem.fields().indexOf(name)
-            if idx >= 0:
-                f.setAttribute(idx, val)
+            idx = index.get(name)
+            if idx is not None:
+                values[idx] = val
+        f.setAttributes(values)
         out.append(f)
     mem.dataProvider().addFeatures(out)
     mem.updateExtents()
@@ -650,12 +655,18 @@ def write_vector_layer(layer, path, layer_name, overwrite_file):
 def write_project_gpkg(path, lines_layer, points_layer, lines, meta, val_results=None):
     """Write the full project GeoPackage at *path* (overwrites the file).
 
-    Writes to a sibling temp file first and then moves it into place, so a
-    failure never leaves a half-written project behind.  Raises
-    PermissionError when the target is locked (caller picks another name).
+    The GeoPackage is built in the local temp folder (SQLite does many small
+    page writes - very slow on network / synced folders), copied next to the
+    target in one sequential write and then moved into place, so a failure
+    never leaves a half-written project behind.  Raises PermissionError when
+    the target is locked (caller picks another name).
     """
+    import shutil
+    import tempfile
     base, ext = os.path.splitext(path)
     tmp = base + "~tmp" + (ext or ".gpkg")      # keep .gpkg for the GPKG driver
+    stage_dir = tempfile.mkdtemp(prefix="geolevel_")
+    stage = os.path.join(stage_dir, "project" + (ext or ".gpkg"))
 
     def _cleanup():
         for p in (tmp, tmp + "-wal", tmp + "-shm"):
@@ -669,15 +680,25 @@ def write_project_gpkg(path, lines_layer, points_layer, lines, meta, val_results
     try:
         first = True
         if lines_layer is not None:
-            write_vector_layer(lines_layer, tmp, LINES_LAYER, overwrite_file=True)
+            write_vector_layer(lines_layer, stage, LINES_LAYER, overwrite_file=True)
             first = False
         if points_layer is not None:
-            write_vector_layer(points_layer, tmp, POINTS_LAYER, overwrite_file=first)
-        write_attribute_tables(tmp, lines, meta, val_results)
+            write_vector_layer(points_layer, stage, POINTS_LAYER, overwrite_file=first)
+        write_attribute_tables(stage, lines, meta, val_results)
+        # Fold any WAL content into the main file before copying it alone
+        conn = sqlite3.connect(stage, timeout=10)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            conn.close()
+        shutil.copyfile(stage, tmp)
         os.replace(tmp, path)
     except BaseException:
         _cleanup()
         raise
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
     return path
 
 

@@ -58,6 +58,53 @@ def _row_needs_forced_choice(records: list) -> bool:
     return any(cluster_needs_choice(cl) for cl in group_twins(ok) if len(cl) > 1)
 
 
+class _BoundedCombo(QComboBox):
+    """Candidate dropdown whose popup stays a short, scrollable list inside
+    the dialog.
+
+    Several Qt styles (Fusion / Windows in QGIS) ignore maxVisibleItems and
+    open a popup as tall as the whole list, positioned so the current item
+    sits over the combo - with 60 search hits it covered the screen.  The
+    style sheet forces the plain list-view popup, which honours
+    maxVisibleItems, and showPopup() keeps it within the dialog."""
+
+    VISIBLE_ITEMS = 12
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMaxVisibleItems(self.VISIBLE_ITEMS)
+        self.setStyleSheet("QComboBox { combobox-popup: 0; }")
+        self.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(30)
+        self.view().setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.view().setTextElideMode(Qt.ElideRight)
+
+    def showPopup(self) -> None:
+        view = self.view()
+        # wide enough for the full "Name | E | N | Height | ..." label
+        fm = view.fontMetrics()
+        widest = max((fm.horizontalAdvance(self.itemText(i))
+                      if hasattr(fm, "horizontalAdvance") else fm.width(self.itemText(i))
+                      for i in range(self.count())), default=0)
+        view.setMinimumWidth(min(widest + 40, 1100))
+        super().showPopup()
+        popup = view.window()                 # the popup container frame
+        host = self.window()                  # the dialog
+        if popup is None or host is None or popup is host:
+            return
+        area = host.frameGeometry()
+        geo = popup.geometry()
+        # cap the height to the dialog, then keep the whole popup inside it
+        if geo.height() > area.height() - 20:
+            geo.setHeight(max(120, area.height() - 20))
+        if geo.width() > area.width() - 20:
+            geo.setWidth(max(200, area.width() - 20))
+        x = area.left() + (area.width() - geo.width()) // 2      # centred in dialog
+        y = min(max(geo.y(), area.top() + 10), area.bottom() - 10 - geo.height())
+        geo.moveTo(x, y)
+        popup.setGeometry(geo)
+
+
 class GeoLevelPointResolutionDialog(QDialog):
     """Verify / re-select DB benchmarks for field point IDs.
 
@@ -208,7 +255,7 @@ class GeoLevelPointResolutionDialog(QDialog):
             id_item.setFlags(Qt.ItemIsEnabled)
             self._table.setItem(row, 0, id_item)
 
-            combo = QComboBox()
+            combo = _BoundedCombo()
             self._table.setCellWidget(row, 1, combo)
             self._combos[pid] = combo
             self._fill_combo(pid)
