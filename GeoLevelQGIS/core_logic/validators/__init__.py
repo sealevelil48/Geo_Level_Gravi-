@@ -6,7 +6,7 @@ Updated to comply with Survey of Israel Directive ג2 (2021).
 """
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import logging
 
 from core_logic.config.models import (
@@ -504,3 +504,32 @@ def check_endpoint(point_id: str) -> Tuple[bool, str]:
         return True, f"'{point_id}' is a valid benchmark"
     
     return False, f"'{point_id}' format is unclear"
+
+
+MEASURE_METHODS = ("BF", "BFFB", "BBFF")
+
+
+def _class_number(cls) -> Optional[int]:
+    if cls is None or cls == "":
+        return None
+    if isinstance(cls, int):
+        return cls
+    s = str(cls).strip().upper()
+    return int(s[1:]) if s.startswith("H") and s[1:].isdigit() else (int(s) if s.isdigit() else None)
+
+
+def validate_lines(lines: List[LevelingLine], default_class=None
+                   ) -> List[Tuple[LevelingLine, ValidationResult]]:
+    """Validate every line with ITS OWN precision class (``line.leveling_class``)
+    or, when it has none, with *default_class* (the project class; None = the
+    user's default setting).  Results are returned in the order of *lines*."""
+    out: List[Optional[Tuple[LevelingLine, ValidationResult]]] = [None] * len(lines)
+    groups: Dict[Optional[int], List[int]] = {}
+    for i, ln in enumerate(lines):
+        cls = _class_number(getattr(ln, "leveling_class", None)) or _class_number(default_class)
+        groups.setdefault(cls, []).append(i)
+    for cls, idx in groups.items():
+        res = BatchValidator(leveling_class=cls).validate_batch([lines[i] for i in idx])
+        for i, pair in zip(idx, res):
+            out[i] = pair
+    return out  # type: ignore[return-value]

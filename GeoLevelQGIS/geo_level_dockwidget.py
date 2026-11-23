@@ -53,6 +53,10 @@ class GeoLevelDockWidget(QDockWidget):
     edit_points_requested = pyqtSignal(list)
     # A line object was edited in place (e.g. direction toggled) -> autosave
     line_modified         = pyqtSignal(int)
+    # project precision class chosen in the dock ("H1".."H6")
+    project_class_changed = pyqtSignal(str)
+    # (line index, "leveling_class" | "method", new value; "" = project class)
+    line_settings_changed = pyqtSignal(int, str, str)
 
     def __init__(self, parent=None):
         super().__init__("Geo Level Gravi", parent)
@@ -129,6 +133,8 @@ class GeoLevelDockWidget(QDockWidget):
         self.class_combo.currentTextChanged.connect(
             lambda c: self.class_lbl.setText(CLASS_DESCRIPTIONS.get(c, ""))
         )
+        # a user change re-validates the project (the plugin listens)
+        self.class_combo.currentTextChanged.connect(self.project_class_changed.emit)
         hbox.addWidget(self.class_lbl)
         vbox.addWidget(grp)
 
@@ -160,6 +166,32 @@ class GeoLevelDockWidget(QDockWidget):
         self.line_info_lbl = QLabel("No line selected")
         self.line_info_lbl.setStyleSheet("font-weight: bold; padding: 2px;")
         vbox.addWidget(self.line_info_lbl)
+
+        # Editable per-line settings: precision class and measure method
+        set_row = QHBoxLayout()
+        set_row.addWidget(QLabel("Precision class:"))
+        self.line_class_combo = QComboBox()
+        self.line_class_combo.addItem("Project class", "")
+        for c in ("H1", "H2", "H3", "H4", "H5", "H6"):
+            self.line_class_combo.addItem(c, c)
+        self.line_class_combo.setToolTip(
+            "Precision class of this line. 'Project class' = the class chosen "
+            "under Precision Class. Saved in the project GeoPackage.")
+        self.line_class_combo.setEnabled(False)
+        self.line_class_combo.currentIndexChanged.connect(self._on_line_class_combo)
+        set_row.addWidget(self.line_class_combo)
+        set_row.addSpacing(12)
+        set_row.addWidget(QLabel("Measure method:"))
+        self.line_method_combo = QComboBox()
+        self.line_method_combo.addItems(["BF", "BFFB", "BBFF"])
+        self.line_method_combo.setToolTip(
+            "Measuring method of this line (H1-H3 require BFFB). "
+            "Saved in the project GeoPackage.")
+        self.line_method_combo.setEnabled(False)
+        self.line_method_combo.currentTextChanged.connect(self._on_line_method_combo)
+        set_row.addWidget(self.line_method_combo)
+        set_row.addStretch()
+        vbox.addLayout(set_row)
 
         self.setup_table = QTableWidget(0, 6)
         self.setup_table.setHorizontalHeaderLabels(
@@ -343,7 +375,30 @@ class GeoLevelDockWidget(QDockWidget):
             "Line: " + (line.start_point or "?") + " -> " + (line.end_point or "?")
             + "  |  Dist: " + dist_str + " m  |  dH: " + dh_str + " m"
         )
+        # show the line's own class / method without emitting a change
+        for combo in (self.line_class_combo, self.line_method_combo):
+            combo.blockSignals(True)
+        i = self.line_class_combo.findData(getattr(line, "leveling_class", None) or "")
+        self.line_class_combo.setCurrentIndex(max(i, 0))
+        method = str(getattr(line, "method", "") or "BF")
+        if self.line_method_combo.findText(method) < 0:
+            self.line_method_combo.addItem(method)
+        self.line_method_combo.setCurrentText(method)
+        for combo in (self.line_class_combo, self.line_method_combo):
+            combo.blockSignals(False)
+            combo.setEnabled(True)
         self._populate_setup_table(line)
+
+    def _on_line_class_combo(self, _i):
+        idx = self.get_current_index()
+        if idx >= 0:
+            self.line_settings_changed.emit(idx, "leveling_class",
+                                            self.line_class_combo.currentData() or "")
+
+    def _on_line_method_combo(self, text):
+        idx = self.get_current_index()
+        if idx >= 0 and text:
+            self.line_settings_changed.emit(idx, "method", text)
 
     def update_validation_tab(self, line):
         """Sync validation detail text when a line is selected."""

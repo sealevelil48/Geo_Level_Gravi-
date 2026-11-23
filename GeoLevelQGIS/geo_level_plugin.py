@@ -29,6 +29,10 @@ if _PLUGIN_DIR not in sys.path:
 _PROJECTS_DIR = os.path.join(_PLUGIN_DIR, "projects")
 
 
+LSA_FIELD = "in_lsa"        # 1 = line used in the last adjustment applied to the map
+LSA_COLOR = "#1565C0"       # blue
+
+
 def _apply_line_renderer(layer):
     """Apply a live QgsRuleBasedRenderer to a line layer.
 
@@ -92,6 +96,13 @@ def _apply_line_renderer(layer):
         r_valid.setFilterExpression("ELSE")
         r_valid.setLabel("Valid")
 
+        # Rule A — lines of the last adjustment ("Apply to Map"): blue, on top
+        # of the status colours.  Only when the layer has the in_lsa field.
+        if layer.fields().indexOf(LSA_FIELD) >= 0:
+            r_lsa = QgsRuleBasedRenderer.Rule(_line_sym(LSA_COLOR, 1.8, 0.0))
+            r_lsa.setFilterExpression(f"\"{LSA_FIELD}\" = 1 AND NOT (\"status\" ILIKE '%exclud%')")
+            r_lsa.setLabel("Adjusted network (last LSA run)")
+            root.appendChild(r_lsa)
         root.appendChild(r_excl)
         root.appendChild(r_mgr)
         root.appendChild(r_invalid)
@@ -222,6 +233,26 @@ def _line_status_str(ln) -> str:
     return (st.value if hasattr(st, "value") else str(st)).upper()
 
 
+def _class_description(cls: str) -> str:
+    try:
+        from geo_level_dockwidget import CLASS_DESCRIPTIONS
+        return CLASS_DESCRIPTIONS.get(cls, "")
+    except Exception:
+        return ""
+
+
+class _LineClassValidator:
+    """BatchValidator drop-in: every line is validated with its own precision
+    class (line.leveling_class), lines without one with the project class."""
+
+    def __init__(self, project_class):
+        self.project_class = project_class or "H3"
+
+    def validate_batch(self, lines):
+        from core_logic.validators import validate_lines
+        return validate_lines(lines, self.project_class)
+
+
 class _frozen_canvas:
     """Context manager: freeze the map canvas, refresh once on exit."""
 
@@ -282,6 +313,7 @@ class GeoLevelPlugin:
         self._glp_path = ""
         # Known heights read from .FA0 / .FA1 files {point_id: height}
         self._file_benchmarks = {}
+        self._file_approx = {}           # approximate heights listed in FA0 / FA1
         # Last adjustment applied to the map (persisted in the GeoPackage)
         self._last_adjustment = {}
 
@@ -390,6 +422,8 @@ class GeoLevelPlugin:
         # connected after _on_override_changed so the layer commit runs first).
         self.dock.override_changed.connect(lambda *_: self._autosave_gpkg())
         self.dock.line_modified.connect(lambda *_: self._autosave_gpkg())
+        self.dock.project_class_changed.connect(self._on_project_class_changed)
+        self.dock.line_settings_changed.connect(self._on_line_settings_changed)
 
     def _show_dock(self):
         if self.dock:
@@ -556,6 +590,7 @@ class GeoLevelPlugin:
         new_lines = result["lines"]
         # Known heights carried by .FA0 / .FA1 files (fixed-point candidates)
         self._file_benchmarks.update(result.get("file_benchmarks") or {})
+        self._file_approx.update(result.get("file_approx") or {})
         # Keep setup endpoints consistent with the renamed line endpoints
         self._rename_points_in_lines(new_lines, pid_remap, setups_only=True)
         # Re-apply exclusions chosen in the dialog (the re-run re-parsed them)
@@ -589,8 +624,7 @@ class GeoLevelPlugin:
 
         # Re-validate the full combined set
         try:
-            from core_logic.validators import BatchValidator
-            bv = BatchValidator(leveling_class=int(leveling_class[1]))
+            bv = _LineClassValidator(leveling_class)
             self._val_results = bv.validate_batch(self._lines)
         except Exception:
             self._val_results = result.get("val_results", [])
@@ -1088,6 +1122,7 @@ class GeoLevelPlugin:
             "resolved_points": resolved,
             "saved_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "file_benchmarks": dict(self._file_benchmarks),
+            "file_approx": dict(self._file_approx),
             "last_adjustment": dict(self._last_adjustment),
         }
 
@@ -1279,16 +1314,56 @@ class GeoLevelPlugin:
         self._add_result_layers(lines, pts)
         return True
 
+    def _on_project_class_changed(self, cls: str) -> None:
+        """Precision Class changed in the dock: re-validate every line that has
+        no class of its own, refresh list / map, save to the GeoPackage."""
+        if cls not in ("H1", "H2", "H3", "H4", "H5", "H6") or cls == self._last_class:
+            return
+        old, self._last_class = self._last_class, cls
+        if not self._lines:
+            return
+        self._after_validation_change(f"Precision class {old} -> {cls}")
+
+    def _on_line_settings_changed(self, idx: int, field: str, value: str) -> None:
+        """Per-line precision class / measure method edited in Line Details."""
+        if not (0 <= idx < len(self._lines)):
+            return
+        ln = self._lines[idx]
+        if field == "leveling_class":
+            new = value if value in ("H1", "H2", "H3", "H4", "H5", "H6") else None
+            if new == getattr(ln, "leveling_class", None):
+                return
+            msg = (f"{ln.filename}: precision class "
+                   f"{getattr(ln, 'leveling_class', None) or 'project'} -> {new or 'project'}")
+            ln.leveling_class = new
+        elif field == "method":
+            if not value or value == ln.method:
+                return
+            msg = f"{ln.filename}: measure method {ln.method} -> {value}"
+            ln.method = value
+        else:
+            return
+        self._after_validation_change(msg, keep_index=idx)
+
+    def _after_validation_change(self, msg: str, keep_index: int = None) -> None:
+        self._revalidate_all(self._last_class)
+        if self.dock:
+            self.dock.load_lines(self._lines, self._val_results)
+            if keep_index is not None and 0 <= keep_index < len(self._lines):
+                self.dock.line_list.setCurrentRow(keep_index)
+            self.dock.log(msg)
+        self._sync_map_statuses()
+        self._autosave_gpkg()          # lv_lines (class, method, status) + lv_meta
+
     def _revalidate_all(self, cls: str) -> None:
         """Re-derive line statuses in memory (no file parsing)."""
         try:
-            from core_logic.validators import BatchValidator
             from core_logic.config.models import LineStatus
             keep = (LineStatus.EXCLUDED_FROM_MERGE, LineStatus.MERGED)
             for ln in self._lines:
                 if ln.status not in keep:
                     ln.status = LineStatus.VALID
-            bv = BatchValidator(leveling_class=int((cls or "H3")[1]))
+            bv = _LineClassValidator((cls or "H3"))
             self._val_results = bv.validate_batch(self._lines)
             for ln in self._lines:
                 if getattr(ln, "manager_override", False):
@@ -1429,6 +1504,7 @@ class GeoLevelPlugin:
             self._point_origin.setdefault(new, old)
         self._restore_point_cache(meta["resolved_points"])
         self._file_benchmarks = dict(meta.get("file_benchmarks") or {})
+        self._file_approx = dict(meta.get("file_approx") or {})
         self._last_adjustment = dict(meta.get("last_adjustment") or {})
 
         self._remove_result_layers()
@@ -1446,7 +1522,10 @@ class GeoLevelPlugin:
             pass
 
         if self.dock and hasattr(self.dock, "class_combo"):
+            self.dock.class_combo.blockSignals(True)     # loading: no re-validation
             self.dock.class_combo.setCurrentText(self._last_class)
+            self.dock.class_combo.blockSignals(False)
+            self.dock.class_lbl.setText(_class_description(self._last_class))
         changed = self._restore_saved_validation(saved_vrs)
         self._sync_map_statuses()
         self._show_dock()
@@ -1533,6 +1612,7 @@ class GeoLevelPlugin:
         self._glp_path = ""
         self._pending_pid_remap = {}
         self._file_benchmarks = {}
+        self._file_approx = {}           # approximate heights listed in FA0 / FA1
         self._last_adjustment = {}
 
         # Remove the QGIS map layers (lines + points)
@@ -1572,9 +1652,8 @@ class GeoLevelPlugin:
                                     "No lines loaded.")
             return
         try:
-            from core_logic.validators import BatchValidator
             cls = self.dock.get_selected_class() if self.dock else self._last_class
-            bv = BatchValidator(leveling_class=int(cls[1]))
+            bv = _LineClassValidator(cls)
             self._val_results = bv.validate_batch(self._lines)
             # Refresh dock list colours and sync map layer statuses
             self.dock.load_lines(self._lines, self._val_results)
@@ -2197,6 +2276,7 @@ class GeoLevelPlugin:
                     allow_defer=allow_defer, round_no=round_no,
                     search_fn=lambda p, q, _b=batch, _k=net.known: db_mgr.score_candidates(
                         p, db_mgr.search(q), new_lines, _b, known=_k),
+                    assigned={p: r for p, r in fixed.items() if r is not None},
                 )
                 if not dlg.exec_():
                     return False
@@ -2319,6 +2399,7 @@ class GeoLevelPlugin:
         dlg = GeoLevelPointResolutionDialog(
             targets, scored, parent=self.iface.mainWindow(), mode="edit",
             current_selection=current, search_fn=_search,
+            assigned={p: r for p, r in current.items() if r is not None},
             current_modes=current_modes,
         )
         if not dlg.exec_():
@@ -2382,10 +2463,9 @@ class GeoLevelPlugin:
             output_dir = self._default_output_dir()
 
         try:
-            from core_logic.validators import BatchValidator
             cls = self.dock.get_selected_class() if self.dock else self._last_class
             cls = cls or self._last_class or "H3"
-            bv = BatchValidator(leveling_class=int(cls[1]))
+            bv = _LineClassValidator(cls)
             # The validator only ever downgrades status; lines were not
             # re-parsed, so reset before re-deriving it from renamed points.
             from core_logic.config.models import LineStatus
@@ -2436,9 +2516,52 @@ class GeoLevelPlugin:
         canvas.setExtent(extent)
         canvas.refresh()
 
-    def _apply_lsa_to_layer(self, result):
+    def _mark_lsa_lines(self, filenames) -> int:
+        """Set in_lsa = 1 on the line features of the last adjustment (0 on
+        all others) and repaint: the adjusted network is drawn blue."""
+        from qgis.core import QgsField, QgsFeatureRequest
+        from qgis.PyQt.QtCore import QVariant
+        wanted = {str(f) for f in filenames or ()}
+        n = 0
+        for layer in self._result_layers("Geodetic Results"):
+            if not layer.isValid():
+                continue
+            fn_idx = layer.fields().indexOf("filename")
+            if fn_idx < 0:
+                continue
+            layer.startEditing()
+            if layer.fields().indexOf(LSA_FIELD) < 0:
+                layer.addAttribute(QgsField(LSA_FIELD, QVariant.Int))
+                layer.updateFields()
+            f_idx = layer.fields().indexOf(LSA_FIELD)
+            req = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry)
+            req.setSubsetOfAttributes([fn_idx, f_idx])
+            for feat in layer.getFeatures(req):
+                val = 1 if str(feat[fn_idx]) in wanted else 0
+                n += val
+                if feat[f_idx] != val:
+                    layer.changeAttributeValue(feat.id(), f_idx, val)
+            layer.commitChanges()
+            _apply_line_renderer(layer)        # adds the blue rule now the field exists
+            try:
+                self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+            except Exception:
+                pass
+        self.iface.mapCanvas().refresh()
+        return n
+
+    def _apply_lsa_to_layer(self, result, run_lines=None):
         """Write adjusted heights to the 'adj_height' field of the point layer
-        ('Geodetic Points') and keep the result in the project GeoPackage."""
+        ('Geodetic Points'), paint the lines of this run blue and keep the
+        result in the project GeoPackage."""
+        n_lines = 0
+        if run_lines:
+            try:
+                n_lines = self._mark_lsa_lines([ln.filename for ln in run_lines])
+            except Exception:
+                QgsMessageLog.logMessage("Marking the adjusted lines failed: "
+                                         + traceback.format_exc(), "GeoLevelPlugin",
+                                         level=Qgis.Warning)
         n_set = 0
         for layer in self._result_layers("Geodetic Points"):
             if not layer.isValid():
@@ -2471,10 +2594,12 @@ class GeoLevelPlugin:
             "heights": {k: float(v) for k, v in result.adjusted_heights.items()},
             "std_mm": {k: float(v * 1000.0) for k, v in result.mse_heights.items()},
             "residuals_mm": {k: float(v) for k, v in result.residuals.items()},
+            "lines": [ln.filename for ln in (run_lines or [])],
         }
         self._autosave_gpkg()
         self.iface.messageBar().pushMessage(
-            "LSA", f"Adjusted heights applied to {n_set} map point(s) (adj_height)",
+            "LSA", f"Adjusted heights applied to {n_set} map point(s) (adj_height); "
+                   f"{n_lines} adjusted line(s) drawn in blue",
             level=Qgis.Success, duration=5
         )
 
@@ -2509,12 +2634,14 @@ class GeoLevelPlugin:
                 val_results=self._val_results,
                 leveling_class=cls or self._last_class or "H3",
                 known_heights=self._file_benchmarks,
+                approx_heights=self._file_approx,
                 selected_lines=selected_lines,
                 project_name=name,
                 output_dir=self._last_output_dir,
             )
             if dlg.exec_() and dlg.result is not None:
-                self._apply_lsa_to_layer(dlg.result)
+                self._apply_lsa_to_layer(dlg.result,
+                                         run_lines=getattr(dlg, "run_lines", None))
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)
@@ -2531,9 +2658,8 @@ class GeoLevelPlugin:
             if dlg.exec_():
                 self._lines = dlg.merged_lines
                 try:
-                    from core_logic.validators import BatchValidator
                     cls = self.dock.get_selected_class() if self.dock else self._last_class
-                    bv = BatchValidator(leveling_class=int(cls[1]))
+                    bv = _LineClassValidator(cls)
                     self._val_results = bv.validate_batch(self._lines)
                 except Exception:
                     pass
@@ -2632,9 +2758,8 @@ class GeoLevelPlugin:
 
                 # Re-validate to prevent deepcopy desync with self._val_results
                 try:
-                    from core_logic.validators import BatchValidator
                     cls = self.dock.get_selected_class() if self.dock else self._last_class
-                    bv = BatchValidator(leveling_class=int(cls[1]))
+                    bv = _LineClassValidator(cls)
                     self._val_results = bv.validate_batch(self._lines)
                 except Exception:
                     pass
@@ -2673,9 +2798,8 @@ class GeoLevelPlugin:
                 # Re-run validation so dock colours reflect new k values immediately
                 if self._lines:
                     try:
-                        from core_logic.validators import BatchValidator
                         cls = self.dock.get_selected_class() if self.dock else self._last_class
-                        bv = BatchValidator(leveling_class=int(cls[1]))
+                        bv = _LineClassValidator(cls)
                         self._val_results = bv.validate_batch(self._lines)
                         self.dock.load_lines(self._lines, self._val_results)
                     except Exception:

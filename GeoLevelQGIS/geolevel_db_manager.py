@@ -151,6 +151,34 @@ def group_twins(records: List["BenchmarkRecord"],
     return clusters
 
 
+def duplicate_assignments(choices: Dict[str, "BenchmarkRecord"],
+                          assigned: Dict[str, "BenchmarkRecord"],
+                          tol_m: float = 1.0) -> List[Tuple[str, str, float]]:
+    """Field IDs whose chosen DB record is the same benchmark as (same record,
+    or within *tol_m* of) the record of ANOTHER field ID -> [(pid, other, m)].
+    Two field IDs on one mark is almost always a wrong pick (e.g. '117' ->
+    '6177/', the twin of fixed point 6177)."""
+    out = []
+    pool = {p: r for p, r in assigned.items() if r is not None}
+    pool.update({p: r for p, r in choices.items() if r is not None})
+    for pid, rec in choices.items():
+        if rec is None or rec.x is None or rec.y is None:
+            continue
+        for other, orec in pool.items():
+            if other == pid or orec is None:
+                continue
+            same = rec.key() == orec.key()
+            if orec.x is None or orec.y is None:
+                if same:
+                    out.append((pid, other, 0.0))
+                continue
+            d = _dist(rec.x, rec.y, orec.x, orec.y)
+            if same or d <= tol_m:
+                out.append((pid, other, d))
+                break
+    return out
+
+
 def cluster_heights_disagree(cluster: List["BenchmarkRecord"], tol_m: float = 0.001) -> bool:
     """True when records of one < 1 m cluster carry different heights
     (e.g. two DB rows for the same monument with a re-levelled gova_ort)."""
@@ -937,11 +965,13 @@ class BenchmarkDBManager:
                              f"UPPER(COALESCE(kfar_aher_name, '')) LIKE %s"], \
                             [f"%{clean}%", f"%{clean}%", f"%{clean}%"]
             if re.sub(r"\s", "", clean).isdigit():
-                conds.append(f"{num} LIKE %s")
-                params.append(f"%{compact}%")
-                rank = (f"CASE WHEN {num} = %s THEN 0 WHEN {num} LIKE %s THEN 1 "
-                        f"WHEN {num} LIKE %s THEN 2 ELSE 3 END")
-                rparams = [compact, f"{compact}%", f"%{compact}%"]
+                # number-only: the exact number, then numbers STARTING with it
+                # ("117" -> 117/A, 1170/B; never 6177, which only contains it)
+                conds = [f"{num} LIKE %s",
+                         f"UPPER(COALESCE(kfar_aher_name, '')) LIKE %s"]
+                params = [f"{compact}%", f"%{clean}%"]
+                rank = f"CASE WHEN {num} = %s THEN 0 WHEN {num} LIKE %s THEN 1 ELSE 3 END"
+                rparams = [compact, f"{compact}%"]
             else:
                 conds += [f"{k_flat} LIKE %s", f"{k_rev} LIKE %s"]
                 params += [f"%{compact}%", f"%{compact}%"]

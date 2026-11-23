@@ -139,6 +139,7 @@ class GeoLevelPointResolutionDialog(QDialog):
         statuses: Optional[Dict[str, str]] = None,
         allow_defer: bool = False,
         round_no: int = 0,
+        assigned: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__(parent)
         self._mode = mode if mode in ("load", "edit") else "load"
@@ -152,6 +153,7 @@ class GeoLevelPointResolutionDialog(QDialog):
         self._round_no = round_no
         self._dirty: set = set()                          # rows the user touched
         self._search_fn = search_fn
+        self._assigned = dict(assigned or {})            # points already matched
         self._combos: Dict[str, QComboBox] = {}          # field ID -> DB candidate dropdown
         self._edits: Dict[str, QLineEdit] = {}            # field ID -> manual name override
         self._handling: Dict[str, QComboBox] = {}         # field ID -> handling mode dropdown
@@ -490,6 +492,27 @@ class GeoLevelPointResolutionDialog(QDialog):
                 + "\n  ".join(missing),
             )
             return
+        res = self.get_resolved()
+        try:
+            from geolevel_db_manager import duplicate_assignments
+            picks = {p: r for p, r in res["records"].items()
+                     if res["modes"].get(p) == "use_selected" and p not in res["manual"]
+                     and (self._mode == "load" or p in self._dirty)}
+            dups = duplicate_assignments(picks, self._assigned)
+        except Exception:
+            dups = []
+        if dups:
+            ans = QMessageBox.question(
+                self, "Same benchmark twice",
+                "These field points would use a DB benchmark that is already used by "
+                "another field point (same record or within 1 m):\n\n  "
+                + "\n  ".join(f"{p} → {res['records'][p].name}   =   {o}  ({d:.2f} m)"
+                               for p, o, d in dups)
+                + "\n\nTwo field IDs on one mark is almost always a wrong choice. "
+                  "Use it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
         self.accept()
 
     # ------------------------------------------------------------------

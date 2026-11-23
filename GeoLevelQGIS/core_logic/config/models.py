@@ -10,6 +10,18 @@ from enum import Enum
 import pandas as pd
 
 
+
+def fast_deepcopy(obj):
+    """Deep copy via a pickle round-trip (~3x faster than copy.deepcopy for
+    leveling lines with many setups); falls back to copy.deepcopy for
+    anything pickle cannot handle."""
+    import pickle
+    try:
+        return pickle.loads(pickle.dumps(obj, pickle.HIGHEST_PROTOCOL))
+    except Exception:
+        import copy
+        return copy.deepcopy(obj)
+
 class MeasurementDirection(Enum):
     """Direction of measurement in a leveling line."""
     FORWARD = "forward"   # BF: Backsight to Foresight
@@ -77,6 +89,12 @@ class LevelingLine:
     # the file = one line; its setups are evenly split placeholders that keep
     # the setup count, so setup-level field checks are not applied.
     is_summary: bool = False
+    # Summary-file columns kept for FA0 / FA1 export (legacy layout)
+    bf_diff: Optional[float] = None    # sum of B-F differences, mm
+    year_month: str = ""               # MMYY of the measurement
+    source_file: str = ""              # raw file name, e.g. '973.raw'
+    # Precision class of this line ('H1'..'H6'); None = the project class
+    leveling_class: Optional[str] = None
     
     @property
     def num_setups(self) -> int:
@@ -135,8 +153,7 @@ class LevelingLine:
 
     def copy(self) -> 'LevelingLine':
         """Create a deep copy of this line for joint projects."""
-        import copy
-        return copy.deepcopy(self)
+        return fast_deepcopy(self)
     
     def to_dataframe(self) -> pd.DataFrame:
         """Convert setups to a pandas DataFrame."""
@@ -256,6 +273,10 @@ class ProjectData:
     is_joint_project: bool = False
     source_projects: List[str] = field(default_factory=list)  # Track source project names
     project_path: Optional[str] = None  # File path for persistence
+    # Benchmark-DB point choices (Point Verification), re-applied on reload:
+    # {raw field ID: {"mode": ..., "record": {...}}} and {name: raw field ID}
+    point_overrides: Dict[str, dict] = field(default_factory=dict)
+    point_origin: Dict[str, str] = field(default_factory=dict)
 
     def add_line(self, line: LevelingLine):
         """Add a leveling line to the project."""
@@ -282,23 +303,21 @@ class ProjectData:
 
     def copy(self) -> 'ProjectData':
         """Create a deep copy of this project (for joint projects)."""
-        import copy
-        return copy.deepcopy(self)
+        return fast_deepcopy(self)
 
     def merge_from(self, other_project: 'ProjectData'):
         """
         Merge another project into this one (for joint projects).
         Creates deep copies to avoid modifying source projects.
         """
-        # Copy lines
-        for line in other_project.lines:
-            self.lines.append(line.copy())
-
-        # Copy benchmarks
-        for point_id, bm in other_project.benchmarks.items():
+        # Copy lines and benchmarks in ONE copy pass (shared objects stay
+        # shared inside the copy, as with a single deepcopy)
+        lines, benchmarks = fast_deepcopy((other_project.lines,
+                                           other_project.benchmarks))
+        self.lines.extend(lines)
+        for point_id, bm in benchmarks.items():
             if point_id not in self.benchmarks:
-                import copy
-                self.benchmarks[point_id] = copy.deepcopy(bm)
+                self.benchmarks[point_id] = bm
 
         # Track source
         if other_project.name not in self.source_projects:

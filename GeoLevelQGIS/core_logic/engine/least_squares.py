@@ -55,8 +55,10 @@ def lines_to_observations(lines: Sequence[LevelingLine]) -> List[MeasurementSumm
         out.append(MeasurementSummary(
             from_point=ln.start_point, to_point=ln.end_point,
             height_diff=ln.total_height_diff, distance=ln.total_distance,
-            num_setups=ln.num_setups, bf_diff=0.0, year_month="",
-            source_file=ln.filename,
+            num_setups=ln.num_setups,
+            bf_diff=getattr(ln, "bf_diff", None) or 0.0,
+            year_month=getattr(ln, "year_month", "") or "",
+            source_file=getattr(ln, "source_file", "") or ln.filename,
         ))
     return out
 

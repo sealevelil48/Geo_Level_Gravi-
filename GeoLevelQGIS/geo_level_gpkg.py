@@ -45,6 +45,10 @@ _LINE_COLS = [
     ("manager_override", "INTEGER"),
     ("validation", "TEXT"),          # JSON ValidationResult (schema >= 2)
     ("is_summary", "INTEGER"),       # line imported from .FA0/.FA1/.rez
+    ("leveling_class", "TEXT"),      # per-line precision class (NULL = project)
+    ("bf_diff", "REAL"),             # summary-file columns, kept for FA0/FA1
+    ("year_month", "TEXT"),
+    ("source_file", "TEXT"),
 ]
 
 _SETUP_COLS = [
@@ -142,6 +146,10 @@ def lines_to_rows(lines, val_results=None):
             "original_direction": getattr(ln, "original_direction", "BF"),
             "manager_override": int(bool(getattr(ln, "manager_override", False))),
             "is_summary": int(bool(getattr(ln, "is_summary", False))),
+            "leveling_class": getattr(ln, "leveling_class", None),
+            "bf_diff": getattr(ln, "bf_diff", None),
+            "year_month": getattr(ln, "year_month", "") or "",
+            "source_file": getattr(ln, "source_file", "") or "",
             "validation": (json.dumps(validation_to_dict(vr_by_line[id(ln)]),
                                       ensure_ascii=False)
                            if vr_by_line.get(id(ln)) is not None else None),
@@ -277,6 +285,13 @@ def rows_to_project(line_rows, setup_rows):
         )
         ln.source_path = r.get("source_path")
         ln.is_summary = bool(r.get("is_summary")) if isinstance(r.get("is_summary"), (bool, int)) else False
+        lc = r.get("leveling_class")
+        ln.leveling_class = lc if lc in ("H1", "H2", "H3", "H4", "H5", "H6") else None
+        ln.bf_diff = _finite(r.get("bf_diff"))
+        ym = r.get("year_month")
+        ln.year_month = ym[:4] if isinstance(ym, str) else ""
+        sf = r.get("source_file")
+        ln.source_file = sf[:260] if isinstance(sf, str) else ""
         lines.append(ln)
         vr = None
         raw = r.get("validation")
@@ -469,6 +484,9 @@ def _sanitize_adjustment(d):
         if isinstance(v, dict):
             out[k] = {kk: float(vv) for kk, vv in v.items()
                       if isinstance(kk, str) and _finite(vv) is not None}
+    ln = d.get("lines")
+    if isinstance(ln, list):
+        out["lines"] = [x for x in ln if isinstance(x, str)][:100000]
     return out
 
 
@@ -530,6 +548,10 @@ def sanitize_meta(meta):
     out["file_benchmarks"] = ({k: float(v) for k, v in fb.items()
                                if isinstance(k, str) and k.strip() and _finite(v) is not None}
                               if isinstance(fb, dict) else {})
+    fa = meta.get("file_approx")
+    out["file_approx"] = ({k: float(v) for k, v in fa.items()
+                           if isinstance(k, str) and k.strip() and _finite(v) is not None}
+                          if isinstance(fa, dict) else {})
     out["last_adjustment"] = _sanitize_adjustment(meta.get("last_adjustment"))
 
     od = meta.get("output_dir")

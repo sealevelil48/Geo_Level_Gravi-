@@ -62,12 +62,15 @@ class GeoLevelEnhancedLSADialog(QDialog):
 
     def __init__(self, lines, parent=None, val_results=None, leveling_class="H3",
                  known_heights=None, selected_lines=None, project_name="geo_level",
-                 output_dir=""):
+                 output_dir="", approx_heights=None):
         super().__init__(parent)
         self.lines = list(lines or [])
         self._val_results = val_results or []
         self.leveling_class = leveling_class or "H3"
-        self.known_heights = dict(known_heights or {})
+        self.known_heights = dict(known_heights or {})   # FA0/FA1 fixed points (header order)
+        self.approx_heights = dict(approx_heights or {})  # other FA0/FA1 heights (approximate)
+        self._run_obs = None                              # observations of the last run
+        self.run_lines = []                               # lines of the last run (map: blue)
         self.project_name = project_name or "geo_level"
         self.output_dir = output_dir or ""
         self._selected_ids = ({id(l) for l in selected_lines}
@@ -363,23 +366,36 @@ class GeoLevelEnhancedLSADialog(QDialog):
             return None
 
     def _auto_select_fixed(self, quiet=False):
-        """List the points of the ticked lines that have a known height
-        (from .FA0/.FA1 files, else the DB).  For a single ticked line the
-        two end points are always listed (single-line adjustment)."""
+        """Fixed points for the ticked lines.
+
+        When the loaded FA0 / FA1 files define fixed points - the FIRST N
+        points listed, N being the second number of the header
+        ('36   2   K6177-64PU-65PU' -> 2) - exactly those are selected, in the
+        file's order; other listed heights are approximate and never fixed.
+        Only when no loaded file defines fixed points for these lines are DB
+        heights offered.  For a single ticked line the two end points are
+        always listed (single-line adjustment)."""
         lines = self._active_lines()
-        pts = []
+        on_lines = []
         for ln in lines:
             for p in (ln.start_point, ln.end_point):
-                if p and p not in pts:
-                    pts.append(p)
-        mgr = self._db()
+                if p and p not in on_lines:
+                    on_lines.append(p)
+        file_fixed = [p for p in self.known_heights if p in on_lines]
         rows = []
-        for p in sorted(pts):
-            h = self.known_heights.get(p)
-            if h is None:
+        if file_fixed:
+            rows = [(p, f"{self.known_heights[p]:.4f}") for p in file_fixed]
+        else:
+            mgr = self._db()
+            if mgr is not None:
+                try:
+                    mgr.prefetch(sorted(on_lines))          # one batched lookup
+                except Exception:
+                    pass
+            for p in sorted(on_lines):
                 h = self._db_height(mgr, p)
-            if h is not None:
-                rows.append((p, f"{h:.4f}"))
+                if h is not None:
+                    rows.append((p, f"{h:.4f}"))
         if len(lines) == 1 and not rows:
             rows = [(lines[0].start_point, ""), (lines[0].end_point, "")]
         elif len(lines) == 1:
@@ -392,8 +408,8 @@ class GeoLevelEnhancedLSADialog(QDialog):
         if not rows and not quiet:
             QMessageBox.information(
                 self, "Auto-Select",
-                "No point of the ticked lines has a known height in the loaded "
-                "files or the database.\nEnter the fixed heights manually.")
+                "No point of the ticked lines is a fixed point of the loaded FA0 / FA1 "
+                "files or has a height in the database.\nEnter the fixed heights manually.")
 
     def _fetch_from_db(self):
         mgr = self._db()
@@ -547,6 +563,8 @@ class GeoLevelEnhancedLSADialog(QDialog):
                                           weight_mode=self._weight_mode(),
                                           leveling_class=cls)
             result = adj.adjust(obs, fixed, known_heights=self.known_heights)
+            self._run_obs = list(obs)
+            self.run_lines = list(self._active_lines())
         except NetworkDatumError as exc:
             self.result = None
             self._set_result_buttons(False)
@@ -696,7 +714,7 @@ class GeoLevelEnhancedLSADialog(QDialog):
             from core_logic.config.models import Benchmark
             from core_logic.exporters import FA0Exporter
             FA0Exporter().export(path, [Benchmark(point_id=k, height=v) for k, v in fixed.items()],
-                                 obs, f"{self.project_name}.rez")
+                                 obs, self.project_name, approx_heights=self.approx_heights)
             QMessageBox.information(self, "Export FA0", f"Written:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export FA0", str(exc))
@@ -710,15 +728,17 @@ class GeoLevelEnhancedLSADialog(QDialog):
         try:
             from core_logic.config.models import Benchmark, MeasurementSummary
             from core_logic.exporters import FA1Exporter
-            obs = [MeasurementSummary(from_point=o["from"], to_point=o["to"],
-                                      height_diff=o["measured_dh"], distance=o["distance"],
-                                      num_setups=o.get("num_setups", 0) or 0, bf_diff=0.0,
-                                      year_month="", source_file=o.get("source", ""))
-                   for o in self.result.observations]
+            obs = self._run_obs or [
+                MeasurementSummary(from_point=o["from"], to_point=o["to"],
+                                   height_diff=o["measured_dh"], distance=o["distance"],
+                                   num_setups=o.get("num_setups", 0) or 0, bf_diff=0.0,
+                                   year_month="", source_file=o.get("source", ""))
+                for o in self.result.observations]
             FA1Exporter().export(path, [Benchmark(point_id=k, height=v)
                                         for k, v in self.fixed_points.items()],
-                                 obs, self.result, f"{self.project_name}.rez",
-                                 leveling_class=self.cmb_class.currentText())
+                                 obs, self.result, self.project_name,
+                                 leveling_class=self.cmb_class.currentText(),
+                                 approx_heights=self.approx_heights)
             QMessageBox.information(self, "Export FA1", f"Written:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export FA1", str(exc))

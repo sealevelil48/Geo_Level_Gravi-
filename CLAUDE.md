@@ -125,7 +125,8 @@ Opened by "Network Adjustment (LSA)" (dock + menu) and by "Adjust This Line" (sa
 Constructor: `GeoLevelEnhancedLSADialog(lines, parent, val_results, leveling_class, known_heights, selected_lines, project_name, output_dir)`
 
 - Left: method (Parametric / Conditional), lines table (tick/untick; invalid/excluded greyed), fixed points (Auto-Select from .FA0/.FA1 heights or DB, Fetch from DB), options (Step 1 averaging, weights distance/setups/equal, class)
-- Buttons: Prepare (Steps 1–2), Run, **Apply to Map** (accept → plugin `_apply_lsa_to_layer` writes `adj_height` on "Geodetic Points" and stores `last_adjustment` in the GPKG), **Export FA0 / FA1 / PDF**
+- Buttons: Prepare (Steps 1–2), Run, **Apply to Map** (accept → plugin `_apply_lsa_to_layer(result, run_lines)` writes `adj_height` on "Geodetic Points", sets `in_lsa`=1 on the run's line features → first renderer rule paints them blue `LSA_COLOR`, and stores `last_adjustment` incl. `lines` in the GPKG), **Export FA0 / FA1 / PDF** (legacy layout, `core_logic/exporters`, see docs/LSA_ENGINE.md)
+- Auto-Select: only `known_heights` (= FA0/FA1 header fixed points, ordered) when present for the ticked lines; DB heights only otherwise. `approx_heights` (other FA0/FA1 heights) go to the exporters, never fixed.
 - Tabs: Summary (σ₀, dof, BM-to-BM misclosures vs k√L), Step 1 Observations, Step 2 Approximate Heights, Adjusted Heights (approx, correction, σ, 95%), Residuals, Line Adjustment (single line between two known heights, Directive G2 App. C), Matrix Diagnostics
 
 ### Adjustment engine (`core_logic/engine/least_squares.py`, `network_prep.py`)
@@ -216,6 +217,7 @@ Reset to Defaults: calls `mgr.reset_to_defaults()` + `importlib.reload(israel_su
 
 ## Important Patterns
 
+- Validation is per line: `core_logic.validators.validate_lines(lines, project_class)` uses `line.leveling_class` (None = project class); the plugin's `_LineClassValidator` wraps it. Dock emits `project_class_changed` and `line_settings_changed(idx, 'leveling_class'|'method', value)`; lv_lines stores `leveling_class`, `bf_diff`, `year_month`, `source_file`.
 - `CLASS_REGISTRY_BY_NAME` — use this dict (not `ALL_CLASSES` which doesn't exist). Keys: `["H1","H2","H3","H4","H5","H6"]`.
 - `create_parser(filename)` — auto-detects Trimble/Leica format from file content.
 - Hebrew encoding (cp1255) is the default for both reading input files and writing exports. Fallback chain: cp1255 → UTF-8 → Latin-1.

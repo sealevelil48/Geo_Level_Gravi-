@@ -220,10 +220,12 @@ def process_geodetic_data(
     lines = []
     parse_errors = []
 
-    file_benchmarks = {}   # known heights carried by .FA0 / .FA1 files
+    file_benchmarks = {}   # FIXED points of .FA0 / .FA1 files (header order)
+    file_approx = {}       # other heights listed there (approximate)
     if preparsed is not None:
         lines = preparsed["lines"]
         file_benchmarks = dict(preparsed.get("file_benchmarks") or {})
+        file_approx = dict(preparsed.get("file_approx") or {})
         parse_errors = list(preparsed.get("parse_errors") or [])
         file_paths = []
     for fp in file_paths:
@@ -237,6 +239,8 @@ def process_geodetic_data(
                 lines.append(line)
             for pid, h in (getattr(parser, "benchmarks", None) or {}).items():
                 file_benchmarks[pid] = h
+            for pid, h in (getattr(parser, "approx_heights", None) or {}).items():
+                file_approx[pid] = h
             if len(parsed) == 1:
                 log.info("Parsed: %s  (%s → %s)", Path(fp).name,
                          parsed[0].start_point, parsed[0].end_point)
@@ -261,6 +265,7 @@ def process_geodetic_data(
             import copy
             pristine = copy.deepcopy(lines)
         snapshot = {"lines": pristine, "file_benchmarks": dict(file_benchmarks),
+                    "file_approx": dict(file_approx),
                     "parse_errors": list(parse_errors)}
 
     # Apply verified DB name overrides (e.g. ASCII → Hebrew) before any
@@ -274,11 +279,12 @@ def process_geodetic_data(
 
     renamed_benchmarks = {(name_overrides or {}).get(k, k): v
                           for k, v in file_benchmarks.items()}
+    renamed_approx = {(name_overrides or {}).get(k, k): v for k, v in file_approx.items()}
     if parse_only:
         return {
             "lines_geojson": "", "points_geojson": "", "line_style": "",
             "point_style": "", "rez_path": None,
-            "file_benchmarks": renamed_benchmarks,
+            "file_benchmarks": renamed_benchmarks, "file_approx": renamed_approx,
             "summary": {"total": len(lines), "valid": 0, "invalid": 0,
                         "warnings": 0, "parse_errors": parse_errors},
             "lines": lines,
@@ -347,7 +353,7 @@ def process_geodetic_data(
         "point_style":    output_files["point_style"],
         "rez_path":       rez_path,
         # Known heights read from .FA0 / .FA1 files (renamed like the lines)
-        "file_benchmarks": renamed_benchmarks,
+        "file_benchmarks": renamed_benchmarks, "file_approx": renamed_approx,
         "summary": {
             "total":    len(lines),
             "valid":    valid_count,
