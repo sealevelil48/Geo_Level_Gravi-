@@ -179,6 +179,12 @@ class ProjectManager:
                 'total_height_diff': line.total_height_diff,
                 'is_used': line.is_used,
                 'original_direction': line.original_direction,
+                'leveling_class': getattr(line, 'leveling_class', None),
+                'is_summary': bool(getattr(line, 'is_summary', False)),
+                'bf_diff': getattr(line, 'bf_diff', None),
+                'year_month': getattr(line, 'year_month', '') or '',
+                'source_file': getattr(line, 'source_file', '') or '',
+                'manager_override': bool(getattr(line, 'manager_override', False)),
                 'setups': []
             }
 
@@ -264,6 +270,14 @@ class ProjectManager:
                 is_used=line_data.get('is_used', True),
                 original_direction=line_data.get('original_direction', 'BF')
             )
+            cls = line_data.get('leveling_class')
+            line.leveling_class = cls if cls in ('H1', 'H2', 'H3', 'H4', 'H5', 'H6') else None
+            line.is_summary = bool(line_data.get('is_summary', False))
+            bf = line_data.get('bf_diff')
+            line.bf_diff = float(bf) if isinstance(bf, (int, float)) else None
+            line.year_month = str(line_data.get('year_month') or '')[:4]
+            line.source_file = str(line_data.get('source_file') or '')
+            line.manager_override = bool(line_data.get('manager_override', False))
             project.add_line(line)
 
         # Deserialize benchmarks

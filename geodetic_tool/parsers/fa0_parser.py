@@ -70,8 +70,9 @@ class FA0Parser(BaseParser):
                 logger.warning("FA0 line %d not understood, skipped: %r", no, text)
                 self.warnings.append(f"Line {no} skipped: {text.strip()[:60]}")
                 continue
-            f, t, dh, dist, n, src = obs
+            f, t, dh, dist, n, src, bf, ym = obs
             lines.append(summary_line(stem, len(lines) + 1, f, t, dh, dist, n, src,
+                                      bf_diff=bf, year_month=ym,
                                       source_path=str(Path(filepath).resolve())))
         if not lines:
             raise ValueError("No observation lines found")
@@ -114,11 +115,14 @@ class FA0Parser(BaseParser):
             n = 0
             if len(rest) > 2 and rest[2].isdigit():
                 n = int(rest[2])
+            # legacy columns after the setups: bf_diff (mm), MMYY, raw file
+            bf = to_float(rest[3]) if len(rest) > 3 and is_number(rest[3]) else None
+            ym = rest[4] if (len(rest) > 4 and rest[4].isdigit() and len(rest[4]) == 4) else ""
             src = ""
             tail = [x for x in rest[3:] if not is_number(x)]
             if tail:
                 src = tail[-1]
-            return f, t, dh, dist, n, src
+            return f, t, dh, dist, n, src, bf, ym
         return None
 
 

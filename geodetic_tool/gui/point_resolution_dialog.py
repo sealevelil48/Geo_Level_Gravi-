@@ -105,7 +105,8 @@ class PointResolutionDialog(tk.Toplevel):
                  notes: Optional[Dict[str, str]] = None,
                  statuses: Optional[Dict[str, str]] = None,
                  allow_defer: bool = False, round_no: int = 0,
-                 search_fn: Optional[Callable[[str, str], list]] = None):
+                 search_fn: Optional[Callable[[str, str], list]] = None,
+                 assigned: Optional[Dict[str, object]] = None):
         super().__init__(parent)
         self.result: Optional[dict] = None
         self._pids = list(target_points)
@@ -114,6 +115,7 @@ class PointResolutionDialog(tk.Toplevel):
         self._statuses = statuses or {}
         self._allow_defer = allow_defer
         self._search_fn = search_fn
+        self._assigned = dict(assigned or {})     # points already matched
         self._dirty: set = set()
         self._combo: Dict[str, ttk.Combobox] = {}
         self._items: Dict[str, list] = {}         # pid -> records aligned with combo values
@@ -318,7 +320,21 @@ class PointResolutionDialog(tk.Toplevel):
                 "(same location, different height).\nPlease choose one explicitly:\n\n  "
                 + "\n  ".join(missing), parent=self)
             return
-        self.result = self.get_resolved()
+        res = self.get_resolved()
+        from ..db.resolution import duplicate_assignments
+        picks = {p: r for p, r in res["records"].items()
+                 if res["modes"].get(p) == "use_selected" and p not in res["manual"]}
+        dups = duplicate_assignments(picks, self._assigned)
+        if dups and not messagebox.askyesno(
+                "Same benchmark twice",
+                "These field points would use a DB benchmark that is already used by "
+                "another field point (same record or within 1 m):\n\n  "
+                + "\n  ".join(f"{p} -> {res['records'][p].name}   =   {o}  ({d:.2f} m)"
+                               for p, o, d in dups)
+                + "\n\nTwo field IDs on one mark is almost always a wrong choice. "
+                  "Use it anyway?", parent=self):
+            return
+        self.result = res
         self._close()
 
     def _cancel(self) -> None:
@@ -356,10 +372,11 @@ class PointResolutionDialog(tk.Toplevel):
 def ask_point_resolution(parent) -> Callable[..., Optional[dict]]:
     """The *ask* callable for PointResolver.resolve(), showing this dialog."""
     def _ask(open_pids, scored, notes=None, statuses=None, allow_defer=False,
-             round_no=0, search_fn=None):
+             round_no=0, search_fn=None, assigned=None):
         dlg = PointResolutionDialog(parent, open_pids, scored, notes=notes,
                                     statuses=statuses, allow_defer=allow_defer,
-                                    round_no=round_no, search_fn=search_fn)
+                                    round_no=round_no, search_fn=search_fn,
+                                    assigned=assigned)
         parent.wait_window(dlg)
         return dlg.result
     return _ask

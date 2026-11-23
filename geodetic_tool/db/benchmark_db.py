@@ -945,11 +945,13 @@ class BenchmarkDBManager:
                              f"UPPER(COALESCE(kfar_aher_name, '')) LIKE %s"], \
                             [f"%{clean}%", f"%{clean}%", f"%{clean}%"]
             if re.sub(r"\s", "", clean).isdigit():
-                conds.append(f"{num} LIKE %s")
-                params.append(f"%{compact}%")
-                rank = (f"CASE WHEN {num} = %s THEN 0 WHEN {num} LIKE %s THEN 1 "
-                        f"WHEN {num} LIKE %s THEN 2 ELSE 3 END")
-                rparams = [compact, f"{compact}%", f"%{compact}%"]
+                # number-only: the exact number, then numbers STARTING with it
+                # ("117" -> 117/A, 1170/B; never 6177, which only contains it)
+                conds = [f"{num} LIKE %s",
+                         f"UPPER(COALESCE(kfar_aher_name, '')) LIKE %s"]
+                params = [f"{compact}%", f"%{clean}%"]
+                rank = f"CASE WHEN {num} = %s THEN 0 WHEN {num} LIKE %s THEN 1 ELSE 3 END"
+                rparams = [compact, f"{compact}%"]
             else:
                 conds += [f"{k_flat} LIKE %s", f"{k_rev} LIKE %s"]
                 params += [f"%{compact}%", f"%{compact}%"]

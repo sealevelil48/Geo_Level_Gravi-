@@ -63,6 +63,36 @@ def record_from_dict(d: dict) -> BenchmarkRecord:
     return BenchmarkRecord(**kw)
 
 
+def duplicate_assignments(choices: Dict[str, object], assigned: Dict[str, object],
+                          tol_m: float = 1.0) -> List[Tuple[str, str, float]]:
+    """Field IDs whose chosen DB record is the same benchmark as (same record,
+    or within *tol_m* of) the record of ANOTHER field ID.
+
+    *choices*: the dialog's picks {pid: rec}; *assigned*: points already
+    matched {pid: rec}.  Returns [(pid, other_pid, distance_m)].  Two field
+    IDs on one mark is almost always a wrong pick (e.g. '117' -> '6177/',
+    the twin of fixed point 6177)."""
+    out = []
+    pool = {p: r for p, r in assigned.items() if r is not None}
+    pool.update({p: r for p, r in choices.items() if r is not None})
+    for pid, rec in choices.items():
+        if rec is None or rec.x is None or rec.y is None:
+            continue
+        for other, orec in pool.items():
+            if other == pid or orec is None:
+                continue
+            same = hasattr(rec, "key") and hasattr(orec, "key") and rec.key() == orec.key()
+            if orec.x is None or orec.y is None:
+                if same:
+                    out.append((pid, other, 0.0))
+                continue
+            d = ((rec.x - orec.x) ** 2 + (rec.y - orec.y) ** 2) ** 0.5
+            if same or d <= tol_m:
+                out.append((pid, other, d))
+                break
+    return out
+
+
 def unique_points(lines) -> List[str]:
     return sorted({ln.start_point for ln in lines if ln.start_point}
                   | {ln.end_point for ln in lines if ln.end_point})
@@ -236,7 +266,8 @@ class PointResolver:
             res = ask(open_pids, scored, notes=notes,
                       statuses={p: net.status.get(p, "") for p in open_pids},
                       allow_defer=allow_defer, round_no=round_no,
-                      search_fn=self.make_search_fn(lines, batch, net.known))
+                      search_fn=self.make_search_fn(lines, batch, net.known),
+                      assigned={p: r for p, r in fixed.items() if r is not None})
             if res is None:
                 return None
 

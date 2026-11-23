@@ -127,7 +127,8 @@ def point_query_rank(query: str, name: str):
 
     * a number-only query ("117") is a point NUMBER: it matches the number
       part only, so "1/17" (number 1, letters 17 - glued it also reads
-      "117") is NOT a hit; 117/A, 117MSA (exact) rank before 1117B (contains);
+      "117") is NOT a hit; 117/A, 117MSA (exact) rank before 1170B (starts with);
+      numbers that only contain the digits (1117, 6177) do not match;
     * any other query matches the name with or without separators
       ("117/MSA" finds "117MSA" and vice versa): exact, then starts-with,
       then contains.
@@ -142,9 +143,7 @@ def point_query_rank(query: str, name: str):
             return 0
         if num.startswith(qd):
             return 1
-        if qd in num:
-            return 2
-        return None
+        return None                 # '6177' only contains '117': not a match
     qs, ns = PointNormalizer.strip_separators(q), PointNormalizer.strip_separators(n)
     if q == n or (qs and qs == ns):
         return 0

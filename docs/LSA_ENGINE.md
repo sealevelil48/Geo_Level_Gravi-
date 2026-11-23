@@ -63,6 +63,29 @@ contains no fixed point. A singular solution is never returned silently.
 between two known heights in proportion to distance (Directive ג2, App. C),
 and checks it against k·√L.
 
+## FA0 / FA1 files (legacy layout)
+
+Both are written exactly as the legacy adjustment program writes them;
+`K6177-64PU-65PU` is reproduced byte for byte (FA0) and line for line (FA1).
+
+* **Header** `npoints  nfixed  name`: the first *nfixed* listed points are the
+  fixed points. Other heights in the list are approximate heights.
+  **Auto-Select** takes exactly these fixed points when the loaded files
+  define them; DB heights are only offered when no loaded file does.
+* **Point IDs** keep the legacy layout: number right-aligned in 4 characters,
+  then the letters (`  64PU`, ` 117`, `2751ב`). Heights are aligned on the
+  decimal point; unknown heights are `.`.
+* **Observation rows** keep the measured columns read from FA0/REZ: setups,
+  B-F difference, MMYY and raw file (`24   0.87  0320  973.raw`). The last row
+  ends with `9`.
+* **FA1** prints two iterations, as the legacy program does: DATA (input
+  heights: fixed, approximate, unknown = 0.000), then `DH-(H2-H1)` against
+  those heights, ITERATION NO. 1 (ADJUSTED / APPROX / DIF / M.S.E.), then DATA
+  with the adjusted heights, `DH-(H2-H1)` against them, and ITERATION NO. 2.
+  **ALWD = 3 mm·√L** (as in the legacy FA1, whatever the class), DELTA =
+  |DH-(H2-H1)| − ALWD, `**` when DELTA > 0; SDIF = Σ|DH-(H2-H1)| in mm,
+  COEFF_CLASS K = SDIF/√SDIST. M.S.E. values are in metres.
+
 ## Outputs
 Summary (σ₀, degrees of freedom, BM-to-BM misclosures against k·√L),
 observations after Step 1, approximate heights, adjusted heights with σ and

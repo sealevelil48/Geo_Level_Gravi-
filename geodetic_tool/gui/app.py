@@ -848,6 +848,8 @@ class GeodeticToolGUI:
         self.file_paths: List[str] = []
         # Known heights read from .FA0 / .FA1 files {point_id: height}
         self.file_benchmarks: Dict[str, float] = {}
+        # Approximate heights listed in .FA0 / .FA1 files (not fixed)
+        self.file_approx: Dict[str, float] = {}
         # Benchmark DB: EPSG:2039 coordinates of the project's points
         # {point_id: PointCoordinate} and the Point Verification state
         self.point_coords: Dict[str, Any] = {}
@@ -1056,15 +1058,34 @@ class GeodeticToolGUI:
         ]
         
         self.detail_vars = {}
+        self._detail_line = None
+        from ..validators import MEASURE_METHODS
         for i, (label_text, var_name) in enumerate(labels):
             ttk.Label(details, text=label_text).grid(row=i, column=0, sticky=tk.W, padx=5, pady=2)
             var = tk.StringVar(value="-")
             self.detail_vars[var_name] = var
-            ttk.Label(details, textvariable=var).grid(row=i, column=1, sticky=tk.W, padx=5, pady=2)
-        
+            if var_name == "method":
+                # editable: measure method of this line
+                self.method_combo = ttk.Combobox(details, textvariable=var, state="readonly",
+                                                 values=list(MEASURE_METHODS), width=10, height=12)
+                self.method_combo.bind("<<ComboboxSelected>>", self._on_line_method_changed)
+                self.method_combo.grid(row=i, column=1, sticky=tk.W, padx=5, pady=2)
+            else:
+                ttk.Label(details, textvariable=var).grid(row=i, column=1, sticky=tk.W, padx=5, pady=2)
+        # editable: precision class of this line ("Project" = the project class)
+        r = len(labels)
+        ttk.Label(details, text="Precision Class / דרגת דיוק:").grid(row=r, column=0, sticky=tk.W,
+                                                                    padx=5, pady=2)
+        self.line_class_var = tk.StringVar(value="Project")
+        self.line_class_combo = ttk.Combobox(details, textvariable=self.line_class_var,
+                                             state="readonly", width=10, height=12,
+                                             values=["Project", "H1", "H2", "H3", "H4", "H5", "H6"])
+        self.line_class_combo.bind("<<ComboboxSelected>>", self._on_line_class_changed)
+        self.line_class_combo.grid(row=r, column=1, sticky=tk.W, padx=5, pady=2)
+
         # Quick action button
         ttk.Button(details, text="Adjust This Line / תאם קו זה", 
-                   command=self._adjust_selected_line).grid(row=len(labels), column=0, columnspan=2, pady=10)
+                   command=self._adjust_selected_line).grid(row=r + 1, column=0, columnspan=2, pady=10)
         
         # Setups table
         setups_frame = ttk.LabelFrame(parent, text="Setups / מעמדים")
@@ -1205,6 +1226,11 @@ class GeodeticToolGUI:
             params = get_class_parameters_by_name(selected_class)
             self._set_status(f"Active class set to {selected_class} (Tolerance: ±{params.tolerance_coefficient}mm√L)")
             self._log(f"Active leveling class changed to {selected_class}")
+            # re-validate with the new project class
+            if self.lines:
+                self._validate_all()
+                if self._detail_line is not None:
+                    self._show_line_details(self._detail_line)
         else:
             messagebox.showerror("Error", "Failed to save class selection")
             self._set_status("Error saving class selection")
@@ -1349,7 +1375,11 @@ Special Requirements:"""
         self.point_origin = resolver.point_origin
         for old, new in outcome.remap.items():
             if old in self.file_benchmarks and new not in self.file_benchmarks:
-                self.file_benchmarks[new] = self.file_benchmarks.pop(old)
+                # keep the header order of the fixed points
+                self.file_benchmarks = {(new if k == old else k): v
+                                        for k, v in self.file_benchmarks.items()}
+            if old in self.file_approx and new not in self.file_approx:
+                self.file_approx[new] = self.file_approx.pop(old)
             self._log(f"Point Verification: '{old}' -> '{new}'")
         if outcome.excluded:
             self._log("Point Verification: excluded " + ", ".join(sorted(outcome.excluded)))
@@ -1457,6 +1487,7 @@ Special Requirements:"""
                     line.source_path = str(Path(file_path).resolve())
                 parsed_files.append((file_path, parsed,
                                      dict(getattr(parser, "benchmarks", None) or {})))
+                self.file_approx.update(getattr(parser, "approx_heights", None) or {})
             except Exception as e:
                 self._log(f"Error loading {Path(file_path).name}: {str(e)}")
 
@@ -1519,6 +1550,7 @@ Special Requirements:"""
         self.lines.clear()
         self.file_paths.clear()
         self.file_benchmarks.clear()
+        self.file_approx.clear()
         self.point_coords = {}             # point choices (overrides) are kept
         db = self._db()
         if db is not None:
@@ -1577,8 +1609,44 @@ Special Requirements:"""
         finally:
             self.file_context_menu.grab_release()
     
+    def _project_class(self) -> str:
+        try:
+            return self.class_selector_var.get() or "H3"
+        except Exception:
+            return "H3"
+
+    def _on_line_method_changed(self, event=None):
+        line = self._detail_line
+        if line is None:
+            return
+        new = self.detail_vars["method"].get()
+        if new and new != line.method:
+            self._log(f"{line.filename}: measure method {line.method} -> {new}")
+            line.method = new
+            self._after_line_setting_change(line)
+
+    def _on_line_class_changed(self, event=None):
+        line = self._detail_line
+        if line is None:
+            return
+        val = self.line_class_var.get()
+        new = None if val == "Project" else val
+        if new != getattr(line, "leveling_class", None):
+            self._log(f"{line.filename}: precision class "
+                      f"{line.leveling_class or 'project'} -> {new or 'project'}")
+            line.leveling_class = new
+            self._after_line_setting_change(line)
+
+    def _after_line_setting_change(self, line):
+        """Re-validate after a class / method edit and refresh the views."""
+        self._show_line_details(line)
+        if hasattr(self, "validation_tree") and self.validation_tree.get_children():
+            self._validate_all()
+
     def _show_line_details(self, line: LevelingLine):
         """Display details for selected line."""
+        self._detail_line = line
+        self.line_class_var.set(getattr(line, "leveling_class", None) or "Project")
         self.detail_vars['filename'].set(line.filename or "-")
         self.detail_vars['start_point'].set(line.start_point or "-")
         self.detail_vars['end_point'].set(line.end_point or "-")
@@ -1587,9 +1655,9 @@ Special Requirements:"""
         self.detail_vars['distance'].set(f"{line.total_distance:.2f} m")
         self.detail_vars['height_diff'].set(f"{line.total_height_diff:.5f} m")
 
-        # Show actual validation result, not cached status
-        validator = BatchValidator()
-        validation_result = validator.validate_batch([line])[0][1]
+        # Show actual validation result with the line's own class
+        from ..validators import validate_lines
+        validation_result = validate_lines([line], self._project_class())[0][1]
         if validation_result.is_valid:
             status_text = "valid - all checks passed"
             if validation_result.warnings:
@@ -1661,9 +1729,9 @@ Special Requirements:"""
                 double_run_map[id(fwd)] = {'pair': ret, 'delta_h': delta_h_mm}
                 double_run_map[id(ret)] = {'pair': fwd, 'delta_h': delta_h_mm}
 
-        # Validate all lines
-        validator = BatchValidator()
-        results = validator.validate_batch(self.lines)
+        # Validate all lines (each with its own class, else the project class)
+        from ..validators import validate_lines
+        results = validate_lines(self.lines, self._project_class())
 
         for line, result in results:
             # Item 2: Enhanced status with specific failure reasons
@@ -1811,7 +1879,8 @@ Special Requirements:"""
         win = AdjustmentWindow(self.root, self.lines, leveling_class=cls,
                                known_heights=self.file_benchmarks,
                                selected_lines=selected_lines, project_name=name,
-                               db_heights=self._db_heights if self._db() else None)
+                               db_heights=self._db_heights if self._db() else None,
+                               approx_heights=self.file_approx)
         self.root.wait_window(win)
         if win.result is not None:
             self._log(f"Adjustment completed ({win.result.method}, "

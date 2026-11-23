@@ -36,7 +36,8 @@ class AdjustmentWindow(tk.Toplevel):
     def __init__(self, parent, lines, leveling_class: str = "H3",
                  known_heights: Optional[Dict[str, float]] = None,
                  selected_lines=None, project_name: str = "geo_level",
-                 output_dir: str = "", db_heights=None):
+                 output_dir: str = "", db_heights=None,
+                 approx_heights: Optional[Dict[str, float]] = None):
         super().__init__(parent)
         self.title("Network Adjustment (LSA) / תיאום רשת")
         fit_to_screen(self, 1280, 780)
@@ -44,6 +45,9 @@ class AdjustmentWindow(tk.Toplevel):
         self.known_heights = dict(known_heights or {})
         # db_heights(pids) -> {pid: height}: one batched benchmark-DB lookup
         self.db_heights = db_heights
+        # approximate heights listed in the loaded FA0 / FA1 (not fixed)
+        self.approx_heights = dict(approx_heights or {})
+        self._run_obs = None             # observations of the last run (FA1)
         self.project_name = project_name or "geo_level"
         self.output_dir = output_dir or ""
         self.result = None
@@ -257,19 +261,26 @@ class AdjustmentWindow(tk.Toplevel):
         self.fp_tree.delete(*self.fp_tree.get_children())
 
     def auto_select(self):
-        """Points of the ticked lines with a known height: from the loaded
-        FA0/FA1 files first, else from the benchmark DB."""
+        """Fixed points for the ticked lines.
+
+        When the loaded FA0 / FA1 files define fixed points (the first N
+        points listed, N from the header), exactly those are selected, in the
+        file's order.  Only when no loaded file defines fixed points for these
+        lines are DB heights offered instead."""
         lines = self.active_lines()
-        pts = sorted({p for ln in lines for p in (ln.start_point, ln.end_point) if p})
-        heights = {}
-        if self.db_heights is not None:
-            try:
-                heights.update(self.db_heights([p for p in pts
-                                                if p not in self.known_heights]) or {})
-            except Exception:
-                pass
-        heights.update({p: self.known_heights[p] for p in pts if p in self.known_heights})
-        rows = [(p, f"{heights[p]:.4f}") for p in pts if p in heights]
+        on_lines = {p for ln in lines for p in (ln.start_point, ln.end_point) if p}
+        file_fixed = [p for p in self.known_heights if p in on_lines]
+        if file_fixed:
+            rows = [(p, f"{self.known_heights[p]:.4f}") for p in file_fixed]
+        else:
+            pts = sorted(on_lines)
+            heights = {}
+            if self.db_heights is not None:
+                try:
+                    heights.update(self.db_heights(pts) or {})
+                except Exception:
+                    pass
+            rows = [(p, f"{heights[p]:.4f}") for p in pts if p in heights]
         if len(lines) == 1:
             have = {p for p, _ in rows}
             rows += [(p, "") for p in (lines[0].start_point, lines[0].end_point)
@@ -373,6 +384,7 @@ class AdjustmentWindow(tk.Toplevel):
         try:
             res = Adj(weight_mode=self._weight_mode(), leveling_class=cls).adjust(
                 obs, fixed, known_heights=self.known_heights)
+            self._run_obs = list(obs)
         except NetworkDatumError as exc:
             self.result = None
             self._set_result_buttons(False)
@@ -457,7 +469,7 @@ class AdjustmentWindow(tk.Toplevel):
             return
         from ..exporters import FA0Exporter
         FA0Exporter().export(path, [Benchmark(point_id=k, height=v) for k, v in fixed.items()],
-                             obs, f"{self.project_name}.rez")
+                             obs, self.project_name, approx_heights=self.approx_heights)
         messagebox.showinfo("Export FA0", f"Written:\n{path}", parent=self)
 
     def export_fa1(self):
@@ -467,15 +479,17 @@ class AdjustmentWindow(tk.Toplevel):
         if not path:
             return
         from ..exporters import FA1Exporter
-        obs = [MeasurementSummary(from_point=o["from"], to_point=o["to"],
-                                  height_diff=o["measured_dh"], distance=o["distance"],
-                                  num_setups=o.get("num_setups", 0) or 0, bf_diff=0.0,
-                                  year_month="", source_file=o.get("source", ""))
-               for o in self.result.observations]
+        obs = self._run_obs or [
+            MeasurementSummary(from_point=o["from"], to_point=o["to"],
+                               height_diff=o["measured_dh"], distance=o["distance"],
+                               num_setups=o.get("num_setups", 0) or 0, bf_diff=0.0,
+                               year_month="", source_file=o.get("source", ""))
+            for o in self.result.observations]
         FA1Exporter().export(path, [Benchmark(point_id=k, height=v)
                                     for k, v in self.fixed_points.items()],
-                             obs, self.result, f"{self.project_name}.rez",
-                             leveling_class=self.class_var.get())
+                             obs, self.result, self.project_name,
+                             leveling_class=self.class_var.get(),
+                             approx_heights=self.approx_heights)
         messagebox.showinfo("Export FA1", f"Written:\n{path}", parent=self)
 
     def export_pdf(self):

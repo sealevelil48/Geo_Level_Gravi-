@@ -75,7 +75,7 @@ class Asker:
         self.answer = answer
 
     def __call__(self, open_pids, scored, notes=None, statuses=None, allow_defer=False,
-                 round_no=0, search_fn=None):
+                 round_no=0, search_fn=None, assigned=None):
         self.calls.append({"pids": list(open_pids), "statuses": dict(statuses or {}),
                            "scored": scored, "search_fn": search_fn})
         if self.answer is None:
@@ -318,3 +318,79 @@ class TestLegacySummaryFiles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLegacyLayout(unittest.TestCase):
+    """FA0 / FA1 are written in the legacy program's exact layout."""
+
+    def _net(self):
+        from geodetic_tool.config.models import Benchmark, MeasurementSummary
+        rows = [("64PU", "875U", -43.1156, 663.0, 24, 0.87, "0320"),
+                ("875U", "117", 10.6667, 993.0, 19, 1.66, "0620"),
+                ("117", "2751ב", 5.0, 400.0, 10, -3.98, "0620"),
+                ("2751ב", "64PU", 27.4505, 500.0, 12, 0.5, "0520")]
+        obs = [MeasurementSummary(from_point=f, to_point=t, height_diff=dh, distance=d,
+                                  num_setups=n, bf_diff=bf, year_month=ym, source_file="973.raw")
+               for f, t, dh, d, n, bf, ym in rows]
+        return obs, [Benchmark(point_id="64PU", height=75.795)]
+
+    def test_fa0_rows_and_idempotent(self):
+        from geodetic_tool.exporters import FA0Exporter, legacy_point_id
+        self.assertEqual([legacy_point_id(p) for p in ("64PU", "117", "2751ב", "PKT1")],
+                         ["  64PU", " 117", "2751ב", "PKT1"])
+        obs, bms = self._net()
+        d = tempfile.mkdtemp()
+        a = os.path.join(d, "a.FA0")
+        FA0Exporter().export(a, bms, obs, "NET", approx_heights={"875U": 32.67})
+        raw = open(a, "rb").read()
+        self.assertIn(b"\r\n", raw)
+        rows = raw.decode("cp1255").split("\r\n")
+        self.assertEqual(rows[0], "   4   1" + " " * 22 + "NET".ljust(49) + "9")
+        self.assertEqual(rows[1], "      64PU        75.795")
+        self.assertEqual(rows[2], "     117            .")            # unknown
+        self.assertEqual(rows[4], "     875U         32.67")          # decimal-aligned
+        self.assertEqual(rows[5], "  64PU    875U      -43.11560   663.  24   0.87  0320"
+                                  "           973.raw       ")
+        self.assertTrue(rows[-2].endswith("973.raw        9 "))
+        # read back and write again: identical file
+        p = create_parser(a)
+        lines = p.parse_many(a)
+        from geodetic_tool.engine.least_squares import lines_to_observations
+        from geodetic_tool.config.models import Benchmark
+        b = os.path.join(d, "b.FA0")
+        FA0Exporter().export(b, [Benchmark(point_id=k, height=v) for k, v in p.benchmarks.items()],
+                             lines_to_observations(lines), "NET", approx_heights=p.approx_heights)
+        self.assertEqual(open(b, "rb").read(), raw)
+
+    def test_fa1_two_iterations_alwd_3mm(self):
+        from geodetic_tool.engine.least_squares import LeastSquaresAdjuster
+        from geodetic_tool.exporters import FA1Exporter
+        obs, bms = self._net()
+        res = LeastSquaresAdjuster().adjust(obs, {"64PU": 75.795})
+        path = os.path.join(tempfile.mkdtemp(), "n.FA1")
+        FA1Exporter().export(path, bms, obs, res, "NET", leveling_class="H3",
+                             approx_heights={"875U": 32.67})
+        txt = open(path, "rb").read().decode("cp1255")
+        self.assertEqual(txt.count("ITERATION  NO. 1"), 1)
+        self.assertEqual(txt.count("ITERATION  NO. 2"), 1)
+        self.assertEqual(txt.count("                                                           DATA"), 3)
+        # ALWD = 3 mm * sqrt(0.663 km) whatever the class
+        self.assertIn("    0.002443", txt)
+        # last observation row of each table carries KOD 9
+        self.assertEqual(txt.count("    9    0- 0      0"), 2)
+        p = create_parser(path)
+        self.assertEqual(len(p.parse_many(path)), 4)
+        self.assertEqual(p.benchmarks, {"64PU": 75.795})
+
+
+class TestDuplicateGuard(unittest.TestCase):
+    def test_same_mark_two_ids(self):
+        from geodetic_tool.db.resolution import duplicate_assignments
+        db = FakeDB()
+        a = db.get_candidates("9001X", include_twins=False)[0]
+        near = record_from_dict(dict(record_to_dict(a), name="X9", mispar_nekuda=9,
+                                     objectid=99, x=a.x + 0.4, y=a.y))
+        far = db.get_candidates("2751B", include_twins=False)[0]
+        self.assertEqual([(p, o) for p, o, _ in duplicate_assignments({"117": near}, {"9001X": a})],
+                         [("117", "9001X")])
+        self.assertEqual(duplicate_assignments({"117": far}, {"9001X": a}), [])

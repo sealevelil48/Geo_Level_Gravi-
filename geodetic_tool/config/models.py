@@ -89,6 +89,12 @@ class LevelingLine:
     # the file = one line; its setups are evenly split placeholders that keep
     # the setup count, so setup-level field checks are not applied.
     is_summary: bool = False
+    # Summary-file columns kept for FA0 / FA1 export (legacy layout)
+    bf_diff: Optional[float] = None    # sum of B-F differences, mm
+    year_month: str = ""               # MMYY of the measurement
+    source_file: str = ""              # raw file name, e.g. '973.raw'
+    # Precision class of this line ('H1'..'H6'); None = the project class
+    leveling_class: Optional[str] = None
     
     @property
     def num_setups(self) -> int:

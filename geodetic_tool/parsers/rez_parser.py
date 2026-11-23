@@ -61,10 +61,19 @@ class RezParser(BaseParser):
                 if m:
                     rest = [m.group(1), m.group(2)] + rest[1:]
             n = int(rest[0]) if rest and rest[0].isdigit() else 0
-            status = status_from_text(rest[1]) if len(rest) > 1 else None
-            src = rest[2] if len(rest) > 2 else ""
+            bf, ym = None, ""
+            if len(rest) > 1 and is_number(rest[1]):
+                # legacy layout: setups  bf_diff  MMYY  raw-file
+                bf = to_float(rest[1])
+                ym = rest[2] if len(rest) > 2 and rest[2].isdigit() else ""
+                src = rest[3] if len(rest) > 3 else (rest[2] if len(rest) > 2 and not ym else "")
+                status = None
+            else:
+                # this tool's export: setups  status  file
+                status = status_from_text(rest[1]) if len(rest) > 1 else None
+                src = rest[2] if len(rest) > 2 else ""
             lines.append(summary_line(stem, len(lines) + 1, f, t, dh, dist, n, src,
-                                      status=status,
+                                      status=status, bf_diff=bf, year_month=ym,
                                       source_path=str(Path(filepath).resolve())))
             logger.debug(".rez row %d: %s -> %s dH=%.5f L=%.1f setups=%d",
                          no, f, t, dh, dist, n)

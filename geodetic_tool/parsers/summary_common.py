@@ -47,6 +47,8 @@ def summary_line(
     source: str = "",
     status: Optional[LineStatus] = None,
     source_path: Optional[str] = None,
+    bf_diff: Optional[float] = None,
+    year_month: str = "",
 ) -> LevelingLine:
     """Build one editable LevelingLine from one summary-file row."""
     n = int(num_setups) if num_setups and int(num_setups) > 0 else 1
@@ -68,6 +70,9 @@ def summary_line(
         status=status or LineStatus.VALID, source_path=source_path,
     )
     line.is_summary = True
+    line.bf_diff = bf_diff
+    line.year_month = year_month or ""
+    line.source_file = source or ""
     return line
 
 

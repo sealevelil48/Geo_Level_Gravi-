@@ -98,6 +98,7 @@ def merge_observations(
     (the mean of n runs has weight n / L).
     """
     groups: Dict[frozenset, List[Tuple[str, str, float, float, int, str]]] = {}
+    first_obs: Dict[frozenset, object] = {}
     order: List[frozenset] = []
     for o in observations:
         f, t, dh, d, n, src = _obs_fields(o)
@@ -106,6 +107,7 @@ def merge_observations(
         key = frozenset((f, t))
         if key not in groups:
             groups[key] = []
+            first_obs[key] = o
             order.append(key)
         groups[key].append((f, t, dh, d, n, src))
 
@@ -130,11 +132,17 @@ def merge_observations(
             disc = (max(reduced) - min(reduced)) * 1000.0
             ok = abs(disc) <= allowed
         sources = [s for *_, s in runs if s]
+        if len(runs) == 1:
+            # a single run keeps its own columns (FA0 / FA1 export)
+            o0 = first_obs[key]
+            bf = getattr(o0, "bf_diff", None) or 0.0
+            ym = getattr(o0, "year_month", "") or ""
+        else:
+            bf, ym = disc, ""
         ms = MeasurementSummary(
             from_point=f0, to_point=t0, height_diff=mean_dh, distance=dist,
             num_setups=max(int(r[4] or 0) for r in runs),
-            bf_diff=0.0 if disc is None else disc,
-            year_month="", source_file=" + ".join(sources),
+            bf_diff=bf, year_month=ym, source_file=" + ".join(sources),
         )
         ms.n_runs = len(reduced)
         merged.append(ms)

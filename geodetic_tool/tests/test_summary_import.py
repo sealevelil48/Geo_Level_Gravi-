@@ -125,7 +125,8 @@ class TestFA1(SummaryImportBase):
         self.assertEqual(detect_file_format(path), FileFormat.FA1)
         p = create_parser(path)
         lines = p.parse_many(path)
-        self.check_lines(lines)
+        # the legacy FA1 layout prints NO.SH 0: setup counts come from the FA0
+        self.check_lines(lines, expect_setups=False)
         self.assertEqual(p.benchmarks, KNOWN)
 
 
