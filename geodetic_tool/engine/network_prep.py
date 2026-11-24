@@ -59,10 +59,33 @@ def class_number(leveling_class) -> int:
     return n if n in CLASS_K_MM else 3
 
 
+def class_k_mm(leveling_class=3) -> float:
+    """k (mm/sqrt(km)) of a class.  Reads the live class registry, so values
+    edited in Settings -> Class Parameters apply here exactly as in line
+    validation; the Directive defaults (CLASS_K_MM) are the fallback."""
+    n = class_number(leveling_class)
+    try:
+        from geodetic_tool.config.israel_survey_regulations import CLASS_REGISTRY
+        k = float(CLASS_REGISTRY[n].tolerance_coefficient)
+        if k > 0:
+            return k
+    except Exception:
+        pass
+    return CLASS_K_MM[n]
+
+
 def tolerance_mm(distance_m: float, leveling_class=3) -> float:
     """Allowed misclosure in mm for a one-direction length *distance_m*."""
-    k = CLASS_K_MM[class_number(leveling_class)]
-    return k * math.sqrt(max(distance_m, 0.0) / 1000.0)
+    return class_k_mm(leveling_class) * math.sqrt(max(distance_m, 0.0) / 1000.0)
+
+
+def achieved_class(discrepancy_mm: float, distance_m: float) -> Optional[int]:
+    """Best (lowest) class whose k*sqrt(L) the discrepancy meets; None when
+    it exceeds even H6."""
+    for n in sorted(CLASS_K_MM):
+        if abs(discrepancy_mm) <= tolerance_mm(distance_m, n) + 1e-9:
+            return n
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -149,6 +172,79 @@ def merge_observations(
         report.append(MergedRun(f0, t0, mean_dh, dist, len(reduced), reduced,
                                 sources, disc, allowed, ok))
     return merged, report
+
+
+@dataclass
+class DoubleRunResult:
+    """One section measured more than once (Directive G2 App. C check)."""
+    from_point: str             # forward direction = first run
+    to_point: str
+    runs: list                  # the LevelingLine objects, forward first
+    leveling_class: str         # class the check was made against ("H3")
+    forward_dh: float           # m, first run
+    return_dh: Optional[float]  # m, second run in ITS OWN direction (2 runs)
+    same_direction: bool        # repeat in the same direction (not fwd/ret)
+    mean_dh: float              # m, in the forward direction
+    distance: float             # m, one-direction L (mean of the runs)
+    discrepancy_mm: float       # delta = dH_fwd + dH_ret (spread for > 2 runs)
+    allowed_mm: float           # k * sqrt(L_km)
+    ok: bool
+    achieved: Optional[int]     # best class met (None = exceeds H6)
+
+    @property
+    def n_runs(self) -> int:
+        return len(self.runs)
+
+
+def analyze_double_runs(lines: Sequence, project_class="H3") -> List[DoubleRunResult]:
+    """Double-run check of Directive G2 (2021), Appendix C, for every section
+    measured more than once (forward / return, or repeats).
+
+    * Pairing: by section (unordered end points), unused lines skipped; the
+      first run (input order) is the forward direction.
+    * delta = dH_fwd + dH_ret (return in its own direction); with three or
+      more runs the spread max - min of the runs reduced to the forward
+      direction.
+    * |delta| <= k*sqrt(L), L = ONE-direction length in km (mean of the runs),
+      k of the line's class (``leveling_class``, else the project class).
+    * mean dH = (dH_fwd - dH_ret) / 2, sign of the forward direction.
+
+    The numbers come from :func:`merge_observations` (Step 1 of the
+    adjustment), so this table and the LSA use identical values."""
+    groups: Dict[frozenset, list] = {}
+    order: List[frozenset] = []
+    for ln in lines:
+        if not getattr(ln, "is_used", True):
+            continue
+        f, t, *_ = _obs_fields(ln)
+        if not f or not t or f == t:
+            continue
+        key = frozenset((f, t))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(ln)
+
+    out: List[DoubleRunResult] = []
+    for key in order:
+        runs = groups[key]
+        if len(runs) < 2:
+            continue
+        cls = getattr(runs[0], "leveling_class", None) or project_class or "H3"
+        cls_name = f"H{class_number(cls)}"
+        _merged, report = merge_observations(runs, cls_name)
+        r = report[0]
+        f0, t0, dh0, *_ = _obs_fields(runs[0])
+        f1, t1, dh1, *_ = _obs_fields(runs[1])
+        disc = float(r.discrepancy_mm or 0.0)
+        out.append(DoubleRunResult(
+            from_point=f0, to_point=t0, runs=list(runs), leveling_class=cls_name,
+            forward_dh=dh0, return_dh=dh1 if len(runs) == 2 else None,
+            same_direction=(len(runs) == 2 and f1 == f0),
+            mean_dh=r.mean_dh, distance=r.distance, discrepancy_mm=disc,
+            allowed_mm=r.allowed_mm, ok=bool(r.within_tolerance),
+            achieved=achieved_class(disc, r.distance)))
+    return out
 
 
 def _obs_fields(o):

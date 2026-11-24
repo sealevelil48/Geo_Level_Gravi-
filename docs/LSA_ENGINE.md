@@ -17,7 +17,14 @@ dH = (dH_fwd − dH_ret) / 2          (return run reversed to the forward direct
 ```
 
 L is the **one-direction** length in km and k is the class coefficient
-(H1 3, H2 5, H3 10, H4 20, H5 30, H6 60 mm). The mean of n runs gets weight n/L.
+(H1 3, H2 5, H3 10, H4 20, H5 30, H6 60 mm; values edited in Class
+Parameters apply). The mean of n runs gets weight n/L. With three or more runs
+δ is the spread (max − min) of the runs reduced to the forward direction.
+
+**Detect Double-Runs** uses the same numbers (`analyze_double_runs()`):
+unused lines are skipped, the first run of a section is the forward run, the
+class is the line's own class (else the project class), and "class met" is the
+best class whose k·√L the δ meets.
 
 ### Step 2: approximate heights
 `approximate_heights()` runs a multi-source Dijkstra from the fixed points
@@ -98,3 +105,10 @@ FA1 (adjusted heights) and a PDF report.
 fixed points RFH-95/96/97, giving A = 121.344, B = 117.573, C = 110.190,
 D = 102.764 and σ₀ = 4.512. Both methods agree to 0.1 mm. The tests also cover
 Step 1 averaging, Step 2, the datum error and single-line adjustment.
+
+`test_double_runs.py` reproduces the worked example of Directive ג2,
+Appendix C (line A–1–2–3–4–B, H1): every δ, mean ΔH, the line sum 10.8004 m
+and f_H = 6.4 mm. Note: that example's "allowed" column prints 2·√L
+(±1.9 mm for 0.907 km) while its own header and Appendix B 4.1 give
+3 mm·√L for H1; the engine follows the formula (±2.9 mm there). All five
+sections pass either way.

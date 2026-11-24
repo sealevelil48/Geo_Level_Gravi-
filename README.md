@@ -25,8 +25,10 @@ and loops, and least-squares adjustment with FA0 / FA1 / PDF output.
 | **Benchmark database** | PostgreSQL/PostGIS control-point table (e.g. `cp_bangal` / `public.cp_table`). On loading, every field ID is matched to the DB (ASCII ↔ Hebrew forms, with or without `/`); duplicated names are resolved by comparing DB distances with the measured line lengths. Open cases go to the **Point Verification** dialog (12-row candidate lists, **Search DB**, twins, *Decide later*). Same batched, cached lookups as the plugin: one connection, a few queries per load. |
 | **Coordinates** | EPSG:2039 coordinates from the DB (spatial-median / k=1 centroid for unverified duplicates); points missing from the DB are estimated from the measured network. Stored in the project benchmarks, used for GeoJSON (WGS 84, same transformation as QGIS) and DB heights in the adjustment window (*Auto-Select*, *Fetch from DB*). |
 | **Validation** | Classes H1–H6: misclosure k·√L, sight lengths, BF/BFFB method, endpoint and naming checks. Lines can be reversed or excluded; the removed-files report keeps track. |
-| **Analysis** | Double-run detection, loop finder, line merging (with direction alignment), point exclusion with search. |
-| **Per-line settings** | In Line Details each line has its own **Precision class** (or the project class) and **Measure method** (BF / BFFB / BBFF); changing them, or the project class in the status bar, re-validates at once. Saved with the project. |
+| **Analysis** | **Double-runs** per Directive ג2 App. C: sections measured more than once are paired (first run = forward, unused lines skipped), δ = ΔH fwd + ΔH ret checked against k·√L (L one direction, the line's class), mean ΔH = (ΔH fwd − ΔH ret)/2 — the same numbers as Step 1 of the adjustment; "class met" shows the best class reached (or "exceeds H6"). Loop finder, line merging (with direction alignment), point exclusion with search. |
+| **Class & method** | Left panel, **Precision Class** (under Toggle Dir / Toggle Use): one **Class** (default **H3**) and one **Method** (default **BFFB**; BF / BFFB / BBFF) for the whole project — they apply to every line and re-validate at once. When a raw file's readings show a different method the Log tab warns. |
+| **Project folder** | A new project is named after the first file's header description (FA0/FA1 title such as `K6177-64PU-65PU`, the REZ project name, else the file name) plus the start time: `K6177-64PU-65PU_24_11_2026_9_57` (Windows-safe). The app asks once where to create it and makes `<that folder>/<name>/`, holding `<name>.json` (saved automatically after each load), exports (FTEG/GeoJSON, QGIS, FA0/FA1/PDF from the adjustment window) and `<name>.log`, kept up to date. *Project → Export Project as ZIP…* packs it. |
+| **Log** | Timestamped entries (warnings/errors coloured), including the tool's own Python logging. **Export Log…** (Log tab or Project menu) saves `.log` / `.txt` (UTF-8). |
 | **Adjustment** (one window) | Step 1: forward/return runs averaged and checked against k·√L (one-direction L). Step 2: approximate heights. Parametric (V = AX − L) or conditional (Bv + w = 0) least squares; weights by distance, setups or equal; single-line adjustment. Export **FA0**, **FA1** (identical to the legacy program's layout), **PDF report**. See [docs/LSA_ENGINE.md](docs/LSA_ENGINE.md). |
 | **Projects** | Save / load as JSON or pickle; joint projects merge several projects without changing the sources. Saves are atomic: written to temp space, then moved into place, so a failed save never damages the previous file. |
 | **GIS** | GeoJSON export with QGIS styles; positions of points without coordinates estimated from the measured network (topology estimator). |
@@ -75,14 +77,17 @@ Linux install `python3-tk`.
 ```bash
 python run_gui.py
 ```
-1. **File → Open Files / Open Folder**, then choose the class (H1–H6) in the status bar.
+1. Check **Class** / **Method** in the Precision Class panel (H3 / BFFB by default),
+   then **File → Open Files / Open Folder** (folders are searched recursively) and
+   choose where the project folder is created.
    With a database configured, **Point Verification** opens for points that need a
    decision; *Cancel Loading* loads nothing. Choices are saved with the project.
 2. **Analysis → Validate All**: red lines are invalid; check *Line Details* and the messages.
 3. **Analysis → Network Adjustment (LSA)** → *Prepare (Steps 1–2)* → choose
    fixed points → *Run* → *Export FA0 / FA1 / PDF*.
    *Line Adjustment* opens the same window for a single line.
-4. **Project → Save Project** (JSON or pickle).
+4. The project is saved in its folder automatically; **Project → Save Project**
+   saves it elsewhere / as pickle.
 
 Windows open sized to the screen, so they fit 1366×768 laptops.
 
@@ -125,6 +130,8 @@ geodetic_tool/
 ├── config/         models, class parameters, settings, project manager
 ├── gui/            app.py (main window and dialogs), adjustment_window.py,
 │                   point_resolution_dialog.py, db_settings_dialog.py, window_utils.py
+├── project_naming.py  <Description>_DD_MM_YYYY_H_MM names, project folder, ZIP
+├── project_log.py  log format, project .log file, Export Log, logging capture
 ├── cli/            command-line interface
 └── tests/          pytest unit tests
 tests/              script tests (LSA demo, class selector)
@@ -135,7 +142,7 @@ run_gui.py, run_cli.py, setup.py
 ## Tests
 
 ```bash
-python -m pytest geodetic_tool/tests     # LSA, Steps 1-2, FA0/FA1/REZ, topology, DB resolver, ITM
+python -m pytest geodetic_tool/tests     # LSA, Steps 1-2, double runs (App. C), FA0/FA1/REZ, naming, topology, DB resolver, ITM
 python tests/test_point_resolution.py    # DB point matching (same suite as the plugin)
 python tests/test_lsa.py                 # parametric + conditional demo
 python tests/test_class_selector.py

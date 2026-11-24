@@ -43,6 +43,10 @@ class RezParser(BaseParser):
         lines: List[LevelingLine] = []
         for no, raw in enumerate(rows, start=1):
             text = raw.strip()
+            if text.startswith("#") and not self.title:
+                m = re.match(r"^#\s*REZ Summary File\s*-\s*(.+)$", text, re.I)
+                if m:
+                    self.title = m.group(1).strip()
             if not text or text.startswith("#") or set(text) <= set("-=| "):
                 continue
             toks = ([t.strip() for t in text.split("|") if t.strip()]

@@ -81,6 +81,7 @@ class FA1Parser(BaseParser):
                 if (n_fixed is None and not data_order and len(toks) >= 3
                         and toks[0].isdigit() and toks[1].isdigit() and not is_number(toks[2])):
                     n_fixed = int(toks[1])
+                    self.title = " ".join(toks[2:]).strip()
                     continue
                 # "idx  point  height"
                 if len(toks) == 3 and toks[0].isdigit() and is_number(toks[2]):

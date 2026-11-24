@@ -30,6 +30,9 @@ from ..config.models import LevelingLine, Benchmark, AdjustmentResult
 from ..config.settings import FileFormat, calculate_tolerance, is_benchmark
 import warnings
 
+DEFAULT_CLASS = "H3"         # project precision class of a new project
+DEFAULT_METHOD = "BFFB"      # project measure method of a new project
+
 # Matplotlib imports - gracefully handle if not available
 try:
     import matplotlib
@@ -870,11 +873,20 @@ class GeodeticToolGUI:
         from ..config.project_manager import ProjectManager
         self.current_project: Optional[ProjectData] = ProjectData(name="Unnamed Project")
         self.project_manager = ProjectManager()
+        # One measure method for every line (Precision Class panel)
+        self.project_method = DEFAULT_METHOD
+        # Project folder <parent>/<name>/ holding every file of the project
+        from ..project_log import ProjectLogFile
+        self.project_dir = ""
+        self.last_parent_dir = ""
+        self.project_log = ProjectLogFile()
 
         # Create the GUI
         self._create_menu()
         self._create_main_layout()
         self._create_status_bar()
+        self._install_log_capture()
+        self._sync_default_class()
 
         # Configure styles
         self._configure_styles()
@@ -909,6 +921,9 @@ class GeodeticToolGUI:
         menubar.add_cascade(label="Project / פרויקט", menu=project_menu)
         project_menu.add_command(label="Save Project... / שמור פרויקט", command=self._save_project)
         project_menu.add_command(label="Load Project... / טען פרויקט", command=self._load_project)
+        project_menu.add_command(label="Export Project as ZIP... / ייצוא פרויקט כ-ZIP",
+                                 command=self._export_project_zip)
+        project_menu.add_command(label="Export Log... / ייצוא יומן", command=self._export_log)
         project_menu.add_separator()
         project_menu.add_command(label="Create Joint Project... / צור פרויקט משולב", command=self._create_joint_project)
         project_menu.add_separator()
@@ -1007,7 +1022,29 @@ class GeodeticToolGUI:
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=5, fill=tk.Y)
         ttk.Button(toolbar, text="⇄ Toggle Dir", command=self._toggle_line_direction).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="✓/✗ Toggle Use", command=self._toggle_line_used).pack(side=tk.LEFT, padx=2)
-        
+
+        # Precision Class: ONE class and ONE method for the whole project
+        from ..validators import MEASURE_METHODS
+        pc = ttk.LabelFrame(parent, text="Precision Class / דרגת דיוק")
+        pc.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(pc, text="Class:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        self.class_selector_var = tk.StringVar(value=DEFAULT_CLASS)
+        self.class_combo = ttk.Combobox(pc, textvariable=self.class_selector_var, state="readonly",
+                                        values=["H1", "H2", "H3", "H4", "H5", "H6"], width=8, height=12)
+        self.class_combo.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        self.class_combo.bind("<<ComboboxSelected>>", self._on_class_changed)
+        ttk.Button(pc, text="ℹ️", width=3, command=self._show_class_info).grid(row=0, column=2, padx=2)
+        ttk.Label(pc, text="Method:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.method_var = tk.StringVar(value=DEFAULT_METHOD)
+        self.method_combo = ttk.Combobox(pc, textvariable=self.method_var, state="readonly",
+                                         values=list(MEASURE_METHODS), width=8, height=12)
+        self.method_combo.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        self.method_combo.bind("<<ComboboxSelected>>", self._on_method_changed)
+        self.class_desc_var = tk.StringVar(value="")
+        ttk.Label(pc, textvariable=self.class_desc_var, foreground="#555").grid(
+            row=2, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(0, 3))
+        self._update_class_desc()
+
         # File list with scrollbar
         list_frame = ttk.Frame(parent)
         list_frame.pack(fill=tk.BOTH, expand=True)
@@ -1059,29 +1096,12 @@ class GeodeticToolGUI:
         
         self.detail_vars = {}
         self._detail_line = None
-        from ..validators import MEASURE_METHODS
         for i, (label_text, var_name) in enumerate(labels):
             ttk.Label(details, text=label_text).grid(row=i, column=0, sticky=tk.W, padx=5, pady=2)
             var = tk.StringVar(value="-")
             self.detail_vars[var_name] = var
-            if var_name == "method":
-                # editable: measure method of this line
-                self.method_combo = ttk.Combobox(details, textvariable=var, state="readonly",
-                                                 values=list(MEASURE_METHODS), width=10, height=12)
-                self.method_combo.bind("<<ComboboxSelected>>", self._on_line_method_changed)
-                self.method_combo.grid(row=i, column=1, sticky=tk.W, padx=5, pady=2)
-            else:
-                ttk.Label(details, textvariable=var).grid(row=i, column=1, sticky=tk.W, padx=5, pady=2)
-        # editable: precision class of this line ("Project" = the project class)
-        r = len(labels)
-        ttk.Label(details, text="Precision Class / דרגת דיוק:").grid(row=r, column=0, sticky=tk.W,
-                                                                    padx=5, pady=2)
-        self.line_class_var = tk.StringVar(value="Project")
-        self.line_class_combo = ttk.Combobox(details, textvariable=self.line_class_var,
-                                             state="readonly", width=10, height=12,
-                                             values=["Project", "H1", "H2", "H3", "H4", "H5", "H6"])
-        self.line_class_combo.bind("<<ComboboxSelected>>", self._on_line_class_changed)
-        self.line_class_combo.grid(row=r, column=1, sticky=tk.W, padx=5, pady=2)
+            ttk.Label(details, textvariable=var).grid(row=i, column=1, sticky=tk.W, padx=5, pady=2)
+        r = len(labels) - 1
 
         # Quick action button
         ttk.Button(details, text="Adjust This Line / תאם קו זה", 
@@ -1168,8 +1188,15 @@ class GeodeticToolGUI:
     
     def _create_log_panel(self, parent: ttk.Frame):
         """Create the log panel."""
+        bar = ttk.Frame(parent)
+        bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 5))
+        ttk.Button(bar, text="Export Log... / ייצוא יומן", command=self._export_log).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Clear Log / נקה",
+                   command=lambda: self.log_text.delete("1.0", tk.END)).pack(side=tk.LEFT, padx=5)
         self.log_text = scrolledtext.ScrolledText(parent, font=('Consolas', 9))
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.log_text.tag_configure("WARNING", foreground="#E65100")
+        self.log_text.tag_configure("ERROR", foreground="#C62828")
     
     def _create_status_bar(self):
         """Create the status bar with class selector."""
@@ -1181,59 +1208,79 @@ class GeodeticToolGUI:
         status_label = ttk.Label(status_frame, textvariable=self.status_var, anchor=tk.W)
         status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        # Class selector (right side)
-        class_frame = ttk.Frame(status_frame)
-        class_frame.pack(side=tk.RIGHT, padx=10, pady=2)
+        # project folder (right side)
+        self.project_dir_var = tk.StringVar(value="")
+        ttk.Label(status_frame, textvariable=self.project_dir_var, anchor=tk.E,
+                  font=('Arial', 9)).pack(side=tk.RIGHT, padx=10)
 
-        ttk.Label(class_frame, text="Active Class / דרגת דיוק:", font=('Arial', 9)).pack(side=tk.LEFT, padx=(0, 5))
-
-        # Load current default class
-        from ..config.israel_survey_regulations import get_default_class
-        current_class = get_default_class()
-
-        self.class_selector_var = tk.StringVar(value=current_class)
-        class_selector = ttk.Combobox(
-            class_frame, height=12,
-            textvariable=self.class_selector_var,
-            values=["H1", "H2", "H3", "H4", "H5", "H6"],
-            state="readonly",
-            width=6,
-            font=('Arial', 9, 'bold')
-        )
-        class_selector.pack(side=tk.LEFT)
-        class_selector.bind('<<ComboboxSelected>>', self._on_class_changed)
-
-        # Add info button next to class selector
-        info_btn = ttk.Button(class_frame, text="ℹ️", width=3, command=self._show_class_info)
-        info_btn.pack(side=tk.LEFT, padx=2)
-    
     def _set_status(self, message: str):
         """Update status bar."""
         self.status_var.set(message)
         self.root.update_idletasks()
 
+    def _sync_default_class(self):
+        """Keep the saved default class (used by validators called without a
+        class) equal to the project class shown in the panel."""
+        try:
+            from ..config.israel_survey_regulations import set_default_class
+            set_default_class(self._project_class())
+        except Exception:
+            pass
+
+    def _update_class_desc(self):
+        try:
+            from ..config.israel_survey_regulations import get_class_parameters_by_name
+            p = get_class_parameters_by_name(self._project_class())
+            self.class_desc_var.set(f"±{p.tolerance_coefficient:g} mm·√km | requires "
+                                    f"{p.required_method} | sight ≤ "
+                                    f"{p.max_sight_distance_geometric_m:g} m")
+        except Exception:
+            self.class_desc_var.set("")
+
     def _on_class_changed(self, event=None):
-        """Handle class selection change."""
-        from ..config.israel_survey_regulations import set_default_class, get_class_parameters_by_name
+        """Project class changed: it applies to EVERY line (per-line classes
+        are cleared), re-validate."""
+        selected_class = self._project_class()
+        self._sync_default_class()
+        self._update_class_desc()
+        own = [ln for ln in self.lines if getattr(ln, "leveling_class", None)]
+        for ln in own:
+            ln.leveling_class = None
+        self._set_status(f"Class {selected_class} for all lines")
+        self._log(f"Precision class -> {selected_class} (all lines)")
+        if self.lines:
+            self._validate_all()
+            if self._detail_line is not None:
+                self._show_line_details(self._detail_line)
 
-        selected_class = self.class_selector_var.get()
+    def _on_method_changed(self, event=None):
+        """Project measure method changed: set on every line, re-validate."""
+        method = self.method_var.get() or DEFAULT_METHOD
+        self.project_method = method
+        self._log(f"Measure method -> {method} (all lines)")
+        if self.lines:
+            self._apply_project_method(self.lines)
+            self._validate_all()
+            if self._detail_line is not None:
+                self._show_line_details(self._detail_line)
 
-        # Save the new default class
-        success = set_default_class(selected_class)
-
-        if success:
-            # Get class parameters for display
-            params = get_class_parameters_by_name(selected_class)
-            self._set_status(f"Active class set to {selected_class} (Tolerance: ±{params.tolerance_coefficient}mm√L)")
-            self._log(f"Active leveling class changed to {selected_class}")
-            # re-validate with the new project class
-            if self.lines:
-                self._validate_all()
-                if self._detail_line is not None:
-                    self._show_line_details(self._detail_line)
-        else:
-            messagebox.showerror("Error", "Failed to save class selection")
-            self._set_status("Error saving class selection")
+    def _apply_project_method(self, lines):
+        """Give *lines* the project method; warn when a raw file's readings
+        show another method (the declared one is used)."""
+        method = self.project_method or DEFAULT_METHOD
+        differ = []
+        for ln in lines:
+            detected = getattr(ln, "measured_method", None)
+            if detected is None and not getattr(ln, "is_summary", False) and ln.setups:
+                detected = str(ln.method.value if hasattr(ln.method, "value") else ln.method)
+                ln.measured_method = detected
+            if detected and detected != method:
+                differ.append(f"{ln.filename} ({detected})")
+            ln.method = method
+        if differ:
+            self._log(f"Measure method {method} set for all lines; the readings of "
+                      f"{len(differ)} file(s) look different: " + ", ".join(differ[:10])
+                      + (" ..." if len(differ) > 10 else ""), level="WARNING")
 
     def _show_class_info(self):
         """Show information about the currently selected class."""
@@ -1283,12 +1330,148 @@ Special Requirements:"""
 
         messagebox.showinfo(f"Class {selected_class} Information", info_text)
     
-    def _log(self, message: str):
-        """Add message to log."""
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+    def _log(self, message: str, level: str = "INFO", source: str = "app"):
+        """Add a timestamped entry to the Log tab and the project .log file."""
+        from ..project_log import format_entry
+        line = format_entry(str(level).upper(), source, message)
+        tag = str(level).upper() if str(level).upper() in ("WARNING", "ERROR") else None
+        self.log_text.insert(tk.END, line + "\n", (tag,) if tag else ())
         self.log_text.see(tk.END)
+        self.project_log.write_line(line)
+
+    def _install_log_capture(self):
+        """Python logging of geodetic_tool.* (INFO and up) -> Log tab.  Records
+        from worker threads are queued to the Tk thread with after()."""
+        from ..project_log import install_handler
+        import queue as _queue
+        import threading as _th
+        main = _th.main_thread()
+        self._log_queue = _queue.Queue()
+
+        def _cb(level, source, msg):
+            if _th.current_thread() is main:
+                self._log(msg, level, source)
+            else:                       # Tk is not thread-safe: queue it
+                self._log_queue.put((msg, level, source))
+        self._log_handler = install_handler(_cb)
+        self._drain_log_queue()
+
+    def _drain_log_queue(self):
+        """Move log entries queued by worker threads into the Log tab."""
+        try:
+            while True:
+                msg, level, source = self._log_queue.get_nowait()
+                self._log(msg, level, source)
+        except Exception:
+            pass
+        try:
+            self.root.after(200, self._drain_log_queue)
+        except Exception:
+            pass
+
+    def _export_log(self):
+        """Save the whole Log tab to a .log / .txt file (UTF-8)."""
+        from ..project_log import write_log_file
+        text = self.log_text.get("1.0", tk.END)
+        if not text.strip():
+            messagebox.showinfo("Export Log", "The log is empty.")
+            return
+        name = self._project_name() or "geodetic"
+        path = filedialog.asksaveasfilename(
+            title="Export Log", defaultextension=".log",
+            initialdir=self.project_dir or None,
+            initialfile=f"{name}_log_{datetime.now():%d_%m_%Y_%H_%M}.log",
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            written = write_log_file(path, text, self._project_name())
+        except OSError as e:
+            messagebox.showerror("Export Log", f"Could not write the log file:\n{e}")
+            return
+        self._log(f"Log exported to {written}")
+
+    # ------------------------------------------------------------------ #
+    # Project name and folder
+    # ------------------------------------------------------------------ #
+    def _project_name(self) -> str:
+        n = self.current_project.name if self.current_project else ""
+        return "" if n in ("", "Unnamed Project") else n
+
+    def _start_project_folder(self, file_paths, titles) -> bool:
+        """New project: name it <Description>_DD_MM_YYYY_H_MM and create
+        <chosen parent>/<name>/.  Returns False when the user cancels."""
+        from ..project_naming import describe_files, make_project_name, project_folder
+        name = self._project_name() or make_project_name(describe_files(file_paths, titles))
+        parent = filedialog.askdirectory(
+            title="Where should the new project folder be created? / היכן ליצור את תיקיית הפרויקט",
+            initialdir=self.last_parent_dir or str(Path.home()))
+        if not parent:
+            return False
+        try:
+            folder = project_folder(parent, name)
+        except OSError as e:
+            messagebox.showerror("Project folder", f"Could not create the project folder:\n{e}")
+            return False
+        self.current_project.name = name
+        self._set_project_dir(folder)
+        self._log(f"Project name: {name}")
+        return True
+
+    def _set_project_dir(self, folder: str):
+        self.project_dir = folder or ""
+        if folder:
+            self.last_parent_dir = str(Path(folder).parent)
+        name = self._project_name()
+        self.root.title("Geodetic Leveling Tool" + (f" - {name}" if name else ""))
+        try:
+            self.project_dir_var.set(f"Project folder: {folder}" if folder else "")
+        except Exception:
+            pass
+        if folder and name:
+            self.project_log.open(str(Path(folder) / f"{name}.log"),
+                                  self.log_text.get("1.0", tk.END), name)
+            self._log(f"Project folder: {folder}")
+        else:
+            self.project_log.close()
+
+    def _project_file_path(self) -> str:
+        name = self._project_name()
+        return str(Path(self.project_dir) / f"{name}.json") if self.project_dir and name else ""
+
+    def _autosave_project(self):
+        """Write <name>.json into the project folder (no dialog)."""
+        path = self._project_file_path()
+        if not path:
+            return
+        try:
+            self.current_project.lines = self.lines
+            self.current_project.point_overrides = dict(self.point_overrides)
+            self.current_project.point_origin = dict(self.point_origin)
+            self.current_project.project_path = path
+            self.project_manager.save_project(self.current_project, format="json")
+        except Exception as e:
+            self._log(f"Project autosave failed: {e}", level="WARNING")
+
+    def _export_project_zip(self):
+        if not self.project_dir or not Path(self.project_dir).is_dir():
+            messagebox.showinfo("Export Project as ZIP", "No project folder yet - load files first.")
+            return
+        self._autosave_project()
+        folder = Path(self.project_dir)
+        path = filedialog.asksaveasfilename(
+            title="Export Project as ZIP", defaultextension=".zip",
+            initialdir=str(folder.parent), initialfile=folder.name + ".zip",
+            filetypes=[("ZIP archive", "*.zip")])
+        if not path:
+            return
+        from ..project_naming import zip_folder
+        try:
+            n = zip_folder(str(folder), path)
+        except OSError as e:
+            messagebox.showerror("Export Project as ZIP", str(e))
+            return
+        self._log(f"Project exported as ZIP: {path} ({n} files)")
     
     def _open_files(self):
         """Open file dialog to select files."""
@@ -1315,12 +1498,9 @@ Special Requirements:"""
         folder = filedialog.askdirectory(title="Select folder with leveling files")
 
         if folder:
-            folder_path = Path(folder)
-            files = list(folder_path.glob("*.DAT")) + list(folder_path.glob("*.dat"))
-            files += list(folder_path.glob("*.RAW")) + list(folder_path.glob("*.raw"))
-            files += list(folder_path.glob("*.rez")) + list(folder_path.glob("*.REZ"))
-            files += list(folder_path.glob("*.FA0")) + list(folder_path.glob("*.fa0"))
-            files += list(folder_path.glob("*.FA1")) + list(folder_path.glob("*.fa1"))
+            exts = (".dat", ".raw", ".gsi", ".rez", ".fa0", ".fa1")
+            files = sorted(p for p in Path(folder).rglob("*")
+                           if p.is_file() and p.suffix.lower() in exts)
             
             if files:
                 self._load_files([str(f) for f in files])
@@ -1473,6 +1653,8 @@ Special Requirements:"""
         self._set_status("Loading files...")
         loaded = set(self.file_paths)
         parsed_files = []                  # (path, lines, benchmarks)
+        titles = {}                        # path -> header description (FA0/FA1/REZ)
+        new_project = not self.lines
         for file_path in file_paths:
             if file_path in loaded:
                 continue
@@ -1488,6 +1670,7 @@ Special Requirements:"""
                 parsed_files.append((file_path, parsed,
                                      dict(getattr(parser, "benchmarks", None) or {})))
                 self.file_approx.update(getattr(parser, "approx_heights", None) or {})
+                titles[str(Path(file_path).resolve())] = getattr(parser, "title", "") or ""
             except Exception as e:
                 self._log(f"Error loading {Path(file_path).name}: {str(e)}")
 
@@ -1506,6 +1689,14 @@ Special Requirements:"""
             self._set_status("Ready")
             return
         kept = {id(ln) for ln in new_lines}       # verification may drop lines
+
+        # New project: auto name + its own folder for every project file
+        if new_project and not self.project_dir:
+            if not self._start_project_folder(
+                    [str(Path(fp).resolve()) for fp, _, _ in parsed_files], titles):
+                self._log("No project folder chosen - the project stays unsaved "
+                          "until Save Project", level="WARNING")
+        self._apply_project_method([ln for ln in new_lines if id(ln) in kept])
 
         for file_path, parsed, bms in parsed_files:
             lines = [ln for ln in parsed if id(ln) in kept]
@@ -1529,6 +1720,7 @@ Special Requirements:"""
         # Update summary
         total_dist = sum(line.total_distance for line in self.lines)
         self.summary_label.config(text=f"{len(self.lines)} files, {total_dist:.0f} m total")
+        self._autosave_project()
         self._set_status("Ready")
 
     def _clear_files(self):
@@ -1559,11 +1751,29 @@ Special Requirements:"""
         self._clear_details()
         self.summary_label.config(text="No files loaded")
         self._log("Cleared all files")
+        # a new project starts with the defaults and its own folder
+        self._set_project_dir("")
+        from ..config.models import ProjectData
+        self.current_project = ProjectData(name="Unnamed Project")
+        self.class_selector_var.set(DEFAULT_CLASS)
+        self.method_var.set(DEFAULT_METHOD)
+        self.project_method = DEFAULT_METHOD
+        self._sync_default_class()
+        self._update_class_desc()
     
     def _reload_files(self):
-        """Reload all files."""
+        """Reload all files (same project: name, folder, class, method kept)."""
         paths = self.file_paths.copy()
+        keep = (self.current_project, self.project_dir, self.class_selector_var.get(),
+                self.method_var.get())
         self._clear_files()
+        self.current_project, folder, cls, method = keep
+        self.class_selector_var.set(cls)
+        self.method_var.set(method)
+        self.project_method = method
+        self._sync_default_class()
+        self._update_class_desc()
+        self._set_project_dir(folder)
         self._load_files(paths)
 
     def _refresh_file_list(self):
@@ -1615,38 +1825,9 @@ Special Requirements:"""
         except Exception:
             return "H3"
 
-    def _on_line_method_changed(self, event=None):
-        line = self._detail_line
-        if line is None:
-            return
-        new = self.detail_vars["method"].get()
-        if new and new != line.method:
-            self._log(f"{line.filename}: measure method {line.method} -> {new}")
-            line.method = new
-            self._after_line_setting_change(line)
-
-    def _on_line_class_changed(self, event=None):
-        line = self._detail_line
-        if line is None:
-            return
-        val = self.line_class_var.get()
-        new = None if val == "Project" else val
-        if new != getattr(line, "leveling_class", None):
-            self._log(f"{line.filename}: precision class "
-                      f"{line.leveling_class or 'project'} -> {new or 'project'}")
-            line.leveling_class = new
-            self._after_line_setting_change(line)
-
-    def _after_line_setting_change(self, line):
-        """Re-validate after a class / method edit and refresh the views."""
-        self._show_line_details(line)
-        if hasattr(self, "validation_tree") and self.validation_tree.get_children():
-            self._validate_all()
-
     def _show_line_details(self, line: LevelingLine):
         """Display details for selected line."""
         self._detail_line = line
-        self.line_class_var.set(getattr(line, "leveling_class", None) or "Project")
         self.detail_vars['filename'].set(line.filename or "-")
         self.detail_vars['start_point'].set(line.start_point or "-")
         self.detail_vars['end_point'].set(line.end_point or "-")
@@ -1795,45 +1976,45 @@ Special Requirements:"""
         self._log(f"Validated {len(self.lines)} files ({len(double_run_pairs)} double-run pairs detected)")
     
     def _detect_double_runs(self):
-        """Detect double-run pairs."""
+        """Double-run check of Directive G2 (2021) App. C: sections measured
+        more than once, delta = dH_fwd + dH_ret vs k*sqrt(L) (L one direction,
+        the line's class else the project class), mean dH = (dH_fwd -
+        dH_ret)/2 - the same numbers as Step 1 of the adjustment."""
         if not self.lines:
             messagebox.showinfo("No Files", "Please load files first")
             return
-        
-        pairs = detect_double_runs(self.lines)
-        analyzer = LoopAnalyzer()
-        
-        self.analysis_text.delete('1.0', tk.END)
-        self.analysis_text.insert(tk.END, "=== DOUBLE-RUN ANALYSIS / ניתוח הלוך-שוב ===\n\n")
-        
-        if not pairs:
-            self.analysis_text.insert(tk.END, "No double-run pairs detected.\n")
-        else:
-            for fwd, ret in pairs:
-                result = analyzer.analyze_double_run(fwd, ret)
-                
-                self.analysis_text.insert(tk.END, f"Pair: {fwd.start_point} ↔ {fwd.end_point}\n")
-                self.analysis_text.insert(tk.END, f"  Forward file:  {fwd.filename}\n")
-                self.analysis_text.insert(tk.END, f"  Return file:   {ret.filename}\n")
-                
-                if result['valid']:
-                    self.analysis_text.insert(tk.END, f"  Forward dH:    {result['forward_dh']*1000:.3f} mm\n")
-                    self.analysis_text.insert(tk.END, f"  Return dH:     {result['return_dh']*1000:.3f} mm\n")
-                    self.analysis_text.insert(tk.END, f"  Misclosure:    {result['misclosure_mm']:.3f} mm\n")
-                    self.analysis_text.insert(tk.END, f"  Mean dH:       {result['mean_dh']*1000:.3f} mm\n")
-                    self.analysis_text.insert(tk.END, f"  Total dist:    {result['total_distance']:.2f} m\n")
-                    self.analysis_text.insert(tk.END, f"  Class:         {result['tolerance_class'] or 'Exceeds all'}\n")
-                    
-                    if result['within_tolerance']:
-                        self.analysis_text.insert(tk.END, f"  Status:        ✓ PASS\n")
-                    else:
-                        self.analysis_text.insert(tk.END, f"  Status:        ✗ FAIL (exceeds {result['tolerance_mm']:.2f} mm)\n")
-                
-                self.analysis_text.insert(tk.END, "\n")
-        
+        from ..engine.network_prep import analyze_double_runs
+        results = analyze_double_runs(self.lines, self._project_class())
+
+        t = self.analysis_text
+        t.delete('1.0', tk.END)
+        t.insert(tk.END, "=== DOUBLE-RUN ANALYSIS / ניתוח הלוך-שוב ===\n")
+        t.insert(tk.END, "Directive G2 (2021) App. C: δ = ΔH fwd + ΔH ret, |δ| ≤ k·√L "
+                         "(L one direction)\n\n")
+        if not results:
+            t.insert(tk.END, "No section measured more than once.\n")
+        for r in results:
+            t.insert(tk.END, f"Section: {r.from_point} ↔ {r.to_point}"
+                             + (f"  ({r.n_runs} runs)" if r.n_runs > 2 else "") + "\n")
+            t.insert(tk.END, f"  Forward file:  {r.runs[0].filename}\n")
+            t.insert(tk.END, "  Other run(s):  " + ", ".join(str(l.filename) for l in r.runs[1:]) + "\n")
+            t.insert(tk.END, f"  Forward dH:    {r.forward_dh:.5f} m\n")
+            if r.return_dh is not None:
+                t.insert(tk.END, f"  {'Repeat' if r.same_direction else 'Return'} dH:     "
+                                 f"{r.return_dh:.5f} m\n")
+            what = ("spread" if r.n_runs > 2 else "repeat diff" if r.same_direction else "δ")
+            t.insert(tk.END, f"  {what:<14}{r.discrepancy_mm:+.1f} mm\n")
+            t.insert(tk.END, f"  Mean dH:       {r.mean_dh:.5f} m\n")
+            t.insert(tk.END, f"  L (one dir.):  {r.distance / 1000.0:.3f} km\n")
+            t.insert(tk.END, f"  Allowed:       ±{r.allowed_mm:.1f} mm ({r.leveling_class})\n")
+            best = f"H{r.achieved}" if r.achieved else "none (exceeds H6)"
+            t.insert(tk.END, "  Status:        " + ("✓ PASS" if r.ok else "✗ FAIL")
+                     + f"   (class met: {best})\n\n")
         self.notebook.select(2)
-        self._log(f"Found {len(pairs)} double-run pairs")
-    
+        n_fail = sum(1 for r in results if not r.ok)
+        self._log(f"Double-runs: {len(results)} section(s), {len(results) - n_fail} pass, "
+                  f"{n_fail} fail", level="WARNING" if n_fail else "INFO")
+
     def _find_loops(self):
         """Find closed loops in the network."""
         if not self.lines:
@@ -1868,17 +2049,12 @@ Special Requirements:"""
             messagebox.showinfo("No Files", "Please load files first")
             return None
         from .adjustment_window import AdjustmentWindow
-        from ..config.israel_survey_regulations import get_default_class
-        try:
-            cls = get_default_class()
-            cls = cls if isinstance(cls, str) else f"H{int(cls)}"
-        except Exception:
-            cls = "H3"
-        name = (self.current_project.name if self.current_project
-                and self.current_project.name != "Unnamed Project" else "geo_level")
+        cls = self._project_class()
+        name = self._project_name() or "geo_level"
         win = AdjustmentWindow(self.root, self.lines, leveling_class=cls,
                                known_heights=self.file_benchmarks,
                                selected_lines=selected_lines, project_name=name,
+                               output_dir=self.project_dir,
                                db_heights=self._db_heights if self._db() else None,
                                approx_heights=self.file_approx)
         self.root.wait_window(win)
@@ -1940,14 +2116,16 @@ Special Requirements:"""
             messagebox.showinfo("No Files", "Please load files first")
             return
         
-        folder = filedialog.askdirectory(title="Select Output Folder / בחר תיקיית יעד")
+        folder = self.project_dir if self.project_dir and Path(self.project_dir).is_dir() else \
+            filedialog.askdirectory(title="Select Output Folder / בחר תיקיית יעד")
         if folder:
             try:
                 from ..exporters import FA0Exporter, FTEGExporter
                 from ..gis.geojson_export import GeoJSONExporter
                 
                 # Export FTEG (only used lines)
-                fteg_path = Path(folder) / "lines.FTEG"
+                stem = self._project_name() or "lines"
+                fteg_path = Path(folder) / f"{stem}.FTEG"
                 fteg = FTEGExporter()
                 # Convert LevelingLine objects to MeasurementSummary format
                 from ..config.models import MeasurementSummary
@@ -1970,7 +2148,7 @@ Special Requirements:"""
                 fteg.export(str(fteg_path), observations)
 
                 # Export GeoJSON (only used lines)
-                geojson_path = Path(folder) / "lines.geojson"
+                geojson_path = Path(folder) / f"{stem}.geojson"
                 gj = GeoJSONExporter(self._coordinate_manager())
                 used_lines = [line for line in self.lines if line.is_used]
                 gj.export_lines(used_lines, str(geojson_path))
@@ -2136,16 +2314,16 @@ Features:
         self.current_project.point_overrides = dict(self.point_overrides)
         self.current_project.point_origin = dict(self.point_origin)
 
-        # Ask for project name if unnamed
+        # Unnamed (no file loaded through a new project yet): auto name
         if self.current_project.name == "Unnamed Project":
-            name = simpledialog.askstring("Project Name", "Enter project name:")
-            if name:
-                self.current_project.name = name
+            from ..project_naming import make_project_name
+            self.current_project.name = make_project_name("GeoLevel")
 
-        # Ask for save location
+        # Ask for save location - the project folder by default
         filepath = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON Project", "*.json"), ("Pickle Project", "*.pickle"), ("All files", "*.*")],
+            initialdir=self.project_dir or None,
             initialfile=f"{self.current_project.name}.json"
         )
 
@@ -2154,6 +2332,8 @@ Features:
                 format = "json" if filepath.endswith(".json") else "pickle"
                 self.current_project.project_path = filepath
                 saved_path = self.project_manager.save_project(self.current_project, format=format)
+                if not self.project_dir:
+                    self._set_project_dir(str(Path(saved_path).parent))
                 messagebox.showinfo("Success", f"Project saved to:\n{saved_path}")
                 self._log(f"Project saved: {saved_path}")
             except Exception as e:
@@ -2186,7 +2366,17 @@ Features:
 
                 total_dist = sum(line.total_distance for line in self.lines)
                 self.summary_label.config(text=f"{len(self.lines)} files, {total_dist:.0f} m total")
-                self.root.title(f"Geodetic Leveling Tool - {project.name}")
+                # one class / method; the folder of the project file
+                methods = [str(ln.method.value if hasattr(ln.method, "value") else ln.method)
+                           for ln in self.lines]
+                from collections import Counter
+                common = [m for m, _ in Counter(methods).most_common() if m in ("BF", "BFFB", "BBFF")]
+                self.project_method = common[0] if common else DEFAULT_METHOD
+                self.method_var.set(self.project_method)
+                if len(set(methods)) > 1 or any(getattr(ln, "leveling_class", None) for ln in self.lines):
+                    self._log("This project was saved with per-line settings; choosing Class / "
+                              "Method applies one value to every line.", level="WARNING")
+                self._set_project_dir(str(Path(filepath).parent))
 
                 messagebox.showinfo("Success", f"Project loaded: {project.name}")
                 self._log(f"Project loaded: {filepath}")
@@ -2267,7 +2457,8 @@ Total Points: {len(self.current_project.get_all_points())}
             messagebox.showinfo("No Data", "Please load files first")
             return
 
-        folder = filedialog.askdirectory(title="Select Output Folder for QGIS Export")
+        folder = self.project_dir if self.project_dir and Path(self.project_dir).is_dir() else \
+            filedialog.askdirectory(title="Select Output Folder for QGIS Export")
         if folder:
             try:
                 from ..gis.qgis_integration import QGISVirtualLayerBuilder

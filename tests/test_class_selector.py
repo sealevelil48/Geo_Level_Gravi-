@@ -175,7 +175,7 @@ def main():
         print("ALL TESTS PASSED! [PASS]")
         print("=" * 70)
         print("\nThe class selector feature is working correctly!")
-        print("You can now select H1-H6 classes in the GUI status bar.")
+        print("You can now select H1-H6 classes in the Precision Class panel.")
 
     except AssertionError as e:
         print(f"\n[FAIL] TEST FAILED: {e}")
