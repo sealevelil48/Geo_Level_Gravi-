@@ -87,6 +87,20 @@ check(p.endswith(".log") and "Project: K6177_24_11_2026_9_25" in body
 p2 = GL.write_log_file(os.path.join(tmp, "run.txt"), "קו 5", "")
 check(p2.endswith(".txt") and "קו 5" in open(p2, encoding="utf-8").read(), "UTF-8 Hebrew .txt")
 
+# -- project .log file --------------------------------------------------- #
+pl = GL.ProjectLogFile()
+lp = os.path.join(tmp, "proj.log")
+pl.open(lp, "earlier line\n", "proj")
+pl.write("WARNING", "x", "live line")
+pl.open(lp, "ignored")                     # same path: no second header
+pl.close(); pl.write("INFO", "x", "after close")
+txt = open(lp, encoding="utf-8").read()
+check(txt.startswith("Geo Level Gravi - plugin log\nStarted:") and "earlier line" in txt
+      and "live line" in txt and "after close" not in txt and "ignored" not in txt,
+      "project log file")
+pl.open(lp, "", "proj")
+check("Session " in open(lp, encoding="utf-8").read(), "reopen appends a session marker")
+
 # -- drag-and-drop collection -------------------------------------------- #
 os.makedirs(os.path.join(tmp, "in", "deep"))
 for f in ("in/A.DAT", "in/b.raw", "in/c.txt", "in/deep/d.FA1", "in/deep/e.Fa0", "x.rez"):

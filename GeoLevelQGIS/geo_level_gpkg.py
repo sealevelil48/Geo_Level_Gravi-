@@ -554,6 +554,8 @@ def sanitize_meta(meta):
                           if isinstance(fa, dict) else {})
     out["last_adjustment"] = _sanitize_adjustment(meta.get("last_adjustment"))
 
+    mm = meta.get("measure_method")
+    out["measure_method"] = mm if mm in ("BF", "BFFB", "BBFF") else ""
     od = meta.get("output_dir")
     out["output_dir"] = od if isinstance(od, str) else ""
     sv = meta.get("schema_version")

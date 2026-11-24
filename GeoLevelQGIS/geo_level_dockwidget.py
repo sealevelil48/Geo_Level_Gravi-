@@ -98,6 +98,10 @@ class _DropListWidget(QListWidget):
         self.files_dropped.emit(paths)
 
 
+DEFAULT_CLASS = "H3"
+DEFAULT_METHOD = "BFFB"
+MEASURE_METHODS = ("BF", "BFFB", "BBFF")
+
 CLASS_DESCRIPTIONS = {
     "H1": "H1 -- +/-3 mm*sqrt(km)  |  BFFB  |  sight <= 30 m",
     "H2": "H2 -- +/-5 mm*sqrt(km)  |  BFFB  |  sight <= 40 m",
@@ -130,8 +134,10 @@ class GeoLevelDockWidget(QDockWidget):
     line_modified         = pyqtSignal(int)
     # project precision class chosen in the dock ("H1".."H6")
     project_class_changed = pyqtSignal(str)
-    # (line index, "leveling_class" | "method", new value; "" = project class)
-    line_settings_changed = pyqtSignal(int, str, str)
+    # project measure method chosen in the dock ("BF" | "BFFB" | "BBFF")
+    project_method_changed = pyqtSignal(str)
+    # every dock log() entry (level, source, text) - the project .log file
+    log_written = pyqtSignal(str, str, str)
 
     def __init__(self, parent=None):
         super().__init__("Geo Level Gravi", parent)
@@ -201,62 +207,41 @@ class GeoLevelDockWidget(QDockWidget):
         gvbox = QVBoxLayout(grp)
         gvbox.setSpacing(4)
 
-        # Project class (used by every line without a class of its own)
-        hbox = QHBoxLayout()
-        lbl_proj = QLabel("Project:")
-        lbl_proj.setFixedWidth(52)
-        hbox.addWidget(lbl_proj)
-        self.class_combo = QComboBox()
-        self.class_combo.addItems(["H1", "H2", "H3", "H4", "H5", "H6"])
-        self.class_combo.setCurrentText("H3")
-        self.class_combo.setFixedWidth(60)
-        self.class_combo.setToolTip("Project precision class - used by every line set to "
-                                    "'Project class'. Changing it re-validates all lines.")
-        hbox.addWidget(self.class_combo)
-        hbox.addStretch()
-        gvbox.addLayout(hbox)
-        self.class_lbl = QLabel(CLASS_DESCRIPTIONS["H3"])
-        self.class_lbl.setWordWrap(True)
-        self.class_lbl.setStyleSheet("color: #555;")
-        gvbox.addWidget(self.class_lbl)
-
-        # Selected line: its own class and measure method
-        self.line_settings_lbl = QLabel("Selected line: —")
-        self.line_settings_lbl.setStyleSheet("font-weight: bold; margin-top: 4px;")
-        gvbox.addWidget(self.line_settings_lbl)
-        lrow = QHBoxLayout()
+        # ONE class and ONE method for the whole project (defaults H3 / BFFB)
+        crow = QHBoxLayout()
         lbl_cls = QLabel("Class:")
         lbl_cls.setFixedWidth(52)
-        lrow.addWidget(lbl_cls)
-        self.line_class_combo = QComboBox()
-        self.line_class_combo.addItem("Project class", "")
-        for c in ("H1", "H2", "H3", "H4", "H5", "H6"):
-            self.line_class_combo.addItem(c, c)
-        self.line_class_combo.setToolTip(
-            "Precision class of the selected line. 'Project class' = the class "
-            "above. Re-validates at once; saved in the project GeoPackage.")
-        self.line_class_combo.setEnabled(False)
-        self.line_class_combo.currentIndexChanged.connect(self._on_line_class_combo)
-        lrow.addWidget(self.line_class_combo, 1)
-        gvbox.addLayout(lrow)
+        crow.addWidget(lbl_cls)
+        self.class_combo = QComboBox()
+        self.class_combo.addItems(["H1", "H2", "H3", "H4", "H5", "H6"])
+        self.class_combo.setCurrentText(DEFAULT_CLASS)
+        self.class_combo.setToolTip("Precision class of the project - applies to every "
+                                    "line. Changing it re-validates all lines and saves "
+                                    "to the project GeoPackage.")
+        crow.addWidget(self.class_combo, 1)
+        gvbox.addLayout(crow)
         mrow = QHBoxLayout()
         lbl_m = QLabel("Method:")
         lbl_m.setFixedWidth(52)
         mrow.addWidget(lbl_m)
-        self.line_method_combo = QComboBox()
-        self.line_method_combo.addItems(["BF", "BFFB", "BBFF"])
-        self.line_method_combo.setToolTip(
-            "Measure method of the selected line (H1-H3 require BFFB). "
-            "Re-validates at once; saved in the project GeoPackage.")
-        self.line_method_combo.setEnabled(False)
-        self.line_method_combo.currentTextChanged.connect(self._on_line_method_combo)
-        mrow.addWidget(self.line_method_combo, 1)
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(list(MEASURE_METHODS))
+        self.method_combo.setCurrentText(DEFAULT_METHOD)
+        self.method_combo.setToolTip("Measure method of the project - applies to every "
+                                     "line (H1-H3 require BFFB). Changing it re-validates "
+                                     "all lines and saves to the project GeoPackage.")
+        mrow.addWidget(self.method_combo, 1)
         gvbox.addLayout(mrow)
+        self.class_lbl = QLabel(CLASS_DESCRIPTIONS[DEFAULT_CLASS])
+        self.class_lbl.setWordWrap(True)
+        self.class_lbl.setStyleSheet("color: #555;")
+        gvbox.addWidget(self.class_lbl)
         self.class_combo.currentTextChanged.connect(
             lambda c: self.class_lbl.setText(CLASS_DESCRIPTIONS.get(c, ""))
         )
         # a user change re-validates the project (the plugin listens)
         self.class_combo.currentTextChanged.connect(self.project_class_changed.emit)
+        self.method_combo.currentTextChanged.connect(self.project_method_changed.emit)
         vbox.addWidget(grp)
 
         return panel
@@ -470,10 +455,6 @@ class GeoLevelDockWidget(QDockWidget):
 
         if lines:
             self.line_list.setCurrentRow(0)
-        else:
-            for combo in (self.line_class_combo, self.line_method_combo):
-                combo.setEnabled(False)
-            self.line_settings_lbl.setText("Selected line: —")
         self.btn_edit_points.setEnabled(bool(lines))
 
         self._refresh_val_table()
@@ -486,32 +467,20 @@ class GeoLevelDockWidget(QDockWidget):
             "Line: " + (line.start_point or "?") + " -> " + (line.end_point or "?")
             + "  |  Dist: " + dist_str + " m  |  dH: " + dh_str + " m"
         )
-        # show the line's own class / method without emitting a change
-        for combo in (self.line_class_combo, self.line_method_combo):
-            combo.blockSignals(True)
-        i = self.line_class_combo.findData(getattr(line, "leveling_class", None) or "")
-        self.line_class_combo.setCurrentIndex(max(i, 0))
-        method = str(getattr(line, "method", "") or "BF")
-        if self.line_method_combo.findText(method) < 0:
-            self.line_method_combo.addItem(method)
-        self.line_method_combo.setCurrentText(method)
-        for combo in (self.line_class_combo, self.line_method_combo):
-            combo.blockSignals(False)
-            combo.setEnabled(True)
-        self.line_settings_lbl.setText(
-            "Selected line: " + (line.start_point or "?") + " → " + (line.end_point or "?"))
         self._populate_setup_table(line)
 
-    def _on_line_class_combo(self, _i):
-        idx = self.get_current_index()
-        if idx >= 0:
-            self.line_settings_changed.emit(idx, "leveling_class",
-                                            self.line_class_combo.currentData() or "")
+    def set_project_settings(self, cls=None, method=None):
+        """Show the project's class / method without emitting a change
+        (project load, New Project)."""
+        for combo, val in ((self.class_combo, cls), (self.method_combo, method)):
+            if val and combo.findText(val) >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentText(val)
+                combo.blockSignals(False)
+        self.class_lbl.setText(CLASS_DESCRIPTIONS.get(self.class_combo.currentText(), ""))
 
-    def _on_line_method_combo(self, text):
-        idx = self.get_current_index()
-        if idx >= 0 and text:
-            self.line_settings_changed.emit(idx, "method", text)
+    def get_selected_method(self):
+        return self.method_combo.currentText()
 
     def update_validation_tab(self, line):
         """Sync validation detail text when a line is selected."""
@@ -524,11 +493,13 @@ class GeoLevelDockWidget(QDockWidget):
     def show_analysis_result(self, text):
         """Append text to the Log tab (analysis text output)."""
         self.log_text.append(text)
+        self.log_written.emit("INFO", "analysis", str(text))
         self.tabs.setCurrentIndex(3)  # Log tab
 
     def show_adjustment_result(self, text):
         """Append text to the Log tab (backward-compat alias)."""
         self.log_text.append(text)
+        self.log_written.emit("INFO", "adjustment", str(text))
         self.tabs.setCurrentIndex(3)
 
     _LOG_COLORS = {"WARNING": "#E65100", "ERROR": "#C62828",
@@ -537,6 +508,7 @@ class GeoLevelDockWidget(QDockWidget):
     def log(self, text, level="INFO", source="plugin"):
         """Append a timestamped message to the Log tab."""
         self.append_log_entry(level, source, text)
+        self.log_written.emit(str(level), str(source), str(text))
 
     def append_log_entry(self, level, source, message):
         """Slot for the plugin LogHub: one formatted, colour-coded entry."""
@@ -740,10 +712,9 @@ class GeoLevelDockWidget(QDockWidget):
             "Geodetic Files (*.DAT *.dat *.RAW *.raw *.GSI *.gsi *.rez *.REZ *.FA0 *.fa0 *.FA1 *.fa1);;All Files (*)"
         )
         if files:
-            cls = self.class_combo.currentText()
-            output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
-            if output_dir:
-                self.files_added.emit(files, cls, output_dir)
+            # output folder: the open project's folder, or - for a new
+            # project - the plugin asks where to create the project folder
+            self.files_added.emit(files, self.class_combo.currentText(), "")
 
     def _on_files_dropped(self, paths):
         """Dropped files / folders: same pipeline as "+ Add Files" (parse,
@@ -1027,9 +998,10 @@ class GeoLevelDockWidget(QDockWidget):
             QMessageBox.information(self, "Export to Excel", "No validation data to export.")
             return
 
+        base = (getattr(self, "project_name", "") or "validation") + "_validation.xlsx"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Validation Table",
-            "validation_results.xlsx",
+            os.path.join(getattr(self, "export_dir", "") or "", base),
             "Excel Workbook (*.xlsx)"
         )
         if not path:
@@ -1105,6 +1077,7 @@ class GeoLevelDockWidget(QDockWidget):
         self.line_list.clear()
         self.btn_toggle_dir.setEnabled(False)
         self.btn_toggle_use.setEnabled(False)
+        self.set_project_settings(DEFAULT_CLASS, DEFAULT_METHOD)
 
         # Tab 0 — Line Details
         self.line_info_lbl.setText("No line selected")

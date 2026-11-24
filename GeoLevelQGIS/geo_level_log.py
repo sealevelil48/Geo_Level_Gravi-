@@ -67,10 +67,10 @@ def minimal_logger_names(names) -> list:
     return out
 
 
-def export_header(project_name: str = "", when=None) -> str:
+def export_header(project_name: str = "", when=None, label: str = "Exported") -> str:
     when = when or _dt.datetime.now()
     lines = ["Geo Level Gravi - plugin log",
-             f"Exported: {when:%d/%m/%Y %H:%M:%S}"]
+             f"{label}: {when:%d/%m/%Y %H:%M:%S}"]
     if project_name:
         lines.append(f"Project: {project_name}")
     return "\n".join(lines) + "\n" + "-" * 72 + "\n"
@@ -187,3 +187,43 @@ def timed(label: str, sink=None, logger_name: str = "GeoLevelGravi"):
                 pass
         else:
             logging.getLogger(logger_name).info("TIMING %s", msg)
+
+
+class ProjectLogFile:
+    """The project's ``<name>.log`` inside its project folder, kept up to
+    date entry by entry (UTF-8, appended).  :meth:`open` starts it with the
+    text already shown in the Log tab, so the file holds the whole session."""
+
+    def __init__(self):
+        self.path = ""
+
+    def open(self, path: str, initial_text: str = "", project_name: str = ""):
+        import os
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+                os.path.abspath(self.path or " ")):
+            return
+        self.path = path
+        try:
+            new = not os.path.exists(path)
+            with open(path, "a", encoding="utf-8", newline="\n") as fh:
+                if new:
+                    fh.write(export_header(project_name, label="Started"))
+                else:
+                    fh.write("\n" + "=" * 72 + "\n"
+                             + f"Session {_dt.datetime.now():%d/%m/%Y %H:%M:%S}\n")
+                if isinstance(initial_text, str) and initial_text.strip():
+                    fh.write(initial_text.rstrip("\n") + "\n")
+        except OSError:
+            self.path = ""
+
+    def write(self, level: str, source: str, message: str):
+        if not self.path:
+            return
+        try:
+            with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(format_entry(str(level).upper(), source, message) + "\n")
+        except OSError:
+            pass    # folder gone / read-only: the Log tab still has it
+
+    def close(self):
+        self.path = ""

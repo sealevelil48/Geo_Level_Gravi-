@@ -70,3 +70,19 @@ def test_rez_title_roundtrip(tmp_path):
     p = RezParser()
     p.parse_many(str(path))
     assert p.title == "Haifa East"
+
+
+def test_project_folder_and_zip(tmp_path):
+    import zipfile
+    from core_logic.project_naming import project_folder, zip_folder
+    name = "K6177-64PU-65PU_24_11_2026_9_57"
+    f = project_folder(str(tmp_path), name)
+    assert f == str(tmp_path / name) and (tmp_path / name).is_dir()
+    assert project_folder(f, name) == f                    # never nested twice
+    (tmp_path / name / f"{name}.glp").write_text("{}")
+    (tmp_path / name / "exports").mkdir()
+    (tmp_path / name / "exports" / "a.FA1").write_text("x")
+    inside = tmp_path / name / "bundle.zip"
+    assert zip_folder(f, str(inside)) == 2                  # the zip itself skipped
+    names = sorted(zipfile.ZipFile(inside).namelist())
+    assert names == sorted([f"{name}/exports/a.FA1", f"{name}/{name}.glp"])

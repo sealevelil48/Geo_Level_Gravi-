@@ -62,3 +62,37 @@ def describe_files(file_paths, file_titles=None) -> str:
         if sanitize_name(stem):
             return stem
     return DEFAULT_DESCRIPTION
+
+
+def project_folder(parent_dir: str, project_name: str) -> str:
+    """Folder of a project: ``<parent>/<project name>``; *parent_dir* itself
+    when it already is that folder.  Created if missing."""
+    parent_dir = os.path.abspath(parent_dir)
+    if os.path.basename(os.path.normpath(parent_dir)) == project_name:
+        folder = parent_dir
+    else:
+        folder = os.path.join(parent_dir, project_name)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def zip_folder(folder: str, zip_path: str) -> int:
+    """Write every file of *folder* (recursively) into *zip_path*, paths
+    relative to the folder's parent so the archive unpacks into one folder.
+    The zip itself is skipped when it lies inside the folder.  Returns the
+    number of files written."""
+    import zipfile
+    folder = os.path.abspath(folder)
+    base = os.path.dirname(folder)
+    target = os.path.normcase(os.path.abspath(zip_path))
+    n = 0
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(folder):
+            dirs.sort()
+            for f in sorted(files):
+                fp = os.path.join(root, f)
+                if os.path.normcase(os.path.abspath(fp)) == target:
+                    continue
+                zf.write(fp, os.path.relpath(fp, base))
+                n += 1
+    return n

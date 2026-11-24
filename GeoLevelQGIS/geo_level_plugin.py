@@ -31,6 +31,9 @@ _PROJECTS_DIR = os.path.join(_PLUGIN_DIR, "projects")
 
 LSA_FIELD = "in_lsa"        # 1 = line used in the last adjustment applied to the map
 LSA_COLOR = "#1565C0"       # blue
+DEFAULT_CLASS = "H3"         # project precision class of a new project
+DEFAULT_METHOD = "BFFB"      # project measure method of a new project
+MEASURE_METHODS = ("BF", "BFFB", "BBFF")
 
 
 def _apply_line_renderer(layer):
@@ -297,7 +300,8 @@ class GeoLevelPlugin:
         self._val_results = []
         self._layer = None
         self._last_output_dir = ""
-        self._last_class = "H3"
+        self._last_class = DEFAULT_CLASS
+        self._project_method = DEFAULT_METHOD   # one measure method for all lines
         self._pending_pid_remap = {}         # Point ID remaps from resolution dialog
         self._pending_marker_pids = {}       # Marker PIDs (estimate/pkt) from resolution
         self._pending_excluded = set()       # Field PIDs excluded in the resolution dialog
@@ -321,6 +325,10 @@ class GeoLevelPlugin:
         # "<Description>_DD_MM_YYYY_H_MM" - set when a new project gets its
         # first files, or from the .glp / .gpkg name when a project is opened
         self._project_name = ""
+        self._project_dir = ""            # <parent>/<project name>/ - all project files
+        self._last_parent_dir = ""        # where the last project folder was created
+        from geo_level_log import ProjectLogFile
+        self._project_log = ProjectLogFile()   # <project dir>/<name>.log
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -348,6 +356,7 @@ class GeoLevelPlugin:
         proj_menu.addAction("Load Project…").triggered.connect(self._load_project)
         proj_menu.addSeparator()
         proj_menu.addAction("Export Results (REZ / GeoJSON)…").triggered.connect(self._export_results)
+        proj_menu.addAction("Export Project as ZIP…").triggered.connect(self._export_project_zip)
         proj_menu.addSeparator()
         proj_menu.addAction("Project Properties…").triggered.connect(self._show_project_properties)
 
@@ -431,7 +440,7 @@ class GeoLevelPlugin:
         self.dock.override_changed.connect(lambda *_: self._autosave_gpkg())
         self.dock.line_modified.connect(lambda *_: self._autosave_gpkg())
         self.dock.project_class_changed.connect(self._on_project_class_changed)
-        self.dock.line_settings_changed.connect(self._on_line_settings_changed)
+        self.dock.project_method_changed.connect(self._on_project_method_changed)
         self._install_log_capture()
 
     def _install_log_capture(self):
@@ -452,6 +461,8 @@ class GeoLevelPlugin:
                 names.append(getattr(lg, "name", mod))
             self._log_hub = LogHub(self.dock)
             self._log_hub.entry.connect(self.dock.append_log_entry)
+            self._log_hub.entry.connect(self._project_log.write)
+            self.dock.log_written.connect(self._project_log.write)
             self._log_capture = PluginLogCapture(self._log_hub, names).install()
             self.dock.log("Log capture started (plugin loggers + QGIS message log).")
         except Exception:
@@ -484,6 +495,31 @@ class GeoLevelPlugin:
         self._set_project_name(name)
         if self.dock:
             self.dock.log(f"Project name: {name}")
+
+    def _start_project_folder(self, parent_dir, file_paths, file_titles=None) -> str:
+        """Name the new project and create ``<parent>/<name>/``; returns the
+        folder.  Everything of the project (.glp, .gpkg, GeoJSON, REZ,
+        FA0/FA1/PDF exports, <name>.log) is written there."""
+        from core_logic.project_naming import project_folder
+        self._ensure_project_name(file_paths, file_titles)
+        folder = project_folder(parent_dir, self._project_name)
+        self._last_parent_dir = os.path.dirname(folder)
+        self._set_project_dir(folder)
+        return folder
+
+    def _set_project_dir(self, folder: str):
+        """Project folder -> dock export folder + the project's .log file."""
+        self._project_dir = folder or ""
+        if self.dock:
+            self.dock.export_dir = self._project_dir
+        if not folder or not self._project_name:
+            self._project_log.close()
+            return
+        initial = self.dock.log_text.toPlainText() if self.dock else ""
+        self._project_log.open(os.path.join(folder, self._project_name + ".log"),
+                               initial, self._project_name)
+        if self.dock and self._project_log.path:
+            self.dock.log(f"Project folder: {folder}")
 
     def _log_timing(self, label):
         """Context manager: '<label>: N.NN s' as a TIMING entry in the Log tab."""
@@ -551,12 +587,18 @@ class GeoLevelPlugin:
         load_remap = dict(getattr(self, "_pending_pid_remap", None) or {})
         self._pending_pid_remap = {}
         leveling_class = leveling_class or self._last_class or "H3"
+        # Files added to an open project always go to its project folder
+        if self._lines and self._project_dir and os.path.isdir(self._project_dir):
+            output_dir = self._project_dir
         output_dir     = output_dir or self._last_output_dir
 
         if not output_dir:
+            # New project: the folder in which its own project folder
+            # "<name>_DD_MM_YYYY_H_MM" will be created
             output_dir = QFileDialog.getExistingDirectory(
-                self.iface.mainWindow(), "Select Output Directory"
-            )
+                self.iface.mainWindow(),
+                "Where should the new project folder be created?",
+                self._last_parent_dir or os.path.expanduser("~"))
             if not output_dir:
                 return
 
@@ -589,6 +631,7 @@ class GeoLevelPlugin:
 
         import time as _time
         _t_load = _time.perf_counter()
+        n_prev_lines = len(self._lines)
         if self.dock:
             self.dock.log(f"Loading {len(new_paths)} file(s), class {leveling_class}, "
                           f"output folder {output_dir}")
@@ -614,6 +657,18 @@ class GeoLevelPlugin:
 
         progress.close()
         self._log_elapsed("Parse files", _t_load)
+
+        # New project: name it after the first file's header + start time and
+        # give it its own folder - every project file is written there.
+        if n_prev_lines == 0:
+            try:
+                output_dir = self._start_project_folder(
+                    output_dir, new_paths, result.get("file_titles"))
+                self._last_output_dir = output_dir
+            except OSError as exc:
+                QMessageBox.critical(self.iface.mainWindow(), "Geo Level Gravi",
+                                     f"Could not create the project folder:\n{exc}")
+                return
 
         # Append new lines to existing list
         new_lines = result["lines"]
@@ -684,9 +739,12 @@ class GeoLevelPlugin:
                 if ln.start_point in unuse or ln.end_point in unuse:
                     ln.is_used = False
             self._pending_unuse = set()
+        if self.dock and hasattr(self.dock, "get_selected_method"):
+            m = self.dock.get_selected_method()
+            if m in MEASURE_METHODS:
+                self._project_method = m
+        self._apply_project_method(new_lines)
         self._lines.extend(new_lines)
-        if n_prev == 0:
-            self._ensure_project_name(new_paths, result.get("file_titles"))
 
         # Seed the DB spatial centroid from the 'נקודות בקרה' control-points layer.
         # This must run before any LSA/loops/double-runs dialog can fire, so the
@@ -724,6 +782,8 @@ class GeoLevelPlugin:
             # volatile memory/GeoJSON layers for the GPKG-backed ones.
             self._persist_to_gpkg()
         self._log_elapsed("Map layers + GeoPackage", _t_map)
+        if not self._glp_path and self._project_dir and self._project_name:
+            self._write_glp(os.path.join(self._project_dir, self._project_name + ".glp"))
         self._show_dock()
         self.dock.load_lines(self._lines, self._val_results)
         self._log_elapsed("Load files (total)", _t_load)
@@ -936,39 +996,52 @@ class GeoLevelPlugin:
             QMessageBox.information(self.iface.mainWindow(), "Save Project",
                                     "No lines loaded to save.")
             return
-        os.makedirs(_PROJECTS_DIR, exist_ok=True)
         if self._glp_path:
             default_path = self._glp_path
         else:
-            from core_logic.project_naming import make_project_name
+            from core_logic.project_naming import make_project_name, project_folder
             if not self._project_name:
                 self._set_project_name(make_project_name("GeoLevel"))
-            default_path = os.path.join(_PROJECTS_DIR, self._project_name + ".glp")
+            folder = self._project_dir
+            if not folder:
+                base = self._last_output_dir or self._default_output_dir() or _PROJECTS_DIR
+                folder = project_folder(base, self._project_name)
+                self._set_project_dir(folder)
+            default_path = os.path.join(folder, self._project_name + ".glp")
         path, _ = QFileDialog.getSaveFileName(
             self.iface.mainWindow(), "Save Project",
             default_path, "Geo Level Project (*.glp)"
         )
         if not path:
             return
-        # Resolve a valid output_dir to store in the project file so the
-        # load path never has to prompt the user for a directory.
-        output_dir = self._last_output_dir
+        gpkg = self._write_glp(path, refresh=True)
+        msg = f"Project saved: {path}"
+        if not gpkg:
+            msg += "  (GeoPackage could not be written - reload will re-parse files)"
+        self.iface.messageBar().pushMessage("Geo Level Gravi", msg,
+                                            level=Qgis.Success if gpkg else Qgis.Warning,
+                                            duration=5)
+
+    def _write_glp(self, path: str, refresh: bool = False) -> str:
+        """Write the .glp pointer file (class, output folder, relative GPKG
+        path, source files, Point Settings).  refresh=True first rewrites the
+        GeoPackage tables.  Returns the GPKG path ("" when there is none)."""
+        output_dir = self._project_dir or self._last_output_dir
         if not output_dir or not os.path.isdir(output_dir):
             output_dir = self._default_output_dir()
-
         # Make sure the GeoPackage holds the current state (statuses,
         # overrides, Point Settings choices) before the .glp points to it.
-        gpkg = self._refresh_gpkg_tables()
+        gpkg = self._refresh_gpkg_tables() if refresh else self._gpkg_path
         gpkg_ref = ""
         if gpkg:
             try:
                 gpkg_ref = os.path.relpath(gpkg, os.path.dirname(os.path.abspath(path)))
             except ValueError:            # different drive on Windows
                 gpkg_ref = os.path.abspath(gpkg)
-
         data = {
             "version": 2,
             "class": self._last_class,
+            "method": self._project_method,
             "output_dir": output_dir,
             # GeoPackage with layers + line/setup tables: loading uses it
             # directly, without re-parsing files or querying the DB.
@@ -978,21 +1051,25 @@ class GeoLevelPlugin:
             # Point Settings choices keyed by original field point ID
             "point_overrides": self._point_overrides,
         }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except OSError:
+            QgsMessageLog.logMessage("Writing the .glp failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+            return gpkg
         self._glp_path = os.path.abspath(path)
-        self._set_project_name(os.path.splitext(os.path.basename(path))[0])
-        msg = f"Project saved: {path}"
-        if not gpkg:
-            msg += "  (GeoPackage could not be written - reload will re-parse files)"
-        self.iface.messageBar().pushMessage("Geo Level Gravi", msg,
-                                            level=Qgis.Success if gpkg else Qgis.Warning,
-                                            duration=5)
+        if not self._project_name:
+            self._set_project_name(os.path.splitext(os.path.basename(path))[0])
+        if self.dock:
+            self.dock.log(f"Project file written: {self._glp_path}")
+        return gpkg
 
     def _load_project(self):
         path, _ = QFileDialog.getOpenFileName(
             self.iface.mainWindow(), "Load Project",
-            _PROJECTS_DIR,
+            self._last_parent_dir or _PROJECTS_DIR,
             "Geo Level Project (*.glp *.gpkg);;Project file (*.glp);;"
             "Project GeoPackage (*.gpkg)"
         )
@@ -1014,6 +1091,8 @@ class GeoLevelPlugin:
                 return
             self._glp_path = ""
             self._set_project_name(os.path.splitext(os.path.basename(real))[0])
+            self._set_project_dir(os.path.dirname(real))
+            self._last_parent_dir = os.path.dirname(os.path.dirname(real))
             return
 
         try:
@@ -1048,8 +1127,14 @@ class GeoLevelPlugin:
             # (needed so a later fallback GPKG name is written back to it).
             self._glp_path = os.path.abspath(path)
             self._set_project_name(os.path.splitext(os.path.basename(path))[0])
+            self._set_project_dir(glp_dir)
+            self._last_parent_dir = os.path.dirname(glp_dir)
             return
         cls = cls or "H3"
+        method = data.get("method")
+        self._project_method = method if method in MEASURE_METHODS else DEFAULT_METHOD
+        if self.dock:
+            self.dock.set_project_settings(cls, self._project_method)
 
         # -- Legacy path: re-parse the measurement files ------------------
         # Resolve each file: absolute path, then the .glp folder and the
@@ -1101,6 +1186,7 @@ class GeoLevelPlugin:
         # Clear _glp_path before attempting load (no prior state to restore)
         self._glp_path = ""
         self._set_project_name(os.path.splitext(os.path.basename(path))[0])
+        self._set_project_dir(glp_dir)
         try:
             self._process_files(resolved_files, cls, output_dir)
         except Exception:
@@ -1207,6 +1293,7 @@ class GeoLevelPlugin:
         return {
             "leveling_class": cls,
             "class": cls,                       # schema-1 readers
+            "measure_method": self._project_method,
             "output_dir": self._last_output_dir,
             "dat_files": list(dict.fromkeys(self._line_src_path(ln) for ln in self._lines)),
             "point_overrides": self._point_overrides,
@@ -1410,35 +1497,61 @@ class GeoLevelPlugin:
         return True
 
     def _on_project_class_changed(self, cls: str) -> None:
-        """Precision Class changed in the dock: re-validate every line that has
-        no class of its own, refresh list / map, save to the GeoPackage."""
-        if cls not in ("H1", "H2", "H3", "H4", "H5", "H6") or cls == self._last_class:
+        """Precision Class changed in the dock: it is the class of EVERY line
+        (no per-line classes - one unambiguous project state).  Re-validate,
+        refresh list / map, save to the GeoPackage."""
+        if cls not in ("H1", "H2", "H3", "H4", "H5", "H6"):
+            return
+        own = [ln for ln in self._lines if getattr(ln, "leveling_class", None)]
+        if cls == self._last_class and not own:
             return
         old, self._last_class = self._last_class, cls
+        for ln in own:
+            ln.leveling_class = None
         if not self._lines:
             return
-        self._after_validation_change(f"Precision class {old} -> {cls}")
+        self._after_validation_change(f"Precision class {old} -> {cls} (all lines)")
 
-    def _on_line_settings_changed(self, idx: int, field: str, value: str) -> None:
-        """Per-line precision class / measure method edited in Line Details."""
-        if not (0 <= idx < len(self._lines)):
+    def _on_project_method_changed(self, method: str) -> None:
+        """Measure method changed in the dock: applied to every line."""
+        if method not in MEASURE_METHODS:
             return
-        ln = self._lines[idx]
-        if field == "leveling_class":
-            new = value if value in ("H1", "H2", "H3", "H4", "H5", "H6") else None
-            if new == getattr(ln, "leveling_class", None):
-                return
-            msg = (f"{ln.filename}: precision class "
-                   f"{getattr(ln, 'leveling_class', None) or 'project'} -> {new or 'project'}")
-            ln.leveling_class = new
-        elif field == "method":
-            if not value or value == ln.method:
-                return
-            msg = f"{ln.filename}: measure method {ln.method} -> {value}"
-            ln.method = value
-        else:
+        changed = method != self._project_method or any(
+            ln.method != method for ln in self._lines)
+        old, self._project_method = self._project_method, method
+        if not changed or not self._lines:
             return
-        self._after_validation_change(msg, keep_index=idx)
+        self._apply_project_method(self._lines)
+        self._after_validation_change(f"Measure method {old} -> {method} (all lines)")
+
+    @staticmethod
+    def _majority_method(lines) -> str:
+        from collections import Counter
+        c = Counter(str(getattr(ln, "method", "") or "") for ln in lines)
+        c.pop("", None)
+        for m, _n in c.most_common():
+            if m in MEASURE_METHODS:
+                return m
+        return DEFAULT_METHOD
+
+    def _apply_project_method(self, lines) -> None:
+        """Give *lines* the project measure method.  A raw measurement file
+        whose readings show another method is reported (WARNING) - the
+        declared method then overrides what the parser detected."""
+        method = self._project_method or DEFAULT_METHOD
+        differ = []
+        for ln in lines:
+            detected = getattr(ln, "measured_method", None)
+            if detected is None and not getattr(ln, "is_summary", False) and ln.setups:
+                detected = ln.method
+                ln.measured_method = detected
+            if detected and detected != method:
+                differ.append(f"{ln.filename} ({detected})")
+            ln.method = method
+        if differ and self.dock:
+            self.dock.log(f"Measure method {method} set for all lines; the readings of "
+                          f"{len(differ)} file(s) look different: " + ", ".join(differ[:10])
+                          + (" ..." if len(differ) > 10 else ""), level="WARNING")
 
     def _after_validation_change(self, msg: str, keep_index: int = None) -> None:
         self._revalidate_all(self._last_class)
@@ -1587,6 +1700,7 @@ class GeoLevelPlugin:
             self.dock.clear_all()
 
         self._last_class = cls or meta["leveling_class"]
+        self._project_method = meta.get("measure_method") or self._majority_method(lines)
         self._last_output_dir = output_dir
         self._lines = lines
         self._val_results = []
@@ -1616,11 +1730,18 @@ class GeoLevelPlugin:
         except Exception:
             pass
 
-        if self.dock and hasattr(self.dock, "class_combo"):
-            self.dock.class_combo.blockSignals(True)     # loading: no re-validation
-            self.dock.class_combo.setCurrentText(self._last_class)
-            self.dock.class_combo.blockSignals(False)
+        if self.dock and hasattr(self.dock, "set_project_settings"):
+            # loading: show the saved class / method, no re-validation
+            self.dock.set_project_settings(self._last_class, self._project_method)
             self.dock.class_lbl.setText(_class_description(self._last_class))
+            own = sorted({ln.leveling_class for ln in self._lines
+                          if getattr(ln, "leveling_class", None)} - {self._last_class})
+            mixed = sorted({ln.method for ln in self._lines} - {self._project_method})
+            if own or mixed:
+                self.dock.log("This project was saved with per-line settings "
+                              f"(classes {own or '-'}, methods {mixed or '-'}); choosing "
+                              "Class / Method applies one value to every line.",
+                              level="WARNING")
         changed = self._restore_saved_validation(saved_vrs)
         self._sync_map_statuses()
         self._show_dock()
@@ -1692,7 +1813,8 @@ class GeoLevelPlugin:
         self._lines = []
         self._val_results = []
         self._last_output_dir = ""
-        self._last_class = "H3"
+        self._last_class = DEFAULT_CLASS
+        self._project_method = DEFAULT_METHOD
 
         # Clear DB session cache so proximity centroid resets for the new project
         try:
@@ -1706,6 +1828,7 @@ class GeoLevelPlugin:
         self._gpkg_path = ""
         self._glp_path = ""
         self._set_project_name("")
+        self._set_project_dir("")
         self._pending_pid_remap = {}
         self._file_benchmarks = {}
         self._file_approx = {}           # approximate heights listed in FA0 / FA1
@@ -2814,14 +2937,42 @@ class GeoLevelPlugin:
             "Saved " + str(len(unique_files)) + " files to " + save_path,
             level=Qgis.Success, duration=5)
 
+    def _export_project_zip(self):
+        """Zip the whole project folder (.glp, .gpkg, exports, .log)."""
+        folder = self._project_dir
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.information(self.iface.mainWindow(), "Export Project as ZIP",
+                                    "No project folder yet - load files first.")
+            return
+        self._refresh_gpkg_tables()          # current state into the GPKG first
+        default = os.path.join(os.path.dirname(folder), os.path.basename(folder) + ".zip")
+        path, _ = QFileDialog.getSaveFileName(
+            self.iface.mainWindow(), "Export Project as ZIP", default, "ZIP archive (*.zip)")
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        try:
+            from core_logic.project_naming import zip_folder
+            n = zip_folder(folder, path)
+        except OSError as exc:
+            QMessageBox.warning(self.iface.mainWindow(), "Export Project as ZIP", str(exc))
+            return
+        self.dock.log(f"Project exported as ZIP: {path} ({n} files)")
+        self.iface.messageBar().pushMessage("Geo Level Gravi", f"Project ZIP: {path}",
+                                            level=Qgis.Success, duration=5)
+
     def _export_results(self):
         if not self._lines:
             QMessageBox.information(self.iface.mainWindow(), "Export Results",
                                     "No lines loaded.")
             return
-        output_dir = QFileDialog.getExistingDirectory(
-            self.iface.mainWindow(), "Select Export Directory", self._last_output_dir
-        )
+        # exports go into the project folder; ask only when there is none
+        output_dir = self._project_dir if os.path.isdir(self._project_dir or "") else ""
+        if not output_dir:
+            output_dir = QFileDialog.getExistingDirectory(
+                self.iface.mainWindow(), "Select Export Directory", self._last_output_dir
+            )
         if not output_dir:
             return
         try:

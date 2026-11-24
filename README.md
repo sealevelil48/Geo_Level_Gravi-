@@ -29,10 +29,10 @@ benchmark database, and adjusts the network by least squares, with FA0 / FA1
 | **Point Settings** | Edit after loading: re-pick a DB point, search, exclude, or mark a point "estimate". |
 | **Adjustment** (one window) | Step 1: average forward/return runs (checked against k·√L, one-direction L). Step 2: approximate heights. Then parametric (V = AX − L) or conditional (Bv + w = 0) least squares, single-line adjustment, **Apply to Map** (adjusted heights on the points; the lines of the run drawn **blue**), **Export FA0 / FA1** in the legacy program's exact layout, **PDF report**. **Auto-Select** takes exactly the fixed points defined by the loaded FA0/FA1 headers. See [docs/LSA_ENGINE.md](docs/LSA_ENGINE.md). |
 | **Loading** | **+ Add Files**, or **drag files / folders from Windows Explorer onto the "Leveling Lines" list** (.DAT .RAW .GSI .FA0 .FA1 .rez; folders are searched recursively). Both run the same pipeline, including Point Verification. |
-| **Project name** | A new project is named after the first loaded file's header description (FA0/FA1 title such as `K6177-64PU-65PU`, the REZ project name, else the file name) plus the start time: `K6177-64PU-65PU_24_11_2026_9_25`. It is the default `.glp` / `.gpkg` file name; characters not allowed in Windows file names become `_`. |
-| **Per-line settings** | Left panel, **Precision Class** group (under Toggle Dir / Toggle Use): the project class, and for the selected line its **Class** (or the project class) and **Method** (BF / BFFB / BBFF). Changing them re-validates immediately and autosaves to the GeoPackage. |
+| **Project name & folder** | A new project is named after the first loaded file's header description (FA0/FA1 title such as `K6177-64PU-65PU`, the REZ project name, else the file name) plus the start time: `K6177-64PU-65PU_24_11_2026_9_57`; characters not allowed in Windows file names become `_`. The plugin asks once where to create the project and makes the folder `<that folder>/<project name>/`. **Everything** of the project is written there: `<name>.glp` (written automatically), `<name>.gpkg`, GeoJSON/REZ, FA0/FA1/PDF/Excel exports and `<name>.log`, which is kept up to date while you work. *Project → Export Project as ZIP…* packs the folder. |
+| **Class & method** | Left panel, **Precision Class** group (under Toggle Dir / Toggle Use): one **Class** (default **H3**) and one **Method** (default **BFFB**; BF / BFFB / BBFF) for the whole project — they apply to every line. Changing either re-validates immediately and autosaves to the GeoPackage. When a raw file's readings show a different method, the Log tab warns. |
 | **Analysis** | **Double-runs** per Directive ג2 App. C: sections measured more than once are paired (first run = forward), δ = ΔH fwd + ΔH ret checked against k·√L (L one direction, the line's class), mean ΔH = (ΔH fwd − ΔH ret)/2 — the same numbers as LSA Step 1. Loop finder, line merging, Excel export of the validation table. |
-| **Log** | The Log tab shows every plugin message in real time — processing steps, warnings, errors, step timings, the plugin's Python loggers and its QGIS Message Log entries. **Export Log…** saves it to a `.log` / `.txt` file (UTF-8). |
+| **Log** | The Log tab shows every plugin message in real time — processing steps, warnings, errors, step timings, the plugin's Python loggers and its QGIS Message Log entries. It is also written to `<project folder>/<name>.log`; **Export Log…** saves a copy as `.log` / `.txt` (UTF-8). |
 | **Project state** | GeoPackage-first: lines, setups, validation, point choices and the last adjustment are stored in one `.gpkg` beside the data and autosaved after every edit. A small `.glp` file points to it. |
 
 ### Tolerances (Directive ג2, 2021)
@@ -81,8 +81,8 @@ is used first to place points.
 3. Check the dock: red lines are invalid; open a line for its setups and messages.
 4. **Network Adjustment (LSA)** → *Prepare (Steps 1–2)* → choose fixed points
    → *Run Adjustment* → *Apply to Map* / *Export FA0* / *Export FA1* / *PDF Report*.
-5. The project is saved automatically in the GeoPackage; *Save Project…*
-   writes the `.glp` you reopen later.
+5. The project is saved automatically in its folder (`.gpkg`, `.glp`,
+   `.log`); reopen it with *Load Project…* (the `.glp` or the `.gpkg`).
 
 ---
 
