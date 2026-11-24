@@ -281,74 +281,61 @@ class LoopAnalyzer:
         return self.graph.find_minimum_loops()
     
     def analyze_double_run(self, line1: LevelingLine, line2: LevelingLine,
-                          target_class: int = 3) -> Dict:
+                          target_class=3) -> Dict:
         """
-        Analyze a double-run (back-and-forth) measurement using new regulations.
+        Double-run check of one section (Directive G2 2021, Appendix C).
+
+        line1 is the forward run; line2 the return run (or a repeat in the
+        same direction).  delta = dH_fwd + dH_ret (return in its own
+        direction), allowed = k*sqrt(L) with L the ONE-direction length in km
+        (mean of the two runs), mean dH = (dH_fwd - dH_ret)/2 in the forward
+        direction.  Same numbers as network_prep.merge_observations (Step 1).
 
         Args:
-            line1: Forward measurement
-            line2: Return measurement
-            target_class: Target accuracy class (1-6), defaults to H3 (Item 10 - changed from H1)
-
-        Returns:
-            Analysis results dictionary
+            target_class: 1-6 or 'H1'-'H6' (default H3)
         """
-        if not (line1.start_point == line2.end_point and
-                line1.end_point == line2.start_point):
+        from core_logic.engine.network_prep import (
+            achieved_class, class_number, tolerance_mm)
+
+        ends1 = {line1.start_point, line1.end_point}
+        if ends1 != {line2.start_point, line2.end_point} or len(ends1) != 2:
             return {
                 'valid': False,
                 'error': 'Lines do not form a proper double-run'
             }
-
+        opposite = line1.start_point == line2.end_point
         dh_forward = line1.total_height_diff
         dh_return = line2.total_height_diff
+        # line2 reduced to the forward direction
+        dh_return_fwd = -dh_return if opposite else dh_return
 
-        # For double-run, sum should be close to 0
-        misclosure = dh_forward + dh_return
-        misclosure_mm = misclosure * 1000
-
-        # Calculate mean values
-        mean_dh = (dh_forward - dh_return) / 2
+        misclosure = dh_forward - dh_return_fwd      # = dH_fwd + dH_ret
+        misclosure_mm = misclosure * 1000.0
+        mean_dh = (dh_forward + dh_return_fwd) / 2.0  # = (dH_fwd - dH_ret)/2
         total_distance = line1.total_distance + line2.total_distance
-        # Directive G2 App. B 4.1: L is the length in ONE direction
-        dist_km = (total_distance / 2.0) / 1000.0
+        one_dir_m = total_distance / 2.0              # App. B 4.1: L one direction
 
-        # Tolerance for double-run using new regulations
-        try:
-            params = get_class_parameters(target_class)
-            tolerance_mm = params.get_tolerance_mm(dist_km)
-        except ValueError:
-            # Fallback to H3 (not H1!) - Item 10
-            tolerance_mm = 10.0 * math.sqrt(dist_km)
-
-        # Determine achieved class (which class does this measurement satisfy)
-        achieved_class = 6  # Default to H6 if exceeds all (not 0!)
-        for class_num in range(1, 7):
-            try:
-                params = get_class_parameters(class_num)
-                allowed_mm = params.get_tolerance_mm(dist_km)
-                if abs(misclosure_mm) <= allowed_mm:
-                    achieved_class = class_num
-                    break
-            except ValueError:
-                continue
-
+        cls = class_number(target_class)
+        tol_mm = tolerance_mm(one_dir_m, cls)
+        best = achieved_class(misclosure_mm, one_dir_m)
         return {
             'valid': True,
             'forward_dh': dh_forward,
             'return_dh': dh_return,
+            'same_direction': not opposite,
             'misclosure': misclosure,
             'misclosure_mm': misclosure_mm,
             'mean_dh': mean_dh,
             'total_distance': total_distance,
-            'target_class': target_class,
-            'achieved_class': achieved_class,
-            'tolerance_class': achieved_class,  # For backward compatibility
-            'within_tolerance': abs(misclosure_mm) <= tolerance_mm,
-            'tolerance_mm': tolerance_mm,
-            'class_name': f"H{achieved_class}" if achieved_class > 0 else "Exceeded"
+            'distance_one_direction': one_dir_m,
+            'target_class': cls,
+            'achieved_class': best,
+            'tolerance_class': best,  # backward compatibility
+            'within_tolerance': abs(misclosure_mm) <= tol_mm + 1e-9,
+            'tolerance_mm': tol_mm,
+            'class_name': f"H{best}" if best else "Exceeds H6",
         }
-    
+
     def get_network_summary(self) -> Dict:
         """Get a summary of the network."""
         loops = self.find_loops()
@@ -364,33 +351,28 @@ class LoopAnalyzer:
 
 def detect_double_runs(lines: List[LevelingLine]) -> List[Tuple[LevelingLine, LevelingLine]]:
     """
-    Detect double-run pairs in a list of leveling lines.
-    
-    Args:
-        lines: List of LevelingLine objects
-        
-    Returns:
-        List of tuples (forward, return) for each double-run pair
+    Double-run pairs: lines measuring the same section (same two end points,
+    either direction), unused lines skipped.  The first run of a section is
+    the forward run; it is paired with every further run of that section.
+    (network_prep.analyze_double_runs gives the full Appendix C check.)
     """
-    pairs = []
-    used = set()
-    
-    for i, line1 in enumerate(lines):
-        if i in used:
+    groups: Dict[frozenset, List[LevelingLine]] = {}
+    order = []
+    for ln in lines:
+        if not getattr(ln, "is_used", True):
             continue
-        
-        for j, line2 in enumerate(lines[i+1:], i+1):
-            if j in used:
-                continue
-            
-            # Check if these form a double-run
-            if (line1.start_point == line2.end_point and 
-                line1.end_point == line2.start_point):
-                pairs.append((line1, line2))
-                used.add(i)
-                used.add(j)
-                break
-    
+        if not ln.start_point or not ln.end_point or ln.start_point == ln.end_point:
+            continue
+        key = frozenset((ln.start_point, ln.end_point))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(ln)
+    pairs = []
+    for key in order:
+        runs = groups[key]
+        for other in runs[1:]:
+            pairs.append((runs[0], other))
     return pairs
 
 

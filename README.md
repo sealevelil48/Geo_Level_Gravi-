@@ -28,8 +28,11 @@ benchmark database, and adjusts the network by least squares, with FA0 / FA1
 | **Map** | Lines and points as layers in EPSG:2039, styled by validation status. Points missing from the DB (PKT, temporary points) are placed by the topology estimator (yellow diamonds). |
 | **Point Settings** | Edit after loading: re-pick a DB point, search, exclude, or mark a point "estimate". |
 | **Adjustment** (one window) | Step 1: average forward/return runs (checked against k·√L, one-direction L). Step 2: approximate heights. Then parametric (V = AX − L) or conditional (Bv + w = 0) least squares, single-line adjustment, **Apply to Map** (adjusted heights on the points; the lines of the run drawn **blue**), **Export FA0 / FA1** in the legacy program's exact layout, **PDF report**. **Auto-Select** takes exactly the fixed points defined by the loaded FA0/FA1 headers. See [docs/LSA_ENGINE.md](docs/LSA_ENGINE.md). |
-| **Per-line settings** | Line Details: each line's **Precision class** (or the project class) and **Measure method** (BF / BFFB / BBFF). Changing them, or the project Precision Class, re-validates immediately and autosaves to the GeoPackage. |
-| **Analysis** | Double-run detection, loop finder, line merging, Excel export of the validation table. |
+| **Loading** | **+ Add Files**, or **drag files / folders from Windows Explorer onto the "Leveling Lines" list** (.DAT .RAW .GSI .FA0 .FA1 .rez; folders are searched recursively). Both run the same pipeline, including Point Verification. |
+| **Project name** | A new project is named after the first loaded file's header description (FA0/FA1 title such as `K6177-64PU-65PU`, the REZ project name, else the file name) plus the start time: `K6177-64PU-65PU_24_11_2026_9_25`. It is the default `.glp` / `.gpkg` file name; characters not allowed in Windows file names become `_`. |
+| **Per-line settings** | Left panel, **Precision Class** group (under Toggle Dir / Toggle Use): the project class, and for the selected line its **Class** (or the project class) and **Method** (BF / BFFB / BBFF). Changing them re-validates immediately and autosaves to the GeoPackage. |
+| **Analysis** | **Double-runs** per Directive ג2 App. C: sections measured more than once are paired (first run = forward), δ = ΔH fwd + ΔH ret checked against k·√L (L one direction, the line's class), mean ΔH = (ΔH fwd − ΔH ret)/2 — the same numbers as LSA Step 1. Loop finder, line merging, Excel export of the validation table. |
+| **Log** | The Log tab shows every plugin message in real time — processing steps, warnings, errors, step timings, the plugin's Python loggers and its QGIS Message Log entries. **Export Log…** saves it to a `.log` / `.txt` file (UTF-8). |
 | **Project state** | GeoPackage-first: lines, setups, validation, point choices and the last adjustment are stored in one `.gpkg` beside the data and autosaved after every edit. A small `.glp` file points to it. |
 
 ### Tolerances (Directive ג2, 2021)
@@ -70,7 +73,8 @@ is used first to place points.
 
 ## Typical workflow
 
-1. **Open / Load Files…**: choose the measurement files and the class (H1–H6).
+1. **Open / Load Files…**, **+ Add Files**, or drag files/folders onto the
+   Leveling Lines list; choose the class (H1–H6).
 2. **Point Verification**: confirm or pick the DB point for each open ID.
    Use *Search DB* when the right point is not listed; choose *Decide later*
    to let matching continue from the points you are sure of.
@@ -106,7 +110,8 @@ Reference project (348 files, 175 points, 40 ms network latency): about
 ```
 GeoLevelQGIS/                     the plugin (this folder is what deploy.bat installs)
 ├── geo_level_plugin.py           plugin class: menus, load pipeline, map ↔ dock sync, GPKG state
-├── geo_level_dockwidget.py       dock: line list, setups, validation, log
+├── geo_level_dockwidget.py       dock: line list (drag-and-drop), setups, validation, log
+├── geo_level_log.py              unified Log tab: logging + QgsMessageLog capture, export
 ├── geo_level_point_resolution_dialog.py   Point Verification / Point Settings
 ├── geo_level_enhanced_lsa_dialog.py       adjustment window (Steps 1–2, LSA, exports)
 ├── geolevel_db_manager.py        benchmark DB: batch lookup, search, network matching
@@ -121,6 +126,7 @@ GeoLevelQGIS/                     the plugin (this folder is what deploy.bat ins
     ├── gis/                      GeoJSON export, topology estimator
     ├── exporters/                FA0 / FA1 / REZ writers
     ├── process.py                parse → validate → coordinates → GeoJSON/REZ
+    ├── project_naming.py         <Description>_DD_MM_YYYY_H_MM project names
     └── tests/                    engine unit tests (pytest)
 tests/                            plugin-level tests (DB matching, GeoPackage, security)
 docs/                             LSA_ENGINE.md (adjustment maths), reference/ (source PDFs)
@@ -132,11 +138,12 @@ deploy.bat                        Windows installer script
 ## Tests
 
 ```bash
-cd GeoLevelQGIS && python -m pytest core_logic/tests    # engine: LSA, Steps 1-2, FA0/FA1/REZ, topology
+cd GeoLevelQGIS && python -m pytest core_logic/tests    # engine: LSA, Steps 1-2, double runs (App. C), FA0/FA1/REZ, naming, topology
 cd ..
 python tests/test_point_resolution.py                   # DB matching (in-memory fake DB)
 python tests/test_gpkg_roundtrip.py                     # GeoPackage state round-trip
 python tests/test_vuln.py                               # untrusted-input checks
+python tests/test_log_and_drop.py                       # Log tab capture/export, drag-and-drop file collection
 ```
 
 The LSA tests reproduce textbook networks (parametric AX−L and conditional

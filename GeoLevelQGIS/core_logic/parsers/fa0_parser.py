@@ -46,6 +46,7 @@ class FA0Parser(BaseParser):
         lines: List[LevelingLine] = []
         has_header = bool(rows) and self._is_header(rows[0])
         n_fixed = self.header_fixed_count(rows[0]) if has_header else None
+        self.title = self.header_title(rows[0]) if has_header else ""
         listed = 0
         body = rows[1:] if has_header else rows
         for no, raw in enumerate(body, start=2):
@@ -90,6 +91,15 @@ class FA0Parser(BaseParser):
         if len(toks) >= 2 and toks[0].isdigit() and toks[1].isdigit():
             return int(toks[1])
         return None
+
+    @staticmethod
+    def header_title(row: str) -> str:
+        """Description of the header '36   2   K6177-64PU-65PU   9' ->
+        'K6177-64PU-65PU' (the trailing '9' end marker is not part of it)."""
+        toks = row.split()[2:]
+        if toks and toks[-1] == "9":
+            toks = toks[:-1]
+        return " ".join(toks).strip()
 
     @staticmethod
     def _is_header(row: str) -> bool:

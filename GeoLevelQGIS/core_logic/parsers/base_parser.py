@@ -68,6 +68,9 @@ class BaseParser(ABC):
         """
         self.settings = get_settings()
         self.encoding = encoding or self.settings.encoding.default_encoding
+        # Description from the file header (FA0/FA1 title, REZ project name);
+        # "" when the format has none - callers then use the file name.
+        self.title = ""
         self.errors: List[str] = []
         self.warnings: List[str] = []
         # Known heights found in the file ({point_id: height}); summary

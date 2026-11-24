@@ -222,10 +222,12 @@ def process_geodetic_data(
 
     file_benchmarks = {}   # FIXED points of .FA0 / .FA1 files (header order)
     file_approx = {}       # other heights listed there (approximate)
+    file_titles = {}       # abs path -> header description (FA0/FA1/REZ) or ""
     if preparsed is not None:
         lines = preparsed["lines"]
         file_benchmarks = dict(preparsed.get("file_benchmarks") or {})
         file_approx = dict(preparsed.get("file_approx") or {})
+        file_titles = dict(preparsed.get("file_titles") or {})
         parse_errors = list(preparsed.get("parse_errors") or [])
         file_paths = []
     for fp in file_paths:
@@ -241,6 +243,7 @@ def process_geodetic_data(
                 file_benchmarks[pid] = h
             for pid, h in (getattr(parser, "approx_heights", None) or {}).items():
                 file_approx[pid] = h
+            file_titles[os.path.abspath(fp)] = str(getattr(parser, "title", "") or "")
             if len(parsed) == 1:
                 log.info("Parsed: %s  (%s → %s)", Path(fp).name,
                          parsed[0].start_point, parsed[0].end_point)
@@ -266,6 +269,7 @@ def process_geodetic_data(
             pristine = copy.deepcopy(lines)
         snapshot = {"lines": pristine, "file_benchmarks": dict(file_benchmarks),
                     "file_approx": dict(file_approx),
+                    "file_titles": dict(file_titles),
                     "parse_errors": list(parse_errors)}
 
     # Apply verified DB name overrides (e.g. ASCII → Hebrew) before any
@@ -285,6 +289,7 @@ def process_geodetic_data(
             "lines_geojson": "", "points_geojson": "", "line_style": "",
             "point_style": "", "rez_path": None,
             "file_benchmarks": renamed_benchmarks, "file_approx": renamed_approx,
+            "file_titles": file_titles,
             "summary": {"total": len(lines), "valid": 0, "invalid": 0,
                         "warnings": 0, "parse_errors": parse_errors},
             "lines": lines,
@@ -354,6 +359,7 @@ def process_geodetic_data(
         "rez_path":       rez_path,
         # Known heights read from .FA0 / .FA1 files (renamed like the lines)
         "file_benchmarks": renamed_benchmarks, "file_approx": renamed_approx,
+        "file_titles": file_titles,
         "summary": {
             "total":    len(lines),
             "valid":    valid_count,

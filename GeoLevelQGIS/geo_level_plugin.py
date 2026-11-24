@@ -316,6 +316,11 @@ class GeoLevelPlugin:
         self._file_approx = {}           # approximate heights listed in FA0 / FA1
         # Last adjustment applied to the map (persisted in the GeoPackage)
         self._last_adjustment = {}
+        self._log_hub = None
+        self._log_capture = None
+        # "<Description>_DD_MM_YYYY_H_MM" - set when a new project gets its
+        # first files, or from the .glp / .gpkg name when a project is opened
+        self._project_name = ""
 
     # ------------------------------------------------------------------
     # QGIS lifecycle
@@ -394,6 +399,9 @@ class GeoLevelPlugin:
             QgsProject.instance().layerWasAdded.disconnect(self._prepare_layer_signals)
         except Exception:
             pass
+        if getattr(self, "_log_capture", None) is not None:
+            self._log_capture.uninstall()
+            self._log_capture = None
         if self.dock:
             self.iface.removeDockWidget(self.dock)
             self.dock.deleteLater()
@@ -424,6 +432,64 @@ class GeoLevelPlugin:
         self.dock.line_modified.connect(lambda *_: self._autosave_gpkg())
         self.dock.project_class_changed.connect(self._on_project_class_changed)
         self.dock.line_settings_changed.connect(self._on_line_settings_changed)
+        self._install_log_capture()
+
+    def _install_log_capture(self):
+        """Unified Log tab: plugin Python loggers + QgsMessageLog messages of
+        the plugin's tags -> LogHub (thread-safe signal) -> dock Log tab."""
+        try:
+            from geo_level_log import LogHub, PluginLogCapture
+            names = [__name__]
+            for mod in ("geolevel_db_manager", "qgis_line_layer_builder",
+                        "geo_level_gpkg"):
+                m = sys.modules.get(mod)
+                if m is None:
+                    try:
+                        m = __import__(mod)
+                    except Exception:
+                        m = None
+                lg = getattr(m, "logger", None)
+                names.append(getattr(lg, "name", mod))
+            self._log_hub = LogHub(self.dock)
+            self._log_hub.entry.connect(self.dock.append_log_entry)
+            self._log_capture = PluginLogCapture(self._log_hub, names).install()
+            self.dock.log("Log capture started (plugin loggers + QGIS message log).")
+        except Exception:
+            self._log_capture = None
+            QgsMessageLog.logMessage("Log capture failed: " + traceback.format_exc(),
+                                     "GeoLevelPlugin", level=Qgis.Warning)
+
+    def _log_elapsed(self, label, t0):
+        """TIMING entry '<label>: N.NN s' since perf_counter value *t0*."""
+        import time as _time
+        msg = f"{label}: {_time.perf_counter() - t0:.2f} s"
+        if getattr(self, "_log_hub", None):
+            self._log_hub.post("TIMING", "timing", msg)
+
+    def _set_project_name(self, name: str):
+        """Current project name -> dock title + Log export default name."""
+        self._project_name = name or ""
+        if self.dock:
+            self.dock.project_name = self._project_name
+            self.dock.export_dir = self._last_output_dir or ""
+            self.dock.setWindowTitle("Geo Level Gravi" + (f" - {name}" if name else ""))
+
+    def _ensure_project_name(self, file_paths, file_titles=None):
+        """New project: name it after the first loaded file's header
+        description + the current date/time (core_logic.project_naming)."""
+        if self._project_name:
+            return
+        from core_logic.project_naming import describe_files, make_project_name
+        name = make_project_name(describe_files(file_paths, file_titles))
+        self._set_project_name(name)
+        if self.dock:
+            self.dock.log(f"Project name: {name}")
+
+    def _log_timing(self, label):
+        """Context manager: '<label>: N.NN s' as a TIMING entry in the Log tab."""
+        from geo_level_log import timed
+        sink = self._log_hub.post if getattr(self, "_log_hub", None) else None
+        return timed(label, sink=sink)
 
     def _show_dock(self):
         if self.dock:
@@ -521,6 +587,11 @@ class GeoLevelPlugin:
         progress.setMinimumDuration(0)
         progress.show()
 
+        import time as _time
+        _t_load = _time.perf_counter()
+        if self.dock:
+            self.dock.log(f"Loading {len(new_paths)} file(s), class {leveling_class}, "
+                          f"output folder {output_dir}")
         try:
             from core_logic.process import process_geodetic_data
             # First pass: parse only.  Its sole consumer is Point
@@ -542,6 +613,7 @@ class GeoLevelPlugin:
             return
 
         progress.close()
+        self._log_elapsed("Parse files", _t_load)
 
         # Append new lines to existing list
         new_lines = result["lines"]
@@ -554,7 +626,10 @@ class GeoLevelPlugin:
         # spatial twins and out-of-radius picks before any layer or LSA runs.
         # (The dialog may shrink new_lines in place, so trim by n_prev.)
         self._pending_excluded = set()
-        if not self._check_point_resolution(new_lines, base_remap=load_remap):
+        _t_pv = _time.perf_counter()
+        _pv_ok = self._check_point_resolution(new_lines, base_remap=load_remap)
+        self._log_elapsed("Point Verification", _t_pv)
+        if not _pv_ok:
             self._lines = self._lines[:n_prev]
             self._val_results = self._val_results[:n_prev]
             self._pending_pid_remap = {}
@@ -568,6 +643,7 @@ class GeoLevelPlugin:
         # before validation and GeoJSON export — fixes INVALID_ENDPOINT errors
         # and missing symbols caused by ASCII names reaching the exporter.
         pid_remap = getattr(self, "_pending_pid_remap", {})
+        _t_run = _time.perf_counter()
         try:
             result = process_geodetic_data(
                 file_paths=new_paths,
@@ -586,6 +662,7 @@ class GeoLevelPlugin:
             # leaving the user with nothing.
         finally:
             self._pending_pid_remap = {}   # consume — one-shot per load
+            self._log_elapsed("Validate + export", _t_run)
 
         new_lines = result["lines"]
         # Known heights carried by .FA0 / .FA1 files (fixed-point candidates)
@@ -608,6 +685,8 @@ class GeoLevelPlugin:
                     ln.is_used = False
             self._pending_unuse = set()
         self._lines.extend(new_lines)
+        if n_prev == 0:
+            self._ensure_project_name(new_paths, result.get("file_titles"))
 
         # Seed the DB spatial centroid from the 'נקודות בקרה' control-points layer.
         # This must run before any LSA/loops/double-runs dialog can fire, so the
@@ -632,6 +711,7 @@ class GeoLevelPlugin:
         # The layers are added, re-styled, snapshotted, removed and re-added
         # from the GeoPackage below.  Freeze the canvas so QGIS renders (with
         # labels) once at the end instead of after every step.
+        _t_map = _time.perf_counter()
         with _frozen_canvas(self.iface):
             self._load_line_layer(result["lines_geojson"], result["line_style"], new_lines)
             self._load_point_layer(result.get("points_geojson", ""),
@@ -643,8 +723,10 @@ class GeoLevelPlugin:
             # Persist layers + line data to the project GeoPackage and swap the
             # volatile memory/GeoJSON layers for the GPKG-backed ones.
             self._persist_to_gpkg()
+        self._log_elapsed("Map layers + GeoPackage", _t_map)
         self._show_dock()
         self.dock.load_lines(self._lines, self._val_results)
+        self._log_elapsed("Load files (total)", _t_load)
 
         s = result["summary"]
         total_loaded = len(self._lines)
@@ -855,9 +937,16 @@ class GeoLevelPlugin:
                                     "No lines loaded to save.")
             return
         os.makedirs(_PROJECTS_DIR, exist_ok=True)
+        if self._glp_path:
+            default_path = self._glp_path
+        else:
+            from core_logic.project_naming import make_project_name
+            if not self._project_name:
+                self._set_project_name(make_project_name("GeoLevel"))
+            default_path = os.path.join(_PROJECTS_DIR, self._project_name + ".glp")
         path, _ = QFileDialog.getSaveFileName(
             self.iface.mainWindow(), "Save Project",
-            _PROJECTS_DIR, "Geo Level Project (*.glp)"
+            default_path, "Geo Level Project (*.glp)"
         )
         if not path:
             return
@@ -892,6 +981,7 @@ class GeoLevelPlugin:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         self._glp_path = os.path.abspath(path)
+        self._set_project_name(os.path.splitext(os.path.basename(path))[0])
         msg = f"Project saved: {path}"
         if not gpkg:
             msg += "  (GeoPackage could not be written - reload will re-parse files)"
@@ -923,6 +1013,7 @@ class GeoLevelPlugin:
                     "(the lv_lines / lv_setups / lv_meta tables are missing or empty).")
                 return
             self._glp_path = ""
+            self._set_project_name(os.path.splitext(os.path.basename(real))[0])
             return
 
         try:
@@ -956,6 +1047,7 @@ class GeoLevelPlugin:
             # Loaded from the GeoPackage: this .glp is now the open project
             # (needed so a later fallback GPKG name is written back to it).
             self._glp_path = os.path.abspath(path)
+            self._set_project_name(os.path.splitext(os.path.basename(path))[0])
             return
         cls = cls or "H3"
 
@@ -1008,6 +1100,7 @@ class GeoLevelPlugin:
         self._remove_result_layers()
         # Clear _glp_path before attempting load (no prior state to restore)
         self._glp_path = ""
+        self._set_project_name(os.path.splitext(os.path.basename(path))[0])
         try:
             self._process_files(resolved_files, cls, output_dir)
         except Exception:
@@ -1182,7 +1275,9 @@ class GeoLevelPlugin:
 
         # Release every layer reading the old GPKG/GeoJSON before writing.
         self._remove_result_layers()
-        default = os.path.join(output_dir, gp.DEFAULT_GPKG_NAME)
+        default = os.path.join(
+            output_dir, (self._project_name + ".gpkg") if self._project_name
+            else gp.DEFAULT_GPKG_NAME)
         stem, ext = os.path.splitext(default)
         candidates = [self._gpkg_path or default]
         candidates += [f"{stem}_{n}{ext}" for n in range(1, 50)]
@@ -1610,6 +1705,7 @@ class GeoLevelPlugin:
         self._point_origin = {}
         self._gpkg_path = ""
         self._glp_path = ""
+        self._set_project_name("")
         self._pending_pid_remap = {}
         self._file_benchmarks = {}
         self._file_approx = {}           # approximate heights listed in FA0 / FA1
@@ -1768,109 +1864,113 @@ class GeoLevelPlugin:
             QMessageBox.critical(self.iface.mainWindow(), "Find Loops -- Error", str(exc))
 
     def _detect_double_runs(self):
+        """Analysis -> Double-Runs (dock button + menu).  Directive G2 (2021)
+        App. C via network_prep.analyze_double_runs: delta = dH_fwd + dH_ret
+        against k*sqrt(L) (L one direction, class of the line), mean dH =
+        (dH_fwd - dH_ret)/2 - the same numbers as LSA Step 1."""
         if not self._lines:
             QMessageBox.information(self.iface.mainWindow(), "Detect Double-Runs",
                                     "No lines loaded.")
             return
         try:
-            from core_logic.engine.loop_detector import detect_double_runs, LoopAnalyzer
-            pairs = detect_double_runs(self._lines)
-
-            tbl = self.dock.double_run_table
-            tbl.setRowCount(0)
-
-            if not pairs:
-                self.dock.log("Detect Double-Runs: no pairs found.")
+            from core_logic.engine.network_prep import analyze_double_runs
+            cls = (self.dock.get_selected_class() if self.dock else None) or self._last_class
+            results = analyze_double_runs(self._lines, cls)
+            self._fill_double_run_table(results)
+            n_fail = sum(1 for r in results if not r.ok)
+            if not results:
+                self.dock.log("Detect Double-Runs: no section measured more than once.")
             else:
-                try:
-                    from geolevel_db_manager import get_db_manager
-                    _db_mgr = get_db_manager()
-                except Exception:
-                    _db_mgr = None
-
-                cls = self.dock.get_selected_class() if self.dock else self._last_class
-                analyzer = LoopAnalyzer(self._lines)
-                for fwd, ret in pairs:
-                    res = analyzer.analyze_double_run(fwd, ret, int(cls[1]))
-                    row = tbl.rowCount()
-                    tbl.insertRow(row)
-
-                    pair_label = fwd.start_point + " <-> " + fwd.end_point
-                    mean_dh = (fwd.total_height_diff - ret.total_height_diff) / 2.0
-                    mis_mm  = res["misclosure_mm"]
-                    tol_mm  = res["tolerance_mm"]
-                    passed  = res["within_tolerance"]
-
-                    values = [
-                        pair_label,
-                        os.path.basename(fwd.filename),
-                        os.path.basename(ret.filename),
-                        "{:.5f}".format(mean_dh),
-                        "{:.3f}".format(mis_mm),
-                        "{:.2f}".format(tol_mm),
-                    ]
-                    for col, val in enumerate(values):
-                        item = QTableWidgetItem(val)
-                        item.setTextAlignment(Qt.AlignCenter)
-                        tbl.setItem(row, col, item)
-
-                    status_item = QTableWidgetItem("PASS" if passed else "FAIL")
-                    status_item.setTextAlignment(Qt.AlignCenter)
-                    status_item.setForeground(
-                        QColor("#2e7d32") if passed else QColor("#c62828")
-                    )
-                    tbl.setItem(row, 6, status_item)
-
-                    # Reason column (col 7) — descriptive failure text
-                    if passed:
-                        reason_text = "Within H{} tolerance".format(int(cls[1]))
-                    else:
-                        achieved = res.get("achieved_class", 6)
-                        reason_text = (
-                            "Misclosure {:.3f} mm exceeds H{} tolerance {:.2f} mm "
-                            "(achieved class: H{})".format(
-                                abs(mis_mm), int(cls[1]), tol_mm, achieved
-                            )
-                        )
-                    reason_item = QTableWidgetItem(reason_text)
-                    reason_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                    if not passed:
-                        reason_item.setForeground(QColor("#c62828"))
-                    tbl.setItem(row, 7, reason_item)
-
-                    # Column 8: DB Check — deviation of mean_dh from known height difference
-                    db_check_text = "—"
-                    if _db_mgr is not None and _db_mgr.is_configured():
-                        try:
-                            rec_s = _db_mgr.resolve_benchmark(fwd.start_point)
-                            rec_e = _db_mgr.resolve_benchmark(fwd.end_point)
-                            if (rec_s and rec_e
-                                    and rec_s.gova_ort is not None
-                                    and rec_e.gova_ort is not None):
-                                expected_dh = rec_e.gova_ort - rec_s.gova_ort
-                                error_mm = (res["mean_dh"] - expected_dh) * 1000
-                                db_check_text = "{:+.3f}".format(error_mm)
-                            else:
-                                db_check_text = "No DB height"
-                        except Exception:
-                            db_check_text = "DB error"
-                    db_item = QTableWidgetItem(db_check_text)
-                    db_item.setTextAlignment(Qt.AlignCenter)
-                    tbl.setItem(row, 8, db_item)
-
-                self.dock.log("Detect Double-Runs: " + str(len(pairs)) + " pair(s) found.")
-
+                self.dock.log(f"Detect Double-Runs: {len(results)} section(s), "
+                              f"{len(results) - n_fail} pass, {n_fail} fail "
+                              "(Directive G2 App. C, k*sqrt(L), L one direction).",
+                              level="WARNING" if n_fail else "INFO")
             # Switch to Analysis tab -> Double-Runs sub-tab
             self.dock.tabs.setCurrentIndex(2)
             self.dock.analysis_tabs.setCurrentIndex(0)
             self._show_dock()
-
         except Exception as exc:
             QgsMessageLog.logMessage(traceback.format_exc(), "GeoLevelPlugin",
                                      level=Qgis.Critical)
             if self.dock:
-                self.dock.log("Double-Runs ERROR: " + str(exc))
+                self.dock.log("Double-Runs ERROR: " + str(exc), level="ERROR")
             QMessageBox.critical(self.iface.mainWindow(), "Double-Runs -- Error", str(exc))
+
+    def _fill_double_run_table(self, results):
+        tbl = self.dock.double_run_table
+        tbl.setRowCount(0)
+        db_mgr = None
+        if results:
+            try:
+                from geolevel_db_manager import get_db_manager
+                db_mgr = get_db_manager()
+                if not db_mgr.is_configured():
+                    db_mgr = None
+            except Exception:
+                db_mgr = None
+
+        def _name(ln):
+            return os.path.basename(str(getattr(ln, "filename", "") or ""))
+
+        for res in results:
+            row = tbl.rowCount()
+            tbl.insertRow(row)
+            pair = f"{res.from_point} <-> {res.to_point}"
+            if res.n_runs > 2:
+                pair += f" ({res.n_runs} runs)"
+            values = [
+                pair,
+                _name(res.runs[0]),
+                " + ".join(_name(ln) for ln in res.runs[1:]),
+                "{:.5f}".format(res.mean_dh),
+                "{:+.1f}".format(res.discrepancy_mm),
+                "±{:.1f}".format(res.allowed_mm),
+            ]
+            for col, val in enumerate(values):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                tbl.setItem(row, col, item)
+
+            status_item = QTableWidgetItem("PASS" if res.ok else "FAIL")
+            status_item.setTextAlignment(Qt.AlignCenter)
+            status_item.setForeground(QColor("#2e7d32") if res.ok else QColor("#c62828"))
+            tbl.setItem(row, 6, status_item)
+
+            L_km = res.distance / 1000.0
+            what = ("spread of the runs" if res.n_runs > 2 else
+                    "repeat in the same direction" if res.same_direction else
+                    "δ = ΔH fwd + ΔH ret")
+            if res.ok:
+                reason = (f"|{what}| ≤ {res.leveling_class} tolerance "
+                          f"(L = {L_km:.3f} km one direction)")
+            else:
+                best = f"H{res.achieved}" if res.achieved else "none (exceeds H6)"
+                reason = (f"{what}: {abs(res.discrepancy_mm):.1f} mm exceeds "
+                          f"{res.leveling_class} tolerance {res.allowed_mm:.1f} mm "
+                          f"(L = {L_km:.3f} km); class met: {best}")
+            reason_item = QTableWidgetItem(reason)
+            reason_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            if not res.ok:
+                reason_item.setForeground(QColor("#c62828"))
+            tbl.setItem(row, 7, reason_item)
+
+            # Column 8: mean dH against the DB heights of the two end points
+            db_text = "—"
+            if db_mgr is not None:
+                try:
+                    rec_s = db_mgr.resolve_benchmark(res.from_point)
+                    rec_e = db_mgr.resolve_benchmark(res.to_point)
+                    if (rec_s and rec_e and rec_s.gova_ort is not None
+                            and rec_e.gova_ort is not None):
+                        err = (res.mean_dh - (rec_e.gova_ort - rec_s.gova_ort)) * 1000
+                        db_text = "{:+.1f}".format(err)
+                    else:
+                        db_text = "No DB height"
+                except Exception:
+                    db_text = "DB error"
+            db_item = QTableWidgetItem(db_text)
+            db_item.setTextAlignment(Qt.AlignCenter)
+            tbl.setItem(row, 8, db_item)
 
     def _sync_map_statuses(self) -> None:
         """Push current in-memory line statuses into the active QGIS line layer.
@@ -2628,7 +2728,7 @@ class GeoLevelPlugin:
             from geo_level_enhanced_lsa_dialog import GeoLevelEnhancedLSADialog
             cls = self.dock.get_selected_class() if self.dock else self._last_class
             name = (os.path.splitext(os.path.basename(self._glp_path))[0]
-                    if self._glp_path else "geo_level")
+                    if self._glp_path else (self._project_name or "geo_level"))
             dlg = GeoLevelEnhancedLSADialog(
                 self._lines, self.iface.mainWindow(),
                 val_results=self._val_results,
@@ -2729,14 +2829,15 @@ class GeoLevelPlugin:
 
             # REZ summary
             from core_logic.exporters import export_rez
-            rez_path = os.path.join(output_dir, "geo_level_export.rez")
-            export_rez(rez_path, self._lines, project_name="geo_level_export")
+            exp_name = self._project_name or "geo_level_export"
+            rez_path = os.path.join(output_dir, exp_name + ".rez")
+            export_rez(rez_path, self._lines, project_name=exp_name)
             exported.append("REZ: " + rez_path)
 
             # GeoJSON
             from core_logic.gis.geojson_export import export_network_to_geojson
             files = export_network_to_geojson(
-                self._lines, output_dir, project_name="geo_level_export"
+                self._lines, output_dir, project_name=self._project_name or "geo_level_export"
             )
             exported.append("GeoJSON: " + files["lines_geojson"])
 

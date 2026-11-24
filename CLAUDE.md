@@ -21,6 +21,7 @@ cd GeoLevelQGIS && python -m pytest core_logic/tests
 python tests/test_point_resolution.py
 python tests/test_gpkg_roundtrip.py
 python tests/test_vuln.py
+python tests/test_log_and_drop.py      # Log tab capture/export + drag-and-drop collection
 
 # Deploy to QGIS (Windows): mirror-copies GeoLevelQGIS/ into the default profile
 deploy.bat
@@ -58,6 +59,7 @@ deploy.bat
 | `geo_level_settings_dialog.py` | `GeoLevelSettingsDialog` — editable H1-H6 parameters table |
 | `geo_level_enhanced_lsa_dialog.py` | `GeoLevelEnhancedLSADialog` — the single adjustment window (network + single line, Steps 1–2, exports) |
 | `geo_level_reporter.py` | `GeoLevelReporter` — PDF report generator via QPrinter |
+| `geo_level_log.py` | Unified Log tab: `LogHub` (thread-safe Qt signal), `PluginLogCapture` (plugin Python loggers + QgsMessageLog tags `GeoLevelPlugin`/`GeoLevel`/`LSA`), `timed`, `write_log_file` |
 | `core_logic/` | Full copy of the geodetic engine (parsers, validators, engine, gis) |
 
 ---
@@ -107,13 +109,13 @@ Menu structure:
 
 ### `GeoLevelDockWidget` (`geo_level_dockwidget.py`)
 
-Left panel: `QListWidget` (colour-coded green/red by validation) + class combo + `+ Add Files` button.
+Left panel: `_DropListWidget` "Leveling Lines" (colour-coded green/red; accepts files/folders dropped from Explorer → `collect_measurement_files` → `files_added(files, class, "")`, same pipeline as `+ Add Files`), Toggle Dir / Toggle Use, and the **Precision Class** group: project `class_combo` + selected line's `line_class_combo` ("Project class" = None, H1–H6) and `line_method_combo` (BF/BFFB/BBFF), disabled until a line is selected.
 
 Right panel: `QTabWidget` with 4 tabs:
 - **Line Details** — 6-col `QTableWidget`: #, From, To, Backsight (m), Foresight (m), Distance (m)
 - **Validation** — status label + error/warning `QTextEdit`
 - **Analysis** — Double-Runs, Loops, and Network Adjustment (LSA) buttons
-- **Log** — read-only log messages
+- **Log** — every plugin message (`append_log_entry(level, source, text)`, timestamped, warnings/errors coloured) + **Export Log…** (`.log`/`.txt`, UTF-8). The plugin installs `PluginLogCapture` in `_create_dock` and removes it in `unload`; `_log_elapsed` / `_log_timing` add TIMING entries.
 
 Signals: `line_selected(int)`, `adjust_line_requested(int)`, `lsa_requested()`, `files_added(list,str,str)`, `double_runs_requested()`, `loops_requested()`
 
@@ -225,6 +227,8 @@ Reset to Defaults: calls `mgr.reset_to_defaults()` + `importlib.reload(israel_su
 - User settings persist to `~/.geodetic_tool/settings.json` and survive between sessions.
 - `filename` attribute is present on GeoJSON line features — required for `_sync_dock_to_map`.
 - **GeoPackage-first state model** (`geo_level_gpkg.py`, schema 2): the project `.gpkg` (default `<output_dir>/geo_level_results.gpkg`) is the authoritative project state — `geo_lines`/`geo_points` map layers plus `lv_lines` (full `LevelingLine` + JSON `validation`), `lv_setups`, `lv_meta` (`leveling_class`, `point_overrides`, `point_origin`, `pid_remap`, `resolved_points` = exact DB record per point / None = estimated, `dat_files`, `output_dir`, `schema_version`). Load Project accepts a `.gpkg` directly or a `.glp`; either way no DAT file is parsed and no DB query runs. Statuses/validation are restored exactly as saved ("saved status wins"; schema-1 files are re-validated then forced back to the saved status). In-memory edits (override/use/direction toggles, point exclusion, class settings) autosave to the lv_* tables via `_autosave_gpkg`; Edit Point rewrites the whole GPKG via `_rebuild_map_layers` → `_persist_to_gpkg`. lv_meta is untrusted input: always pass it through `gp.sanitize_meta()`.
+- **Project name** (`core_logic/project_naming.py`): `<Description>_DD_MM_YYYY_H_MM`, description = first file's header title (parsers set `parser.title`; `process_geodetic_data` returns `file_titles`) else the file stem; sanitized for Windows. Set by `_ensure_project_name` on the first load of a new project, from the `.glp`/`.gpkg` stem when a project is opened; used as the default `.glp`, `.gpkg`, export and log file names.
+- **Double runs**: `network_prep.analyze_double_runs(lines, project_class)` (Directive G2 App. C) groups used lines by section, first run = forward, δ = ΔH_fwd + ΔH_ret (spread for >2 runs) vs k·√L (L one direction = mean length, class = `line.leveling_class` or project), mean = (ΔH_fwd − ΔH_ret)/2; built on `merge_observations` so it equals LSA Step 1. `tolerance_mm` reads k from the live `CLASS_REGISTRY` (Class Parameters edits apply). Tested against the App. C worked example in `core_logic/tests/test_double_runs.py`.
 - `.glp` (v2, JSON in `GeoLevelQGIS/projects/`) is a pointer: `{version, class, output_dir, gpkg (relative), files[], point_overrides}`. `files[]` is the legacy fallback when the GPKG is missing; `_repoint_glp` updates `gpkg` if a locked file forced a `*_N.gpkg` name.
 - Live registry patching: `GeoLevelSettingsDialog` patches `CLASS_REGISTRY_BY_NAME` objects in-memory so validators immediately use new k values without QGIS restart.
 - Validation re-run after settings change: plugin re-runs `BatchValidator` and calls `dock.load_lines` to refresh dock list colours.
