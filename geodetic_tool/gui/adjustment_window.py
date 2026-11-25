@@ -146,7 +146,7 @@ class AdjustmentWindow(tk.Toplevel):
              "Check", "Sources"), (80, 80, 100, 80, 45, 90, 90, 50, 200))
         self.approx_tree = self._tree_tab(
             "Step 2: Approximate Heights", ("pid", "h", "seed", "kind", "km"),
-            ("Point ID", "Approx. Height (m)", "Carried from", "Seed type", "Path (km)"),
+            ("Point ID", "Approx. Height (m)", "Carried from seed", "Seed type", "Path (km)"),
             (110, 130, 110, 90, 90))
         self.heights_tree = self._tree_tab(
             "Adjusted Heights / גבהים", ("pid", "h", "ap", "corr", "sd", "c95"),
@@ -439,7 +439,7 @@ class AdjustmentWindow(tk.Toplevel):
                 t.insert("", tk.END, tags=("fixed",), values=(pid, f"{h:.5f}", "fixed", "—", "—", "—"))
                 continue
             sd = res.mse_heights.get(pid, 0.0) * 1000
-            t.insert("", tk.END, values=(pid, f"{h:.5f}", f"{res.approximate_heights.get(pid, h):.5f}",
+            t.insert("", tk.END, values=(pid, f"{h:.5f}", f"{res.approximate_heights.get(pid, h):.2f}",
                                          f"{res.corrections.get(pid, 0.0) * 1000:.2f}",
                                          f"{sd:.2f}", f"{1.96 * sd:.2f}"))
         t = self.res_tree
