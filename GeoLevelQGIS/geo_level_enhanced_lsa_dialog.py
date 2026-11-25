@@ -227,7 +227,7 @@ class GeoLevelEnhancedLSADialog(QDialog):
                                       "Δ runs (mm)", "Allowed (mm)", "Check", "Sources"])
         self.tabs.addTab(self.obs_table, "Step 1: Observations")
 
-        self.approx_table = self._table(["Point ID", "Approx. Height (m)", "Carried from",
+        self.approx_table = self._table(["Point ID", "Approx. Height (m)", "Carried from seed",
                                          "Seed type", "Path (km)"])
         self.tabs.addTab(self.approx_table, "Step 2: Approximate Heights")
 
@@ -658,7 +658,7 @@ class GeoLevelEnhancedLSADialog(QDialog):
             sd = res.mse_heights.get(pid, 0.0) * 1000
             approx = res.approximate_heights.get(pid, h)
             corr = "—" if is_fixed else f"{res.corrections.get(pid, 0.0) * 1000:.2f}"
-            vals = [pid, f"{h:.5f}", f"{approx:.5f}", corr,
+            vals = [pid, f"{h:.5f}", f"{approx:.2f}", corr,
                     "—" if is_fixed else f"{sd:.2f}",
                     "—" if is_fixed else f"{1.96 * sd:.2f}"]
             row = t.rowCount()
